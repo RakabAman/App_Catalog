@@ -1,0 +1,31 @@
+# Runtime dependencies for App Catalog / Organizer.
+#
+#   pip install -r requirements.txt
+#
+# Then to build a Windows .exe (see app_manager.spec for full notes):
+#   pip install pyinstaller
+#   pyinstaller app_manager.spec
+#
+# Everything below except PySide6/requests/rapidfuzz/beautifulsoup4 is
+# OPTIONAL at runtime -- the app degrades gracefully without it (see
+# scanner.py, app_manager.py, and monitor.py's own try/except
+# ImportError comments for exactly what each one enables). They're
+# still listed here (not in a separate optional-requirements file)
+# because app_manager.spec's PyInstaller build bundles whichever of
+# them happen to be installed when you build -- install all of them
+# before building if you want every optional feature working with zero
+# extra binaries required on the end user's machine.
+
+PySide6>=6.5          # GUI toolkit -- required, the app won't start without it
+requests>=2.28         # winget manifest / winutil apps.json / Chocolatey search
+rapidfuzz>=3.0         # fuzzy name matching (duplicate detection, resolver clustering)
+beautifulsoup4>=4.12   # Chocolatey live-search HTML parsing (choco_search.py)
+
+# -- optional, all with a graceful fallback if omitted --
+pefile>=2023.2.7        # reads .exe version-info resources (publisher/version) during scan
+py7zr>=0.20             # .7z reading (scan) + .7z writing (reorganize/monitor archiving)
+                          # without an external 7z/7za binary on PATH
+pycdlib>=1.14           # .iso reading during scan
+rarfile>=4.1             # .rar reading during scan -- STILL needs a real unrar/7z/bsdtar
+                          # binary on PATH at runtime regardless; this package is a thin
+                          # wrapper around one, not a pure-Python RAR implementation
