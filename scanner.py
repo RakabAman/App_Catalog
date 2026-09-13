@@ -590,6 +590,14 @@ def _apply_taxonomy_rules(rel_path_str: str, rules: list) -> Optional[str]:
 def _derive_catalog_subcatalog(
     root: str, folder_path: str, settings: Optional[dict] = None
 ) -> tuple[Optional[str], Optional[str], int]:
+    """
+    Legacy fixed-2-tier derivation (catalog=part[0], subcatalog=part[1],
+    always, regardless of actual nesting depth). Kept only as the
+    no-layout-configured fallback path; real scans go through
+    resolve_scan_root_layout() below, which generalizes this to an
+    arbitrary chain of subcategory tiers, per-folder skip, and per-folder
+    rename. See Part 2 of the Feature B design doc.
+    """
     rel = os.path.relpath(folder_path, root)
     if rel == ".":
         return None, None, 0
@@ -606,6 +614,210 @@ def _derive_catalog_subcatalog(
         subcatalog = parts[1] if len(parts) >= 2 else None
 
     return catalog, subcatalog, len(parts)
+
+
+# ---------------------------------------------------------------------
+# Feature B: per-scan-root folder layout (arbitrary-depth subcategory
+# chains, per-folder skip/rename). resolver.py and classify_folder() are
+# unchanged -- all of this feeds them the same shape of data (catalog,
+# subcatalog, depth) they always received, just computed more flexibly.
+# ---------------------------------------------------------------------
+
+def _layout_mode_of(entry, default=None):
+    """
+    A layout entry is either a bare int (-1/0/2) or a dict
+    {"mode": -1|0|2, "name": "Custom Label"}. Returns just the mode.
+    """
+    if entry is None:
+        return default
+    if isinstance(entry, dict):
+        return entry.get("mode", default)
+    try:
+        return int(entry)
+    except (TypeError, ValueError):
+        return default
+
+
+def _layout_label_for(raw_name: Optional[str], key: Optional[str], layout: dict,
+                       taxonomy_value: Optional[str] = None) -> Optional[str]:
+    """
+    Resolves the display label for one folder position: an explicit rename
+    in the layout config wins (this is what "revert to raw for this
+    folder" and free-text renaming in FolderLayoutDialog write), then a
+    matching category_rules/subcategory_rules regex, then the raw folder
+    name itself.
+    """
+    if raw_name is None:
+        return None
+    entry = layout.get(key) if key else None
+    if isinstance(entry, dict) and entry.get("name"):
+        return entry["name"]
+    if taxonomy_value:
+        return taxonomy_value
+    return raw_name
+
+
+def _layout_find_skip(keys: list[str], layout: dict) -> bool:
+    """
+    A folder is skipped if ANY ancestor (or itself) is explicitly marked
+    -1 -- "do not scan/import this folder or anything under it" is
+    absolute; a deeper override cannot un-skip a subtree. Checked
+    shallow-to-deep only for readability; order doesn't affect the result.
+    """
+    return any(_layout_mode_of(layout.get(k)) == -1 for k in keys)
+
+
+def _layout_nearest_ancestor(keys: list[str], layout: dict) -> tuple[Optional[int], Optional[int]]:
+    """
+    Deepest-match-wins lookup: keys[i] is the cumulative lowercased
+    relative-path key for parts[0..i] (1-indexed depth = i+1). Returns
+    (matched_depth, mode) for the deepest key present in the layout, or
+    (None, None) if nothing at any level was explicitly configured.
+    Assumes _layout_find_skip() has already ruled out a -1 anywhere in
+    this chain, so entries seen here are only 0 or 2.
+    """
+    for depth in range(len(keys), 0, -1):
+        entry = layout.get(keys[depth - 1])
+        if entry is not None:
+            return depth, _layout_mode_of(entry, default=2)
+    return None, None
+
+
+def resolve_scan_root_layout(
+    root: str,
+    folder_path: str,
+    layout: dict,
+    root_is_catalog: bool = False,
+    root_catalog_name: Optional[str] = None,
+    settings: Optional[dict] = None,
+) -> tuple[Optional[str], Optional[str], int, bool]:
+    """
+    Generalization of _derive_catalog_subcatalog() that understands the
+    user's declared per-folder layout: an arbitrary chain of subcategory
+    tiers (not just a fixed 2), per-folder skip, and per-folder rename.
+
+    Returns (catalog, subcatalog, depth, skip). When skip is True, catalog/
+    subcatalog/depth are meaningless (None, None, 0) -- the caller must not
+    yield a raw_candidates row for this folder or descend into it.
+
+    The load-bearing idea (unchanged from the original 2-tier design):
+    resolver.extract_fields() still expects "depth <= 2 = category label,
+    not an app name". We never touch that contract -- we just compute a
+    `depth` number that honours it, however deep the user's real chain is.
+
+    Walkthrough (see Part 2 of the design doc for the full derivation):
+      layout={"adobe": 0}
+        ADOBE/Photoshop            -> catalog=ADOBE, subcatalog=None, depth=3
+      layout={} (nothing configured -- the all-default case)
+        GRAPHICS/Converters/Acme   -> catalog=GRAPHICS, subcatalog=Converters, depth=3
+      layout={"graphics/converters/video": 0}   (only this one override)
+        GRAPHICS/Converters/appname1        -> subcatalog=Converters (still just default)
+        GRAPHICS/Converters/Video/AcmeConvert -> subcatalog=Video (nearer tier wins)
+      layout={"tutorials": -1}
+        TUTORIALS/anything -> skip=True, never yielded, walk doesn't descend
+    """
+    rel = os.path.relpath(folder_path, root)
+    if rel == ".":
+        return None, None, 0, False
+
+    settings = settings or {}
+    layout = layout or {}
+    parts = Path(rel).parts
+    rel_str = rel.replace(os.sep, "/")
+
+    # cumulative lowercase keys: keys[i] = "a/b/c" for parts[0..i]
+    keys = []
+    acc = []
+    for p in parts:
+        acc.append(p.lower())
+        keys.append("/".join(acc))
+
+    if _layout_find_skip(keys, layout):
+        return None, None, 0, True
+
+    # How many leading real folders the catalog tier consumes: 1 normally
+    # (parts[0] IS the catalog folder), 0 when this root is itself a single
+    # catalog (there's no on-disk folder occupying that role).
+    offset = 0 if root_is_catalog else 1
+
+    taxonomy_catalog = _apply_taxonomy_rules(rel_str, settings.get("category_rules", []))
+    if root_is_catalog:
+        catalog = root_catalog_name or Path(root).name
+    else:
+        catalog = _layout_label_for(parts[0] if parts else None, keys[0] if keys else None,
+                                     layout, taxonomy_catalog)
+
+    matched_depth, mode = _layout_nearest_ancestor(keys, layout)
+    if matched_depth is None:
+        # Nothing explicitly configured anywhere in this chain -- default
+        # is "has subcatalog", applied just past the catalog boundary.
+        matched_depth, mode = offset, 2
+
+    taxonomy_subcatalog = _apply_taxonomy_rules(rel_str, settings.get("subcategory_rules", []))
+
+    if mode == 0:
+        # The folder at matched_depth declared "my children are apps
+        # directly" -- terminate the subcategory chain there. Two distinct
+        # shapes both reach this branch: an ANCESTOR several levels up was
+        # marked mode=0 (e.g. "graphics/converters"=0, and we're deriving
+        # for a descendant of Converters -- subcatalog becomes Converters'
+        # own name), or the CURRENT folder's own key was marked mode=0
+        # (e.g. "graphics/faststone"=0, self-match -- FastStone itself is
+        # the app, so what matters is FastStone's own parent, one level
+        # shallower than an ancestor-match would use).
+        is_self_match = (matched_depth == len(parts))
+        boundary_idx = matched_depth - (2 if is_self_match else 1)
+        if boundary_idx >= offset:
+            raw_sub = parts[boundary_idx] if boundary_idx < len(parts) else None
+            subcatalog = _layout_label_for(raw_sub, keys[boundary_idx] if boundary_idx < len(keys) else None,
+                                            layout, taxonomy_subcatalog)
+        else:
+            subcatalog = None
+        # +1 so a folder that would otherwise land on the resolver's
+        # "shallow, don't trust this name" tier (<=2) is correctly treated
+        # as an app tier instead. Harmless no-op for already-deep folders.
+        depth = len(parts) + 1
+    else:
+        # mode == 2 ("has subcatalog", default): the chain continues past
+        # matched_depth, so the very next folder after it is the
+        # subcatalog for now (a deeper explicit override, if any, would
+        # have already won via matched_depth in the lookup above).
+        sub_idx = matched_depth
+        if sub_idx < len(parts):
+            raw_sub = parts[sub_idx]
+            subcatalog = _layout_label_for(raw_sub, keys[sub_idx], layout, taxonomy_subcatalog)
+        else:
+            subcatalog = None
+        depth = len(parts)
+
+    return catalog, subcatalog, depth, False
+
+
+def list_top_level_folders(root: str) -> list[str]:
+    """
+    Fast, shallow (single os.scandir, no recursion) listing of a scan
+    root's immediate subfolders -- used by the pre-scan FolderLayoutDialog
+    to know what rows to show without doing a full filesystem walk.
+    """
+    try:
+        with os.scandir(root) as it:
+            return sorted((e.name for e in it if e.is_dir(follow_symlinks=False)), key=str.lower)
+    except OSError:
+        return []
+
+
+def list_child_folders(root: str, rel_parent: str) -> list[str]:
+    """
+    Same idea as list_top_level_folders() but for one specific folder
+    under the root, addressed by its relative path -- used when the
+    FolderLayoutDialog's tree is expanded below the pre-populated first
+    two levels (lazy, on-demand resolution, any depth).
+    """
+    try:
+        with os.scandir(os.path.join(root, rel_parent)) as it:
+            return sorted((e.name for e in it if e.is_dir(follow_symlinks=False)), key=str.lower)
+    except OSError:
+        return []
 
 
 _MULTIPART_PATTERNS = [
@@ -789,6 +1001,9 @@ def walk_scan_root(
     settings: dict,
     follow_symlinks: bool = False,
     error_sink: Optional[list] = None,
+    folder_layout: Optional[dict] = None,
+    root_is_catalog: bool = False,
+    root_catalog_name: Optional[str] = None,
 ) -> Iterator[ScanCandidate]:
     root = os.path.abspath(root)
     walk_root = _apply_long_path_prefix(root)
@@ -823,7 +1038,18 @@ def walk_scan_root(
         subfolder_names = [e.name for e in entries if e.is_dir(follow_symlinks=False)]
         file_names = [e.name for e in file_entries]
 
-        catalog, subcatalog, depth = _derive_catalog_subcatalog(root, display_dirpath, settings)
+        catalog, subcatalog, depth, skip = resolve_scan_root_layout(
+            root, display_dirpath, folder_layout or {},
+            root_is_catalog=root_is_catalog, root_catalog_name=root_catalog_name,
+            settings=settings,
+        )
+        if skip:
+            log.info("SKIPPED (folder layout: skip mode) %s", display_dirpath)
+            # Do not descend into a skipped subtree at all -- no candidate
+            # row, and os.walk must not visit anything below it either.
+            dirnames[:] = []
+            continue
+
         classification = classify_folder(display_dirpath, file_names, subfolder_names, settings, depth=depth)
 
         candidate = ScanCandidate(
@@ -967,6 +1193,11 @@ def run_scan(
 
     scan_root_id = _upsert_scan_root(db, root_path, status="running")
 
+    scan_root_row = db.get_scan_root_by_id(scan_root_id)
+    folder_layout = db.get_folder_layout(scan_root_id)
+    root_is_catalog = bool(scan_root_row["root_is_catalog"]) if scan_root_row else False
+    root_catalog_name = scan_root_row["root_catalog_name"] if scan_root_row else None
+
     incremental = settings.get("incremental_scan_by_default", True)
     existing_fingerprints = {}
     if incremental:
@@ -983,6 +1214,9 @@ def run_scan(
             root_path, settings,
             follow_symlinks=settings.get("scan_follow_symlinks", False),
             error_sink=scan_errors,
+            folder_layout=folder_layout,
+            root_is_catalog=root_is_catalog,
+            root_catalog_name=root_catalog_name,
         ):
             if cancel_flag and cancel_flag():
                 log.warning("Scan cancelled by user.")

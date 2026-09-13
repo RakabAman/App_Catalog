@@ -115,28 +115,3 @@ def get_manifest_dir(db_path: str | Path) -> Path:
 def get_app_log_path(db_path: str | Path) -> Path:
     """The single general application log file: <catalog folder>/logs/app.log"""
     return get_logs_dir(db_path) / "app.log"
-
-def get_resource_path(name: str) -> Path:
-    """
-    Locate a bundled read-only data file (ico.ico, etc.) in all three
-    run modes this app supports:
-
-      - PyInstaller onefile: PyInstaller extracts bundled datas into a
-        temp folder at launch; sys._MEIPASS points at it. The file is
-        there, not next to the .exe.
-      - PyInstaller onedir (PyInstaller >= 5.0): datas are placed inside
-        the _internal/ subfolder, and sys._MEIPASS is set to point at
-        that folder too. Same lookup works.
-      - PyInstaller onedir (older versions) / plain `python run_gui.py`:
-        fall back to the app's own folder, same as app_paths.py itself.
-
-    Distinct from get_app_base_dir() on purpose: that's "where user data
-    goes", this is "where bundled read-only resources are found". They
-    are the same folder in dev/onedir-old and different in onefile.
-    """
-    if getattr(sys, "frozen", False):
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            return Path(meipass) / name
-        return Path(sys.executable).resolve().parent / name
-    return Path(__file__).resolve().parent / name

@@ -311,6 +311,13 @@ DEFAULT_SETTINGS = {
     "category_rules": [],
     "subcategory_rules": [],
 
+    # -- per-scan-root folder layout (see FolderLayoutDialog / scanner
+    # resolve_scan_root_layout()) -- label used when a folder ends up with
+    # no catalog or no subcatalog at all. User-editable so it isn't stuck
+    # as a hardcoded string.
+    "fallback_catalog_name": "MISC",
+    "fallback_subcatalog_name": "MISC",
+
     "edition_keywords": [
         "professional", "pro", "enterprise", "ultimate", "premium", "premiere",
         "home", "standard", "business", "server", "community", "ce",

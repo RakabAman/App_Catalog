@@ -331,6 +331,22 @@ class Database:
             # checkpoint 14: winget show fallback for real description/
             # license (the bare manifest has neither -- see manifest.py).
             ("apps", "license", "TEXT"),
+            # Feature B: per-scan-root folder layout (see scanner.py's
+            # resolve_scan_root_layout() and gui_main.FolderLayoutDialog).
+            # root_is_catalog: this root's own folder IS a single catalog
+            # (no top-level catalog-tier folders below it).
+            ("scan_roots", "root_is_catalog", "INTEGER DEFAULT 0"),
+            # Only meaningful when root_is_catalog=1; defaults to the root
+            # folder's basename in the GUI, but stored explicitly so it
+            # survives a repath (Feature A) even if the basename changes.
+            ("scan_roots", "root_catalog_name", "TEXT"),
+            # Flat JSON map, keyed by lowercased relative path from the
+            # root. Values are either an int (-1 skip / 0 no-subcatalog /
+            # 2 has-subcatalog) or an object {"mode": ..., "name": "..."}
+            # when the folder has also been renamed for display purposes.
+            # Missing key = inherit from nearest configured ancestor, else
+            # default to 2. See scanner.resolve_scan_root_layout().
+            ("scan_roots", "folder_layouts_json", "TEXT DEFAULT '{}'"),
         ]
         for table, column, coldef in migrations:
             try:
@@ -458,6 +474,65 @@ class Database:
         conn = self.connect()
         conn.execute("DELETE FROM variants WHERE app_id = ?", (app_id,))
         conn.execute("DELETE FROM apps WHERE id = ?", (app_id,))
+        conn.commit()
+
+    # ------------------------------------------------------------------
+    # scan_roots / Feature B folder-layout config
+    # ------------------------------------------------------------------
+    def get_scan_root_by_path(self, path: str) -> Optional[dict]:
+        conn = self.connect()
+        row = conn.execute("SELECT * FROM scan_roots WHERE path = ?", (path,)).fetchone()
+        return dict(row) if row else None
+
+    def ensure_scan_root(self, path: str) -> int:
+        """
+        Returns the id of the scan_roots row for `path`, inserting a bare
+        placeholder row if one doesn't exist yet. Used by the GUI to open
+        FolderLayoutDialog *before* a scan job runs (scan_roots rows are
+        normally created/updated by scanner._upsert_scan_root at scan
+        time) -- safe to call unconditionally since it's insert-if-missing.
+        """
+        conn = self.connect()
+        row = conn.execute("SELECT id FROM scan_roots WHERE path = ?", (path,)).fetchone()
+        if row:
+            return row["id"]
+        cur = conn.execute("INSERT INTO scan_roots (path) VALUES (?)", (path,))
+        conn.commit()
+        return cur.lastrowid
+
+    def get_scan_root_by_id(self, scan_root_id: int) -> Optional[dict]:
+        conn = self.connect()
+        row = conn.execute("SELECT * FROM scan_roots WHERE id = ?", (scan_root_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_folder_layout(self, scan_root_id: int) -> dict:
+        """Returns the parsed folder_layouts_json map for a scan root
+        (empty dict if never configured)."""
+        row = self.get_scan_root_by_id(scan_root_id)
+        if not row or not row.get("folder_layouts_json"):
+            return {}
+        try:
+            return json.loads(row["folder_layouts_json"])
+        except (TypeError, ValueError):
+            return {}
+
+    def save_folder_layout(
+        self, scan_root_id: int, layout: dict,
+        root_is_catalog: Optional[bool] = None,
+        root_catalog_name: Optional[str] = None,
+    ) -> None:
+        conn = self.connect()
+        if root_is_catalog is None:
+            conn.execute(
+                "UPDATE scan_roots SET folder_layouts_json = ? WHERE id = ?",
+                (json.dumps(layout), scan_root_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE scan_roots SET folder_layouts_json = ?, root_is_catalog = ?, "
+                "root_catalog_name = ? WHERE id = ?",
+                (json.dumps(layout), int(root_is_catalog), root_catalog_name, scan_root_id),
+            )
         conn.commit()
 
 class _MissingType:

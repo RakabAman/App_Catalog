@@ -18,18 +18,14 @@ no visible console window. See app_paths.py's module docstring for why
 paths are resolved the way they are (checkpoint 21).
 """
 
-import ctypes
 import logging
 import logging.handlers
 import os
 import sys
 
-from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from app_paths import (
-    get_app_log_path, get_default_db_path, resolve_db_path, get_resource_path,
-)
+from app_paths import get_app_log_path, get_default_db_path, resolve_db_path
 
 
 def _setup_logging(db_path: str):
@@ -107,35 +103,6 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("App Catalog")
-
-    # Windows taskbar grouping is keyed off an explicit AppUserModelID
-    # set on the PROCESS, not per-window. Without one, Windows treats the
-    # process as a generic python.exe and shows Python's icon on the
-    # taskbar regardless of setWindowIcon(), no matter what the title bar
-    # shows. Must be set before the first top-level window is created;
-    # harmless no-op on non-Windows and if the shell32 call fails.
-    if sys.platform == "win32":
-        try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "AppCatalog.Gui.1"
-            )
-        except Exception:
-            logging.getLogger("appcatalog").debug(
-                "SetCurrentProcessExplicitAppUserModelID failed", exc_info=True
-            )
-
-    # The ico= stamp in the .spec gives the .exe file its icon in Explorer;
-    # it does NOT make Qt use it for the title bar / taskbar. Setting the
-    # application-wide icon here covers every window the app opens
-    # (MainWindow, OrganizeDialog, etc.) without each one setting its own.
-    icon_path = get_resource_path("ico.ico")
-    if icon_path.exists():
-        app.setWindowIcon(QIcon(str(icon_path)))
-    else:
-        logging.getLogger("appcatalog").warning(
-            "ico.ico not found at %s -- window/taskbar icon will be default",
-            icon_path,
-        )
 
     from gui_main import MainWindow
     window = MainWindow(db_path)
