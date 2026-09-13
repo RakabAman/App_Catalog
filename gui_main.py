@@ -2,6 +2,7 @@
 gui_main.py – All UI components: main window, detail panel, dialogs.
 """
 
+import json
 import os
 import platform
 import subprocess
@@ -32,7 +33,8 @@ from scraper import apply_choco_candidate, apply_manifest_candidate, ScrapeProgr
 from app_organizer import OrganizeDialog
 
 from monitor import MonitorJob
-from app_manager import execute_clean_library
+from app_manager import execute_clean_library, update_scan_root_path, delete_scan_root
+from scanner import resolve_scan_root_layout, list_top_level_folders, list_child_folders
 
 from gui_backend import (
     AppsTableModel, AppPickerDialog, COLUMNS, export_apps_csv, import_apps_csv,
@@ -822,6 +824,355 @@ class SearchMatchDialog(QDialog):
         self.accept()
 
 
+class FolderLayoutDialog(QDialog):
+    """
+    Per-scan-root folder layout editor (Feature B). Lets the user declare,
+    for the top-level folders under a scan root (and any folder beneath
+    them, to any depth), whether that folder has a further subcategory
+    layer, has none (direct children are apps), or should be skipped
+    entirely -- plus an optional display-name override that propagates to
+    every app resolved under that folder. See scanner.resolve_scan_root_
+    layout() for how these choices translate into catalog/subcatalog/depth.
+
+    The first two folder levels are populated immediately (no clicking
+    needed) since that's the common "maybe one folder is mixed" case;
+    anything deeper is resolved lazily the moment a level-2 row is
+    expanded, so opening the dialog never has to walk more of the disk
+    than a handful of os.scandir() calls.
+    """
+
+    MODE_ITEMS_TOP = [("Has subcatalogs", 2), ("No subcatalogs", 0), ("Skip this folder", -1)]
+    MODE_ITEMS_CHILD = [("⤷ Inherit", None), ("Has subcatalogs", 2),
+                         ("No subcatalogs", 0), ("Skip this folder", -1)]
+
+    def __init__(self, db: Database, scan_root_row: dict, parent=None,
+                 only_new_folders: Optional[list] = None):
+        super().__init__(parent)
+        self.db = db
+        self.scan_root_row = scan_root_row
+        self.root_path = scan_root_row["path"]
+        # Informational only -- which top-level folders are newly found on
+        # this re-scan (per the user's choice: always show the FULL
+        # dialog, with new rows simply pre-filled at default, rather than
+        # hiding already-configured rows).
+        self.new_folder_names = (
+            {n.lower() for n in only_new_folders} if only_new_folders else set()
+        )
+        try:
+            self._saved_layout = json.loads(scan_root_row.get("folder_layouts_json") or "{}")
+        except (TypeError, ValueError):
+            self._saved_layout = {}
+        # Working copy the dialog edits live; only written back on OK.
+        self._working_layout = dict(self._saved_layout)
+        self._rows = {}  # rel_key -> {"item", "combo", "rename", "preview", "is_top"}
+
+        title = "Folder layout — " + self.root_path
+        if self.new_folder_names:
+            title += "  (new folders found)"
+        self.setWindowTitle(title)
+        self.resize(920, 540)
+        outer = QVBoxLayout(self)
+
+        intro_text = (
+            "Declare how this root's folders are organized: which top-level folders have "
+            "a further subcategory layer, which don't, and which to skip entirely. "
+            "Expand a row (▸) to override an individual child folder, at any depth. "
+            "The Preview column shows the catalog / subcatalog / app-name triple your "
+            "choice would produce."
+        )
+        if self.new_folder_names:
+            intro_text = (
+                f"{len(self.new_folder_names)} new top-level folder(s) were found since this "
+                "root was last configured (marked \"NEW\" below) -- everything else keeps its "
+                "saved setting. " + intro_text
+            )
+        intro = QLabel(intro_text)
+        intro.setWordWrap(True)
+        outer.addWidget(intro)
+
+        # -- top strip: root-is-catalog toggle --------------------------
+        top_strip = QHBoxLayout()
+        self.root_is_catalog_cb = QCheckBox("This root is itself a single catalog")
+        self.root_is_catalog_cb.setChecked(bool(scan_root_row.get("root_is_catalog")))
+        self.root_is_catalog_cb.toggled.connect(self._on_root_is_catalog_toggled)
+        top_strip.addWidget(self.root_is_catalog_cb)
+        top_strip.addWidget(QLabel("Catalog name:"))
+        self.catalog_name_edit = QLineEdit(
+            scan_root_row.get("root_catalog_name") or Path(self.root_path).name
+        )
+        self.catalog_name_edit.setEnabled(self.root_is_catalog_cb.isChecked())
+        self.catalog_name_edit.textChanged.connect(self._refresh_all_previews)
+        top_strip.addWidget(self.catalog_name_edit)
+        top_strip.addStretch()
+        outer.addLayout(top_strip)
+
+        # -- main tree ----------------------------------------------------
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(4)
+        self.tree.setHeaderLabels(["Folder", "Subcatalogs?", "Rename (optional)", "Preview"])
+        self.tree.setColumnWidth(0, 220)
+        self.tree.setColumnWidth(1, 160)
+        self.tree.setColumnWidth(2, 180)
+        self.tree.itemExpanded.connect(self._on_item_expanded)
+        outer.addWidget(self.tree)
+
+        self._populate_top_level()
+
+        # -- footer ---------------------------------------------------------
+        footer = QHBoxLayout()
+        default_all_btn = QPushButton("Use default for all")
+        default_all_btn.setToolTip("Resets every visible row to \"Has subcatalogs\" / inherit.")
+        default_all_btn.clicked.connect(self._use_default_for_all)
+        footer.addWidget(default_all_btn)
+        expand_all_btn = QPushButton("Expand all")
+        expand_all_btn.clicked.connect(self.tree.expandAll)
+        footer.addWidget(expand_all_btn)
+        collapse_all_btn = QPushButton("Collapse all")
+        collapse_all_btn.clicked.connect(self.tree.collapseAll)
+        footer.addWidget(collapse_all_btn)
+        footer.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setToolTip("Aborts the scan job entirely -- no candidates are written.")
+        cancel_btn.clicked.connect(self.reject)
+        footer.addWidget(cancel_btn)
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self._on_ok)
+        footer.addWidget(ok_btn)
+        outer.addLayout(footer)
+
+    # ------------------------------------------------------------------
+    # tree population
+    # ------------------------------------------------------------------
+    def _populate_top_level(self):
+        names = list_top_level_folders(self.root_path)
+        for name in names:
+            label = f"{name}   (NEW)" if name.lower() in self.new_folder_names else name
+            item = QTreeWidgetItem(self.tree, [label])
+            self.tree.addTopLevelItem(item)
+            self._add_row(item, (name,), is_top=True)
+            # Level 2 is populated immediately (not lazy) -- this is the
+            # "mixed catalog" case the user actually has, so it shouldn't
+            # require an extra click to discover.
+            self._populate_children(item, (name,))
+
+    def _populate_children(self, parent_item: QTreeWidgetItem, rel_parts: tuple):
+        child_names = list_child_folders(self.root_path, os.path.join(*rel_parts))
+        parent_key = "/".join(p.lower() for p in rel_parts)
+        parent_row = self._rows.get(parent_key)
+        if parent_row is not None and child_names:
+            parent_row["first_child_name"] = child_names[0]
+        for name in child_names:
+            child_parts = rel_parts + (name,)
+            child_item = QTreeWidgetItem(parent_item, [name])
+            self._add_row(child_item, child_parts, is_top=False)
+            # Lazy placeholder: a dummy child gives this row an expand
+            # arrow without touching the disk again until the user
+            # actually clicks it (any depth beyond level 2).
+            QTreeWidgetItem(child_item, ["…loading…"])
+        if parent_row is not None and child_names:
+            self._update_preview(parent_key)
+
+    def _on_item_expanded(self, item: QTreeWidgetItem):
+        # Real children already populated (level <=2, or already expanded
+        # once) -- nothing to do.
+        if item.childCount() != 1 or item.child(0).text(0) != "…loading…":
+            return
+        item.takeChildren()
+        rel_parts = item.data(0, Qt.UserRole + 1)
+        self._populate_children(item, rel_parts)
+
+    def _add_row(self, item: QTreeWidgetItem, rel_parts: tuple, is_top: bool):
+        rel_key = "/".join(p.lower() for p in rel_parts)
+        item.setData(0, Qt.UserRole, rel_key)
+        item.setData(0, Qt.UserRole + 1, rel_parts)
+
+        existing = self._working_layout.get(rel_key)
+        existing_mode = existing.get("mode") if isinstance(existing, dict) else existing
+        existing_name = existing.get("name") if isinstance(existing, dict) else None
+
+        combo = QComboBox()
+        choices = self.MODE_ITEMS_TOP if is_top else self.MODE_ITEMS_CHILD
+        for label, value in choices:
+            combo.addItem(label, value)
+        default_value = 2 if is_top else None
+        target_value = existing_mode if existing_mode is not None else default_value
+        idx = combo.findData(target_value)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.currentIndexChanged.connect(lambda _i, k=rel_key: self._on_row_changed(k))
+        self.tree.setItemWidget(item, 1, combo)
+
+        rename_edit = QLineEdit(existing_name or "")
+        rename_edit.setPlaceholderText("(use folder name)")
+        rename_edit.textChanged.connect(lambda _t, k=rel_key: self._on_row_changed(k))
+        self.tree.setItemWidget(item, 2, rename_edit)
+
+        preview_label = QLabel("")
+        self.tree.setItemWidget(item, 3, preview_label)
+
+        self._rows[rel_key] = {
+            "item": item, "combo": combo, "rename": rename_edit,
+            "preview": preview_label, "is_top": is_top, "rel_parts": rel_parts,
+        }
+        self._update_row_layout_entry(rel_key)
+        self._update_preview(rel_key)
+
+    # ------------------------------------------------------------------
+    # live editing
+    # ------------------------------------------------------------------
+    def _on_row_changed(self, rel_key: str):
+        self._update_row_layout_entry(rel_key)
+        self._refresh_all_previews()
+
+    def _update_row_layout_entry(self, rel_key: str):
+        row = self._rows.get(rel_key)
+        if not row:
+            return
+        mode = row["combo"].currentData()
+        name = row["rename"].text().strip()
+        if mode is None and not name:
+            # Pure inherit, no rename -- no entry needed (keeps the saved
+            # JSON small; see Q3 in the design notes).
+            self._working_layout.pop(rel_key, None)
+        elif name:
+            entry = {"name": name}
+            entry["mode"] = mode if mode is not None else 2
+            self._working_layout[rel_key] = entry
+        else:
+            self._working_layout[rel_key] = mode
+
+    def _refresh_all_previews(self):
+        for rel_key in self._rows:
+            self._update_preview(rel_key)
+
+    def _update_preview(self, rel_key: str):
+        row = self._rows.get(rel_key)
+        if not row:
+            return
+        rel_parts = row["rel_parts"]
+        root_is_catalog = self.root_is_catalog_cb.isChecked()
+        root_catalog_name = self.catalog_name_edit.text().strip()
+
+        # A row explicitly set to "No subcatalogs" on ITSELF (not
+        # inherited from a parent) means THIS folder is the app -- like
+        # FastStone directly under GRAPHICS. Preview that folder's own
+        # path, not a synthetic child, or resolve_scan_root_layout's
+        # self-match logic would be queried one level too deep and give a
+        # wrong (non-None) subcatalog. Everything else (has-subcatalog,
+        # inherit, or an ANCESTOR further up owning the no-subcatalog
+        # setting -- e.g. ADOBE) previews one level down instead, since
+        # the real app is a folder not yet known.
+        own_mode = row["combo"].currentData()
+        if own_mode == 0:
+            # If we already know a real child folder name (fetched when
+            # this row's own children were listed), show it as the app --
+            # matches what the user will actually see on disk. Falls back
+            # to this folder's own name when no child is known yet (the
+            # common case: the folder itself already IS the leaf/app,
+            # e.g. FastStone directly holding its installer).
+            known_child = row.get("first_child_name")
+            if known_child:
+                sample_path = os.path.join(self.root_path, *rel_parts, known_child)
+                app_label = known_child
+            else:
+                sample_path = os.path.join(self.root_path, *rel_parts)
+                app_label = rel_parts[-1]
+        else:
+            # Two synthetic segments, not one: if only "App" were appended,
+            # a row whose subcatalog would land exactly one level below it
+            # (e.g. any top-level row with no deeper override configured)
+            # would have that placeholder text leak into the COMPUTED
+            # subcatalog itself, not just the displayed app name. Using a
+            # real known child folder name (if any) for the first segment
+            # keeps the preview honest; "App" only ever appears as the
+            # final, cosmetic app-name placeholder.
+            mid_segment = row.get("first_child_name") or "Category"
+            sample_path = os.path.join(self.root_path, *rel_parts, mid_segment, "App")
+            app_label = "App"
+
+        catalog, subcatalog, depth, skip = resolve_scan_root_layout(
+            self.root_path, sample_path, self._working_layout,
+            root_is_catalog=root_is_catalog, root_catalog_name=root_catalog_name,
+        )
+        if skip:
+            row["preview"].setText("(not imported — skipped)")
+            return
+        row["preview"].setText(f"{catalog or '—'} / {subcatalog or '—'} / {app_label}")
+
+    def _on_root_is_catalog_toggled(self, checked: bool):
+        self.catalog_name_edit.setEnabled(checked)
+        self._refresh_all_previews()
+
+    def _use_default_for_all(self):
+        for rel_key, row in self._rows.items():
+            default_idx = 0  # "Has subcatalogs" for top rows, "Inherit" for children
+            row["combo"].setCurrentIndex(default_idx)
+            row["rename"].clear()
+
+    # ------------------------------------------------------------------
+    # save
+    # ------------------------------------------------------------------
+    def _on_ok(self):
+        # Top-level rows are always written explicitly (even at the
+        # default), so a future re-scan doesn't treat an already-seen,
+        # unchanged folder as "new" again.
+        for rel_key, row in self._rows.items():
+            if row["is_top"] and rel_key not in self._working_layout:
+                self._working_layout[rel_key] = row["combo"].currentData()
+
+        # Prune keys whose folder no longer exists on disk (e.g. renamed/
+        # deleted since the config was last saved) -- low priority but
+        # cheap to do on every save.
+        pruned = _prune_orphaned_layout_keys(self.root_path, self._working_layout)
+
+        root_is_catalog = self.root_is_catalog_cb.isChecked() if self.root_is_catalog_cb else \
+            bool(self.scan_root_row.get("root_is_catalog"))
+        root_catalog_name = self.catalog_name_edit.text().strip() if self.catalog_name_edit else \
+            self.scan_root_row.get("root_catalog_name")
+
+        self.db.save_folder_layout(
+            self.scan_root_row["id"], pruned,
+            root_is_catalog=root_is_catalog, root_catalog_name=root_catalog_name or None,
+        )
+        self.accept()
+
+
+def _folder_exists_case_insensitive(root_path: str, key_parts: list) -> bool:
+    """
+    Layout keys are stored lowercased, but the real folder names on disk
+    keep their original casing -- os.path.isdir(root/lowercased/parts)
+    would wrongly report "missing" on any case-sensitive filesystem (and,
+    just as importantly, must never be relied on to be case-preserving on
+    Windows either). Walks down one segment at a time, matching each
+    segment case-insensitively via os.scandir.
+    """
+    current = root_path
+    for part in key_parts:
+        try:
+            with os.scandir(current) as it:
+                match = next((e.name for e in it if e.is_dir(follow_symlinks=False)
+                              and e.name.lower() == part), None)
+        except OSError:
+            return False
+        if match is None:
+            return False
+        current = os.path.join(current, match)
+    return True
+
+
+def _prune_orphaned_layout_keys(root_path: str, layout: dict) -> dict:
+    """
+    Drops layout keys whose folder no longer exists under root_path (e.g.
+    the on-disk folder was renamed or deleted after the config was saved).
+    Cheap (a handful of os.scandir calls per key) at the scale this app
+    runs at.
+    """
+    pruned = {}
+    for key, value in layout.items():
+        if _folder_exists_case_insensitive(root_path, key.split("/")):
+            pruned[key] = value
+    return pruned
+
+
 class ScanRootsDialog(QDialog):
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
@@ -837,9 +1188,9 @@ class ScanRootsDialog(QDialog):
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
-            ["Path", "Last scan started", "Last scan finished", "Status", "", ""]
+            ["Path", "Last scan started", "Last scan finished", "Status", "", "", "", ""]
         )
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -850,6 +1201,30 @@ class ScanRootsDialog(QDialog):
         add_btn = QPushButton("Add new scan root…")
         add_btn.clicked.connect(self._add_new_root)
         btn_row.addWidget(add_btn)
+        delete_btn = QPushButton("Delete selected root…")
+        delete_btn.setToolTip(
+            "Forgets the selected scan root and its staged scan data. Does NOT remove "
+            "apps already in the catalog from it -- use this for a root added by "
+            "mistake, a duplicate, or one that's permanently gone."
+        )
+        delete_btn.clicked.connect(self._delete_selected_root)
+        btn_row.addWidget(delete_btn)
+        btn_row.addSpacing(20)
+        rescan_all_btn = QPushButton("Re-scan all roots")
+        rescan_all_btn.setToolTip(
+            "Re-scans every scan root above, one at a time (never in parallel). Each "
+            "root still skips anything unchanged, same as its own \"Re-scan now\"."
+        )
+        rescan_all_btn.clicked.connect(self._rescan_all)
+        btn_row.addWidget(rescan_all_btn)
+        clean_all_btn = QPushButton("Clean library (all roots)")
+        clean_all_btn.setToolTip(
+            "Checks EVERY app in the catalog, from every scan root, for whether its "
+            "file still exists on disk -- removes catalog records for anything that "
+            "doesn't. Never looks for new apps."
+        )
+        clean_all_btn.clicked.connect(self._clean_library_all)
+        btn_row.addWidget(clean_all_btn)
         btn_row.addStretch()
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
@@ -866,7 +1241,10 @@ class ScanRootsDialog(QDialog):
             values = [r["path"], r["last_scan_started_at"] or "", r["last_scan_finished_at"] or "",
                       r["last_scan_status"] or ""]
             for j, val in enumerate(values):
-                self.table.setItem(i, j, QTableWidgetItem(val))
+                item = QTableWidgetItem(val)
+                if j == 0:
+                    item.setData(Qt.UserRole, r["id"])
+                self.table.setItem(i, j, item)
             rescan_btn = QPushButton("Re-scan now")
             rescan_btn.clicked.connect(lambda _checked, p=r["path"]: self._rescan(p))
             self.table.setCellWidget(i, 4, rescan_btn)
@@ -878,12 +1256,85 @@ class ScanRootsDialog(QDialog):
             )
             clean_btn.clicked.connect(lambda _checked, p=r["path"]: self._clean_library(p))
             self.table.setCellWidget(i, 5, clean_btn)
+            repath_btn = QPushButton("Change path…")
+            repath_btn.setToolTip(
+                "Drive letter or mount point changed? Point this scan root at its new "
+                "location -- every path already in the catalog from here gets rewritten "
+                "to match. No re-scan needed."
+            )
+            repath_btn.clicked.connect(lambda _checked, rid=r["id"]: self._change_path(rid))
+            self.table.setCellWidget(i, 6, repath_btn)
+            layout_btn = QPushButton("Edit folder layout…")
+            layout_btn.setToolTip(
+                "Declare which top-level folders under this root have subcategories, "
+                "have none, or should be skipped entirely."
+            )
+            layout_btn.clicked.connect(lambda _checked, rid=r["id"]: self._edit_layout(rid))
+            self.table.setCellWidget(i, 7, layout_btn)
         self.table.resizeColumnsToContents()
+
+    def _change_path(self, scan_root_id: int):
+        row = self.db.get_scan_root_by_id(scan_root_id)
+        if row is None:
+            return
+        new_path, ok = QInputDialog.getText(
+            self, "Change scan root path",
+            "New path for this scan root (rewrites every stored path under it):",
+            text=row["path"],
+        )
+        if not ok or not new_path.strip():
+            return
+        new_path = new_path.strip()
+        if not os.path.isdir(new_path):
+            proceed = QMessageBox.question(
+                self, "Path not found",
+                f"'{new_path}' doesn't exist or isn't reachable right now (the drive "
+                "may not be connected). The catalog update is still valid either way -- "
+                "continue?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if proceed != QMessageBox.Yes:
+                return
+        try:
+            counts = update_scan_root_path(self.db, scan_root_id, new_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Repath failed", f"Could not update the catalog:\n{e}")
+            return
+        QMessageBox.information(
+            self, "Path updated",
+            "Scan root path updated. Rows rewritten:\n"
+            f"  raw_candidates: {counts['raw_candidates']}\n"
+            f"  variants: {counts['variants']}\n"
+            f"  scan_errors: {counts['scan_errors']}",
+        )
+        self._load_rows()
+        main_window = self.parent()
+        if main_window is not None and hasattr(main_window, "refresh_all"):
+            main_window.refresh_all()
+
+    def _edit_layout(self, scan_root_id: int):
+        row = self.db.get_scan_root_by_id(scan_root_id)
+        if row is None:
+            return
+        dialog = FolderLayoutDialog(self.db, row, parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            QMessageBox.information(
+                self, "Layout saved",
+                "Folder layout saved. Run \"Re-scan now\" to apply it -- existing "
+                "raw_candidates rows aren't changed until then.",
+            )
+            self._load_rows()
 
     def _rescan(self, path: str):
         main_window = self.parent()
         if main_window is not None and hasattr(main_window, "_run_scan_and_resolve"):
             main_window._run_scan_and_resolve(path)
+        self.accept()
+
+    def _rescan_all(self):
+        main_window = self.parent()
+        if main_window is not None and hasattr(main_window, "_run_rescan_all_roots"):
+            main_window._run_rescan_all_roots()
         self.accept()
 
     def _clean_library(self, path: str):
@@ -892,11 +1343,50 @@ class ScanRootsDialog(QDialog):
             main_window._run_clean_library(path)
         self.accept()
 
+    def _clean_library_all(self):
+        main_window = self.parent()
+        if main_window is not None and hasattr(main_window, "_run_clean_library"):
+            main_window._run_clean_library(None)
+        self.accept()
+
     def _add_new_root(self):
         folder = QFileDialog.getExistingDirectory(self, "Choose folder to scan")
         if not folder:
             return
         self._rescan(folder)
+
+    def _delete_selected_root(self):
+        row_idx = self.table.currentRow()
+        if row_idx < 0:
+            QMessageBox.information(self, "No selection", "Select a scan root row first.")
+            return
+        path_item = self.table.item(row_idx, 0)
+        scan_root_id = path_item.data(Qt.UserRole)
+        path = path_item.text()
+
+        confirm = QMessageBox.question(
+            self, "Delete scan root",
+            f"Forget this scan root?\n\n{path}\n\n"
+            "This removes its staged scan data (raw candidates, scan errors). Apps "
+            "already resolved into the catalog from it are NOT deleted -- they just "
+            "lose their link back to this root. This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        try:
+            counts = delete_scan_root(self.db, scan_root_id)
+        except Exception as e:
+            QMessageBox.critical(self, "Delete failed", f"Could not delete the scan root:\n{e}")
+            return
+        QMessageBox.information(
+            self, "Scan root deleted",
+            "Scan root removed. Rows affected:\n"
+            f"  raw_candidates: {counts['raw_candidates']}\n"
+            f"  scan_errors: {counts['scan_errors']}\n"
+            f"  variants unlinked (apps kept): {counts['variants_unlinked']}",
+        )
+        self._load_rows()
 
 
 class CleanLibraryReviewDialog(QDialog):
@@ -918,18 +1408,21 @@ class CleanLibraryReviewDialog(QDialog):
         layout = QVBoxLayout(self)
 
         intro = QLabel(
-            f"<b>{len(missing)} item(s)</b> already in the catalog no longer exist on disk "
-            "(deleted, moved, or replaced outside this app). Uncheck anything you don't want "
-            "removed from the catalog -- this only removes the catalog record, there's nothing "
-            "left on disk to touch either way."
+            f"<b>{len(missing)} item(s)</b> are no longer valid: either the file itself is gone "
+            "(deleted, moved, or replaced outside this app), its scan root's drive/folder isn't "
+            "reachable right now, or its scan root was removed from this app entirely. See the "
+            "Reason column for which. Uncheck anything you don't want removed from the catalog -- "
+            "this only removes the catalog record, it never touches the filesystem."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        self.table = QTableWidget(len(missing), 4)
-        self.table.setHorizontalHeaderLabels(["Remove", "App", "Version", "Source path (no longer exists)"])
+        self.table = QTableWidget(len(missing), 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Remove", "App", "Version", "Reason", "Source path (no longer valid)"]
+        )
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self._checks = []
         for i, item in enumerate(missing):
             checkbox = QCheckBox()
@@ -943,7 +1436,8 @@ class CleanLibraryReviewDialog(QDialog):
             self._checks.append(checkbox)
             self.table.setItem(i, 1, QTableWidgetItem(item.app_name))
             self.table.setItem(i, 2, QTableWidgetItem(item.version))
-            self.table.setItem(i, 3, QTableWidgetItem(item.source_path))
+            self.table.setItem(i, 3, QTableWidgetItem(getattr(item, "reason", "file not found")))
+            self.table.setItem(i, 4, QTableWidgetItem(item.source_path))
         self.table.resizeColumnsToContents()
         layout.addWidget(self.table)
 
@@ -1702,24 +2196,42 @@ class MainWindow(QMainWindow):
         self.resize(1200, 750)
 
         self._active_worker = None
+        self._batch_rescan_remaining = []
+        self._batch_rescan_total = 0
+        self._batch_rescan_failures = []
+        self._batch_rescan_current_path = None
 
         self._build_toolbar()
         self._build_central_widget()
         self._build_status_bar()
         self.refresh_all()
 
+    def _release_worker(self):
+        """
+        Clears self._active_worker safely. The custom finished_ok/failed
+        signals fire from inside the worker's run(), which is not
+        necessarily the exact instant the underlying OS thread has fully
+        wound down -- dropping the last Python reference to a QThread
+        that Qt doesn't yet consider finished() prints "QThread:
+        Destroyed while thread is still running" and can crash outright
+        (this is what caused the occasional crash after Re-resolve
+        all -> Clean library). wait() blocks until the thread has
+        genuinely finished; if it already has (the overwhelmingly common
+        case), it returns immediately, so this costs nothing in practice.
+        """
+        worker = self._active_worker
+        if worker is not None:
+            worker.wait()
+        self._active_worker = None
+
     def _build_toolbar(self):
         toolbar = QToolBar("Main")
         self.addToolBar(toolbar)
 
-        pick_root_action = QAction("Add scan root…", self)
-        pick_root_action.triggered.connect(self._pick_and_scan_root)
-        toolbar.addAction(pick_root_action)
-
         scan_roots_action = QAction("Scan roots…", self)
         scan_roots_action.setToolTip(
-            "View previously-added scan roots and re-scan any of them "
-            "(picks up new/changed files, skips anything unchanged)"
+            "Add, re-scan, repath, or delete scan roots (picks up new/changed files "
+            "on re-scan, skips anything unchanged)"
         )
         scan_roots_action.triggered.connect(self._show_scan_roots)
         toolbar.addAction(scan_roots_action)
@@ -2037,12 +2549,6 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "No versions", "This app has no versions.")
 
-    def _pick_and_scan_root(self):
-        folder = QFileDialog.getExistingDirectory(self, "Choose folder to scan")
-        if not folder:
-            return
-        self._run_scan_and_resolve(folder)
-
     def _show_scan_roots(self):
         dialog = ScanRootsDialog(self.db, parent=self)
         dialog.exec()
@@ -2083,9 +2589,36 @@ class MainWindow(QMainWindow):
         dialog.exec()
         self.refresh_all()
 
+    def _maybe_show_folder_layout_dialog(self, root_path: str) -> bool:
+        """
+        Runs before every scan (main thread, non-blocking -- just a
+        top-level os.scandir): opens FolderLayoutDialog if this is the
+        first-ever scan of the root, or if new top-level folders have
+        appeared since it was last configured. Returns False if the user
+        cancelled, in which case the scan must not proceed at all.
+        """
+        scan_root_id = self.db.ensure_scan_root(root_path)
+        scan_root_row = self.db.get_scan_root_by_id(scan_root_id)
+        layout = self.db.get_folder_layout(scan_root_id)
+
+        top_level = list_top_level_folders(root_path)
+        configured = {k.split("/")[0] for k in layout.keys()}
+        new_folders = [n for n in top_level if n.lower() not in configured]
+
+        if layout and not new_folders:
+            return True  # already configured, nothing new -- proceed silently
+
+        dialog = FolderLayoutDialog(
+            self.db, scan_root_row, parent=self,
+            only_new_folders=new_folders if layout else None,
+        )
+        return dialog.exec() == QDialog.Accepted
+
     def _run_scan_and_resolve(self, root_path: str):
         if self._active_worker is not None:
             QMessageBox.information(self, "Busy", "A scan/resolve job is already running.")
+            return
+        if not self._maybe_show_folder_layout_dialog(root_path):
             return
         worker = ScanAndResolveWorker(self.db_path, root_path)
         worker.scan_progress.connect(self._on_scan_progress)
@@ -2097,11 +2630,68 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Scanning {root_path} …")
         worker.start()
 
-    def _run_clean_library(self, root_path: str):
-        """Confirms every app already in the catalog from `root_path`
-        still exists on disk -- the opposite of a scan, see
-        app_manager.scan_for_missing_sources()'s docstring. Never looks
-        for new apps."""
+    def _run_rescan_all_roots(self):
+        """
+        Re-scans every known scan root, one at a time -- never in
+        parallel, since ScanAndResolveWorker/the DB connection aren't set
+        up for concurrent jobs. Each root still goes through the normal
+        single-root path (including FolderLayoutDialog if that root has
+        new top-level folders); a root that fails or gets skipped doesn't
+        stop the rest of the batch. Continuation is driven from
+        _on_scan_resolve_finished/_on_job_failed (already connected
+        before the worker starts) rather than a fresh connect() made
+        after _run_scan_and_resolve returns -- connecting afterwards
+        would race a worker that finishes before that connect() runs.
+        """
+        if self._active_worker is not None:
+            QMessageBox.information(self, "Busy", "A scan/resolve/scrape job is already running.")
+            return
+        conn = self.db.connect()
+        paths = [r["path"] for r in conn.execute("SELECT path FROM scan_roots ORDER BY path").fetchall()]
+        if not paths:
+            QMessageBox.information(self, "No scan roots", "There are no scan roots to re-scan yet.")
+            return
+        self._batch_rescan_remaining = paths
+        self._batch_rescan_total = len(paths)
+        self._batch_rescan_failures = []
+        self._batch_rescan_current_path = None
+        self._advance_batch_rescan()
+
+    def _advance_batch_rescan(self):
+        if not self._batch_rescan_remaining:
+            total = self._batch_rescan_total
+            failures = self._batch_rescan_failures
+            self._batch_rescan_total = 0
+            self._batch_rescan_current_path = None
+            if total:  # guards against a stray call when no batch is active
+                msg = f"Re-scanned all {total} scan root(s)."
+                if failures:
+                    msg += f"\n\n{len(failures)} had a problem:\n" + "\n".join(failures)
+                self.status_label.setText("Ready.")
+                QMessageBox.information(self, "Re-scan all roots", msg)
+            return
+
+        next_path = self._batch_rescan_remaining.pop(0)
+        self._batch_rescan_current_path = next_path
+        done_so_far = self._batch_rescan_total - len(self._batch_rescan_remaining)
+        self.status_label.setText(
+            f"Re-scanning root {done_so_far}/{self._batch_rescan_total}: {next_path} …"
+        )
+        worker_before = self._active_worker
+        self._run_scan_and_resolve(next_path)
+        if self._active_worker is worker_before:
+            # _run_scan_and_resolve returned without starting a job (the
+            # user cancelled this root's FolderLayoutDialog) -- skip it
+            # and keep the batch moving rather than stalling on one root.
+            self._batch_rescan_failures.append(f"{next_path} (skipped)")
+            self._batch_rescan_current_path = None
+            self._advance_batch_rescan()
+
+    def _run_clean_library(self, root_path: Optional[str]):
+        """Confirms every app already in the catalog -- from `root_path`,
+        or the whole catalog when root_path is None -- still exists on
+        disk. The opposite of a scan, see app_manager.scan_for_missing_
+        sources()'s docstring. Never looks for new apps."""
         if self._active_worker is not None:
             QMessageBox.information(self, "Busy", "A scan/resolve/scrape job is already running.")
             return
@@ -2112,7 +2702,8 @@ class MainWindow(QMainWindow):
         self._active_worker = worker
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
-        self.status_label.setText(f"Checking whether apps from {root_path} still exist…")
+        target = root_path or "the whole catalog"
+        self.status_label.setText(f"Checking whether apps from {target} still exist…")
         worker.start()
 
     def _on_clean_library_progress(self, checked: int, total: int):
@@ -2121,15 +2712,16 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(checked)
         self.status_label.setText(f"Checking… {checked}/{total}")
 
-    def _on_clean_library_scanned(self, missing: list, root_path: str):
+    def _on_clean_library_scanned(self, missing: list, root_path: Optional[str]):
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 100)
-        self._active_worker = None
+        self._release_worker()
         self.status_label.setText("Ready.")
+        target = f"from:\n{root_path}" if root_path else "in the whole catalog"
         if not missing:
             QMessageBox.information(
                 self, "Clean library",
-                f"Everything already in the catalog from:\n{root_path}\n\n"
+                f"Everything already in the catalog {target}\n\n"
                 "still exists on disk. Nothing to clean up.",
             )
             return
@@ -2178,7 +2770,7 @@ class MainWindow(QMainWindow):
     def _on_scrape_finished(self, result: ScrapeResult):
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 100)
-        self._active_worker = None
+        self._release_worker()
         if result.status == "failed":
             self.status_label.setText("Scrape failed to run.")
             detail = f"\n\n({result.manifest_error})" if result.manifest_error else ""
@@ -2230,7 +2822,7 @@ class MainWindow(QMainWindow):
     def _on_monitor_finished(self, result):
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 100)
-        self._active_worker = None
+        self._release_worker()
         if result is None:
             self.status_label.setText("Monitor: cancelled.")
             return
@@ -2247,7 +2839,7 @@ class MainWindow(QMainWindow):
     def _on_monitor_failed(self, err: str):
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 100)
-        self._active_worker = None
+        self._release_worker()
         self.status_label.setText("Monitor failed.")
         QMessageBox.critical(self, "Monitor failed", err)
 
@@ -2262,7 +2854,7 @@ class MainWindow(QMainWindow):
 
     def _on_scan_resolve_finished(self, scan_result, resolve_result):
         self.progress_bar.setVisible(False)
-        self._active_worker = None
+        self._release_worker()
         if resolve_result is None:
             self.status_label.setText("Scan cancelled.")
         else:
@@ -2271,10 +2863,13 @@ class MainWindow(QMainWindow):
                 f"{resolve_result.apps_created} new apps, {resolve_result.apps_updated} apps updated."
             )
         self.refresh_all()
+        if self._batch_rescan_total and self._batch_rescan_current_path is not None:
+            self._batch_rescan_current_path = None
+            self._advance_batch_rescan()
 
     def _on_resolve_only_finished(self, resolve_result):
         self.progress_bar.setVisible(False)
-        self._active_worker = None
+        self._release_worker()
         self.status_label.setText(
             f"Re-resolve done. {resolve_result.apps_created} new, "
             f"{resolve_result.apps_updated} updated, "
@@ -2285,9 +2880,13 @@ class MainWindow(QMainWindow):
     def _on_job_failed(self, error_message: str):
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 100)
-        self._active_worker = None
+        self._release_worker()
         self.status_label.setText("Job failed.")
         QMessageBox.critical(self, "Job failed", error_message)
+        if self._batch_rescan_total and self._batch_rescan_current_path is not None:
+            self._batch_rescan_failures.append(f"{self._batch_rescan_current_path}: {error_message}")
+            self._batch_rescan_current_path = None
+            self._advance_batch_rescan()
 
     def _open_settings(self):
         dialog = SettingsDialog(self.db, parent=self)

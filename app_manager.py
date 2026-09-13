@@ -51,6 +51,193 @@ log = logging.getLogger("appcatalog.organizer")
 log_job = logging.getLogger("appcatalog.organizer.job")
 
 # ======================================================================
+# 0. Scan root path management (Feature A: repath a moved/remounted drive)
+# ======================================================================
+
+def _starts_with_root(path: Optional[str], root_norm: str) -> bool:
+    """
+    Case-insensitive prefix match with a separator boundary -- i.e. a real
+    ancestor-path check, not a substring check. `root_norm` must already be
+    stripped of any trailing separator. Deliberately rejects a path that
+    merely starts with the same characters but isn't actually under the
+    root, e.g. root D:\\PROGRAMS must not match D:\\PROGRAMS2\\Foo.
+    """
+    if not path:
+        return False
+    if path.lower() == root_norm.lower():
+        return True
+    return path.lower().startswith(root_norm.lower() + os.sep) or \
+        path.lower().startswith(root_norm.lower() + "/")
+
+
+def _rewrite_prefix(path: Optional[str], old_root_norm: str, new_root_norm: str) -> Optional[str]:
+    """
+    Replaces the old_root_norm prefix with new_root_norm, preserving
+    everything after it (the relative install-folder trail) byte-for-byte,
+    including its original separator style/casing. Only called on paths
+    already confirmed by _starts_with_root() to actually be under the root.
+    """
+    if path is None:
+        return None
+    if path.lower() == old_root_norm.lower():
+        return new_root_norm
+    tail = path[len(old_root_norm):]  # keeps its leading separator + original casing
+    return new_root_norm + tail
+
+
+def update_scan_root_path(db: Database, scan_root_id: int, new_root_path: str) -> dict:
+    """
+    Rewrites a scan root's path AND every absolute path in the catalog
+    derived from it -- for when the external/backup drive it lives on
+    changes mount point (D:\\ -> E:\\, or a UNC path gets remounted).
+    Does NOT touch the filesystem and does NOT re-scan/re-resolve; the
+    folder structure under the root is assumed unchanged. Prefix-match
+    only (never a naive substring replace), so a sibling path that merely
+    shares characters with the old root is never touched. Transactional:
+    all four tables update together or not at all.
+
+    Returns a per-table row-count dict for the GUI, e.g.
+    {"scan_roots": 1, "raw_candidates": 214, "variants": 240, "scan_errors": 2}.
+    """
+    conn = db.connect()
+    row = conn.execute("SELECT path FROM scan_roots WHERE id = ?", (scan_root_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"No scan root with id={scan_root_id}")
+
+    old_root = row["path"].rstrip("\\/")
+    new_root = new_root_path.rstrip("\\/")
+    if not new_root:
+        raise ValueError("New root path cannot be empty")
+
+    counts = {"scan_roots": 0, "raw_candidates": 0, "variants": 0, "scan_errors": 0}
+
+    try:
+        conn.execute("BEGIN")
+
+        cur = conn.execute(
+            "UPDATE scan_roots SET path = ? WHERE id = ?", (new_root, scan_root_id)
+        )
+        counts["scan_roots"] = cur.rowcount
+
+        rc_rows = conn.execute(
+            "SELECT id, folder_path FROM raw_candidates WHERE scan_root_id = ?",
+            (scan_root_id,),
+        ).fetchall()
+        for r in rc_rows:
+            if _starts_with_root(r["folder_path"], old_root):
+                new_path = _rewrite_prefix(r["folder_path"], old_root, new_root)
+                conn.execute(
+                    "UPDATE raw_candidates SET folder_path = ? WHERE id = ?",
+                    (new_path, r["id"]),
+                )
+                counts["raw_candidates"] += 1
+
+        # variants doesn't store scan_root_id directly -- scope the rewrite
+        # via the join so a variant from another root sharing a path prefix
+        # is never touched.
+        v_rows = conn.execute(
+            """
+            SELECT v.id, v.source_path FROM variants v
+            JOIN raw_candidates rc ON rc.id = v.raw_candidate_id
+            WHERE rc.scan_root_id = ?
+            """,
+            (scan_root_id,),
+        ).fetchall()
+        for r in v_rows:
+            if _starts_with_root(r["source_path"], old_root):
+                new_path = _rewrite_prefix(r["source_path"], old_root, new_root)
+                conn.execute(
+                    "UPDATE variants SET source_path = ? WHERE id = ?",
+                    (new_path, r["id"]),
+                )
+                counts["variants"] += 1
+
+        se_rows = conn.execute(
+            "SELECT id, path FROM scan_errors WHERE scan_root_id = ?",
+            (scan_root_id,),
+        ).fetchall()
+        for r in se_rows:
+            if _starts_with_root(r["path"], old_root):
+                new_path = _rewrite_prefix(r["path"], old_root, new_root)
+                conn.execute(
+                    "UPDATE scan_errors SET path = ? WHERE id = ?",
+                    (new_path, r["id"]),
+                )
+                counts["scan_errors"] += 1
+
+        conn.execute(
+            "INSERT INTO audit_log (entity_type, entity_id, action, detail_json) VALUES (?,?,?,?)",
+            ("scan_root", scan_root_id, "path_change",
+             json.dumps({"old_path": old_root, "new_path": new_root, "counts": counts})),
+        )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        log.exception("Repath FAILED for scan_root_id=%s (%r -> %r); rolled back.",
+                      scan_root_id, old_root, new_root)
+        raise
+
+    log.info("Repathed scan_root_id=%s: %r -> %r (%s)", scan_root_id, old_root, new_root, counts)
+    return counts
+
+
+def delete_scan_root(db: Database, scan_root_id: int) -> dict:
+    """
+    Forgets a scan root entirely: deletes the scan_roots row along with
+    the raw_candidates/scan_errors rows staged from it (ON DELETE CASCADE).
+    Does NOT touch the resolved catalog -- variants that came from this
+    root have their raw_candidate_id set to NULL (ON DELETE SET NULL) and
+    their parent apps are left exactly as they are. Use this to drop a
+    root that was added by mistake, is a duplicate, or is permanently
+    gone -- not as a way to remove apps from the catalog.
+
+    Returns a row-count dict for the GUI, e.g.
+    {"raw_candidates": 214, "scan_errors": 2, "variants_unlinked": 240}.
+    """
+    conn = db.connect()
+    row = conn.execute("SELECT path FROM scan_roots WHERE id = ?", (scan_root_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"No scan root with id={scan_root_id}")
+    path = row["path"]
+
+    counts = {"raw_candidates": 0, "scan_errors": 0, "variants_unlinked": 0}
+    try:
+        conn.execute("BEGIN")
+
+        counts["raw_candidates"] = conn.execute(
+            "SELECT COUNT(*) c FROM raw_candidates WHERE scan_root_id = ?", (scan_root_id,)
+        ).fetchone()["c"]
+        counts["scan_errors"] = conn.execute(
+            "SELECT COUNT(*) c FROM scan_errors WHERE scan_root_id = ?", (scan_root_id,)
+        ).fetchone()["c"]
+        counts["variants_unlinked"] = conn.execute(
+            """
+            SELECT COUNT(*) c FROM variants v
+            JOIN raw_candidates rc ON rc.id = v.raw_candidate_id
+            WHERE rc.scan_root_id = ?
+            """,
+            (scan_root_id,),
+        ).fetchone()["c"]
+
+        conn.execute("DELETE FROM scan_roots WHERE id = ?", (scan_root_id,))
+
+        conn.execute(
+            "INSERT INTO audit_log (entity_type, entity_id, action, detail_json) VALUES (?,?,?,?)",
+            ("scan_root", scan_root_id, "deleted", json.dumps({"path": path, "counts": counts})),
+        )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        log.exception("Delete FAILED for scan_root_id=%s (%r); rolled back.", scan_root_id, path)
+        raise
+
+    log.info("Deleted scan_root_id=%s (%r): %s", scan_root_id, path, counts)
+    return counts
+
+
+# ======================================================================
 # 1. Duplicate detection
 # ======================================================================
 
@@ -1645,6 +1832,7 @@ class MissingItem:
     version: str
     source_path: str
     raw_candidate_id: Optional[int]
+    reason: str = "file not found"
 
 
 @dataclass
@@ -1677,35 +1865,68 @@ def scan_for_missing_sources(
 ) -> list[MissingItem]:
     """
     DRY RUN, read-only, never touches the DB or filesystem beyond
-    `os.path.exists()` checks -- confirms every variant's source_path
-    still exists. Scoped to variants whose source_path currently lives
-    under `root_path` when one is given (so running this from one scan
-    root's row in ScanRootsDialog -- e.g. an external drive that simply
-    isn't plugged in right now -- can't wrongly flag every OTHER root's
-    apps as missing too); pass root_path=None to check the whole catalog
+    os.path.exists()/os.path.isdir() checks. For each variant, in order:
+
+      1. Its scan root is gone from scan_roots entirely (raw_candidate_id
+         is NULL -- this happens once a root is removed via "Delete
+         selected root", which deliberately leaves apps/variants in
+         place but unlinks them). Flagged missing outright; there's no
+         live root left to even check a path against.
+      2. Its scan root IS still registered, but that root's own path
+         isn't reachable right now (external/network drive unplugged,
+         letter remounted elsewhere, etc). Flagged missing WITHOUT
+         checking the individual file -- if the whole root is gone,
+         everything under it is too, and this also sidesteps a slow or
+         flaky per-file stat against a drive that isn't there.
+      3. Otherwise, the normal per-file os.path.exists() check (the
+         original behaviour): the file itself may have been deleted,
+         moved, or replaced by hand even though its root is fine.
+
+    Scoped to variants whose source_path currently lives under
+    `root_path` when one is given (so running this from one scan root's
+    row in ScanRootsDialog can't wrongly flag every OTHER root's apps as
+    missing too); pass root_path=None to check the whole catalog
     regardless of which root each variant came from.
     """
     conn = db.connect()
     rows = conn.execute("""
         SELECT v.id AS variant_id, v.app_id, v.source_path, v.version,
-               v.raw_candidate_id, a.name AS app_name
-        FROM variants v JOIN apps a ON a.id = v.app_id
+               v.raw_candidate_id, a.name AS app_name, rc.scan_root_id
+        FROM variants v
+        JOIN apps a ON a.id = v.app_id
+        LEFT JOIN raw_candidates rc ON rc.id = v.raw_candidate_id
         ORDER BY a.name, v.version
     """).fetchall()
 
     if root_path:
         rows = [r for r in rows if _path_is_under(r["source_path"], root_path)]
 
+    # One reachability check per scan root (not per variant) -- cheap and
+    # avoids repeatedly stat-ing a drive that isn't there.
+    root_reachable: dict[int, bool] = {}
+    for r in conn.execute("SELECT id, path FROM scan_roots").fetchall():
+        root_reachable[r["id"]] = os.path.isdir(r["path"])
+
     missing: list[MissingItem] = []
     total = len(rows)
     for i, r in enumerate(rows, start=1):
         if cancel_flag and cancel_flag():
             break
-        if not os.path.exists(r["source_path"]):
+
+        reason = None
+        if r["raw_candidate_id"] is None:
+            reason = "scan root no longer tracked"
+        elif not root_reachable.get(r["scan_root_id"], True):
+            reason = "scan root path unreachable"
+        elif not os.path.exists(r["source_path"]):
+            reason = "file not found"
+
+        if reason:
             missing.append(MissingItem(
                 variant_id=r["variant_id"], app_id=r["app_id"],
                 app_name=r["app_name"] or "", version=r["version"] or "",
                 source_path=r["source_path"], raw_candidate_id=r["raw_candidate_id"],
+                reason=reason,
             ))
         if on_progress and (i % 25 == 0 or i == total):
             on_progress(i, total)
