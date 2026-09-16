@@ -10,7 +10,7 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QItemSelectionModel
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QTableView,
@@ -37,10 +37,43 @@ from app_manager import execute_clean_library, update_scan_root_path, delete_sca
 from scanner import resolve_scan_root_layout, list_top_level_folders, list_child_folders
 
 from gui_backend import (
-    AppsTableModel, AppPickerDialog, COLUMNS, export_apps_csv, import_apps_csv,
+    AppsTableModel, AppsTableDelegate, AppPickerDialog, COLUMNS,
+    export_apps_csv, import_apps_csv,
     ScanWorker, ScanAndResolveWorker, ResolveWorker, ScrapeWorker,
     ChocoSearchWorker, WingetSearchWorker, CleanLibraryScanWorker,
 )
+
+
+# =============================================================
+# Module-scope helpers
+# =============================================================
+
+def _set_app_tags(db: Database, app_id: int, tag_names: list) -> None:
+    """
+    Replace an app's tag list wholesale. Creates any tag row that
+    doesn't exist yet. Used by the detail panel's editable Tags field
+    (single and multi selection).
+    """
+    conn = db.connect()
+    conn.execute("DELETE FROM app_tags WHERE app_id = ?", (app_id,))
+    seen = set()
+    for name in tag_names:
+        name = (name or "").strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        row = conn.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
+        if row:
+            tag_id = row["id"]
+        else:
+            tag_id = conn.execute(
+                "INSERT INTO tags (name) VALUES (?)", (name,)
+            ).lastrowid
+        conn.execute(
+            "INSERT OR IGNORE INTO app_tags (app_id, tag_id) VALUES (?, ?)",
+            (app_id, tag_id),
+        )
+    conn.commit()
 
 
 # =============================================================
@@ -66,6 +99,16 @@ class DetailPanel(QWidget):
         super().__init__(parent)
         self.db = db
         self.current_app_id: int | None = None
+        # ---- Multi-selection state ----
+        # _multi_mode is True only while load_apps() has populated the
+        # panel for a multi-row selection; load_app() / clear() reset it.
+        self._multi_mode = False
+        self._multi_app_ids: list[int] = []
+        # Snapshot of editable field values, so the editingFinished
+        # handlers can tell a real edit from a mere focus-out (which
+        # also fires editingFinished and would otherwise cause spurious
+        # DB writes every time the user tabs through a field).
+        self._baseline: dict = {}
         self._build_ui()
         self.clear()
 
@@ -193,10 +236,12 @@ class DetailPanel(QWidget):
         scrape_layout.setSpacing(8)                           # ← increased spacing
         scrape_layout.setContentsMargins(6, 6, 6, 6)
 
-        # Row 0: Publisher | Latest version
+        # Row 0: Publisher (now EDITABLE) | Latest version (read-only)
         self.publisher_edit = QLineEdit()
-        self.publisher_edit.setReadOnly(True)
         self.publisher_edit.setPlaceholderText("(not scraped yet)")
+        self.publisher_edit.editingFinished.connect(
+            lambda: self._commit_scraper_field("publisher", self.publisher_edit)
+        )
         scrape_layout.addWidget(QLabel("Publisher:"), 0, 0)
         scrape_layout.addWidget(self.publisher_edit, 0, 1)
 
@@ -206,15 +251,17 @@ class DetailPanel(QWidget):
         scrape_layout.addWidget(QLabel("Latest version:"), 0, 2)
         scrape_layout.addWidget(self.latest_version_edit, 0, 3)
 
-        # Row 1: Homepage – now spans columns 1 to 3 (full width after label)
+        # Row 1: Homepage (now EDITABLE) – spans columns 1 to 3
         self.homepage_edit = QLineEdit()
-        self.homepage_edit.setReadOnly(True)
         self.homepage_edit.setPlaceholderText("(not scraped yet)")
         self.homepage_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self.homepage_edit.editingFinished.connect(
+            lambda: self._commit_scraper_field("homepage_url", self.homepage_edit)
+        )
         scrape_layout.addWidget(QLabel("Homepage:"), 1, 0)
         scrape_layout.addWidget(self.homepage_edit, 1, 1, 1, 3)   # ← spans 3 columns
 
-        # Row 2: Winget ID | Choco ID
+        # Row 2: Winget ID | Choco ID (read-only -- single-app only)
         self.winget_id_edit = QLineEdit()
         self.winget_id_edit.setReadOnly(True)
         self.winget_id_edit.setPlaceholderText("(no Winget match yet)")
@@ -227,12 +274,11 @@ class DetailPanel(QWidget):
         scrape_layout.addWidget(QLabel("Chocolatey ID:"), 2, 2)
         scrape_layout.addWidget(self.choco_id_edit, 2, 3)
 
-        # Row 3: Tags (spans columns 1-3)
-        self.scraped_tags_edit = QLabel()
-        self.scraped_tags_edit.setWordWrap(True)
-        self.scraped_tags_edit.setMinimumHeight(30)
+        # Row 3: Tags -- now an EDITABLE line edit (comma-separated)
+        self.scraped_tags_edit = QLineEdit()
+        self.scraped_tags_edit.setPlaceholderText("(no tags)")
         self.scraped_tags_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        self.scraped_tags_edit.setStyleSheet("QLabel { background: transparent; }")
+        self.scraped_tags_edit.editingFinished.connect(self._commit_tags)
         scrape_layout.addWidget(QLabel("Tags:"), 3, 0)
         scrape_layout.addWidget(self.scraped_tags_edit, 3, 1, 1, 3)
 
@@ -242,7 +288,7 @@ class DetailPanel(QWidget):
 
         layout.addWidget(scrape_box)
 
-        # Action buttons (unchanged)
+        # Action buttons
         actions_row = QHBoxLayout()
         self.verify_btn = QPushButton("Mark verified")
         self.verify_btn.clicked.connect(self._mark_verified)
@@ -253,7 +299,7 @@ class DetailPanel(QWidget):
         actions_row.addStretch()
         layout.addLayout(actions_row)
 
-        # Variants table (unchanged)
+        # Variants table
         variants_box = QGroupBox("Variants found on disk")
         vbox = QVBoxLayout(variants_box)
         self.variants_table = QTableWidget(0, len(VARIANT_COLUMNS))
@@ -283,10 +329,30 @@ class DetailPanel(QWidget):
         variant_actions.addStretch()
         vbox.addLayout(variant_actions)
 
+        # Remember the whole variants group so multi-mode can hide it in
+        # one step.
+        self.variants_box = variants_box
+
         layout.addWidget(variants_box)
 
     def clear(self):
+        # Reset multi-selection state and restore anything multi-mode hid.
+        self._multi_mode = False
+        self._multi_app_ids = []
+        self._baseline = {}
         self.current_app_id = None
+
+        self.name_edit.setEnabled(True)
+        self.description_edit.setVisible(True)
+        self.description_edit.setPlaceholderText("(not scraped yet)")
+        self.variants_box.setVisible(True)
+        self.btn_original_name.setVisible(True)
+        self.verify_btn.setText("Mark verified")
+        self.reresolve_btn.setText("Re-resolve this app")
+        self.publisher_edit.setPlaceholderText("(not scraped yet)")
+        self.homepage_edit.setPlaceholderText("(not scraped yet)")
+        self.scraped_tags_edit.setPlaceholderText("(no tags)")
+
         self.name_edit.setText("")
         self.catalog_edit.clear()
         self.catalog_edit.addItem("")   # optional placeholder
@@ -297,7 +363,7 @@ class DetailPanel(QWidget):
         self.description_edit.setPlainText("")
         self.publisher_edit.setText("")
         self.homepage_edit.setText("")
-        
+
         self.latest_version_edit.setText("")
         self.winget_id_edit.setText("")
         self.choco_id_edit.setText("")
@@ -328,8 +394,22 @@ class DetailPanel(QWidget):
         self.subcatalog_edit.clear()
         self.subcatalog_edit.addItems(items)
         self.subcatalog_edit.blockSignals(False)
-        
+
     def load_app(self, app_id: int):
+        # Reset any lingering multi-selection state and restore anything
+        # multi-mode hid.
+        self._multi_mode = False
+        self._multi_app_ids = []
+        self.name_edit.setEnabled(True)
+        self.description_edit.setVisible(True)
+        self.description_edit.setPlaceholderText("(not scraped yet)")
+        self.variants_box.setVisible(True)
+        self.verify_btn.setText("Mark verified")
+        self.reresolve_btn.setText("Re-resolve this app")
+        self.publisher_edit.setPlaceholderText("(not scraped yet)")
+        self.homepage_edit.setPlaceholderText("(not scraped yet)")
+        self.scraped_tags_edit.setPlaceholderText("(no tags)")
+
         self.setEnabled(True)
         self.current_app_id = app_id
         conn = self.db.connect()
@@ -360,8 +440,15 @@ class DetailPanel(QWidget):
         self.name_lock_label.setText("🔒" if app.get("name_locked") else "")
         self.description_edit.setPlainText(app.get("description") or "")
 
+        # Block signals while populating so the editingFinished handlers
+        # can't fire spuriously from a programmatic setText.
+        self.publisher_edit.blockSignals(True)
         self.publisher_edit.setText(app.get("publisher") or "")
+        self.publisher_edit.blockSignals(False)
+
+        self.homepage_edit.blockSignals(True)
         self.homepage_edit.setText(app.get("homepage_url") or "")
+        self.homepage_edit.blockSignals(False)
 
         self.latest_version_edit.setText(app.get("latest_version") or "")
         self.winget_id_edit.setText(app.get("winget_id") or "")
@@ -392,13 +479,16 @@ class DetailPanel(QWidget):
         else:
             self.btn_choco_name.setVisible(False)
 
-        # Tags
+        # Tags -- now a QLineEdit, populate as comma-separated text.
         tag_rows = conn.execute(
             """SELECT t.name FROM tags t JOIN app_tags at ON at.tag_id = t.id
                WHERE at.app_id = ? ORDER BY t.name""",
             (app_id,),
         ).fetchall()
-        self.scraped_tags_edit.setText(", ".join(r["name"] for r in tag_rows))
+        tags_text = ", ".join(r["name"] for r in tag_rows)
+        self.scraped_tags_edit.blockSignals(True)
+        self.scraped_tags_edit.setText(tags_text)
+        self.scraped_tags_edit.blockSignals(False)
 
         if app.get("last_scraped"):
             self.scrape_source_label.setText(
@@ -432,15 +522,171 @@ class DetailPanel(QWidget):
         self.variants_table.setSortingEnabled(True)
         self.variants_table.resizeColumnsToContents()
 
-        # (Removed duplicate populate/setCurrentText calls)
+        # Snapshot the editable-field values now that everything's
+        # populated, so _commit_* knows the "no change" baseline.
+        self._baseline = {
+            "publisher":    self.publisher_edit.text(),
+            "homepage_url": self.homepage_edit.text(),
+            "tags":         self.scraped_tags_edit.text(),
+        }
 
-    def _commit_field(self, field: str, widget):
-        if self.current_app_id is None:
+    # ------------------------------------------------------------------
+    # Multi-app loading (bulk edit mode)
+    # ------------------------------------------------------------------
+    def load_apps(self, app_ids: list) -> None:
+        """
+        Multi-app selection mode. Shows ONLY the fields that make sense
+        to apply to several apps at once:
+            Catalog, Subcatalog, Publisher, Homepage, Tags
+        plus the two bulk action buttons.
+
+        Name / Description / Winget ID / Choco ID / the variants table
+        and the alt-name buttons are disabled or hidden, since they only
+        make sense for one app at a time.
+
+        A field whose selected-apps value is not unanimous shows as
+        "(mixed)" (for combos) or blank with a hint placeholder (for
+        line edits). Typing a new value and confirming applies it to
+        every selected app.
+        """
+        if not app_ids:
+            self.clear()
             return
+
+        self._multi_mode = True
+        self._multi_app_ids = list(app_ids)
+        self.current_app_id = None
+        self.setEnabled(True)
+
+        conn = self.db.connect()
+        placeholders = ",".join("?" * len(app_ids))
+        rows = conn.execute(
+            f"SELECT * FROM apps WHERE id IN ({placeholders})", app_ids
+        ).fetchall()
+        apps = [dict(r) for r in rows]
+        n = len(apps)
+
+        # --- Name: display-only summary; not editable ---
+        self.name_edit.blockSignals(True)
+        self.name_edit.setText(f"({n} apps selected)")
+        self.name_edit.blockSignals(False)
+        self.name_edit.setEnabled(False)
+        self.name_lock_label.setText("")
+
+        # --- Hide single-app-only buttons ---
+        self.btn_original_name.setVisible(False)
+        self.btn_alt_name.setVisible(False)
+        self.btn_manifest_name.setVisible(False)
+        self.btn_choco_name.setVisible(False)
+
+        # --- Catalog / Subcatalog ---
+        self._populate_catalog_combo()
+        self._populate_subcatalog_combo()
+
+        cat_values = {(a.get("catalog") or "") for a in apps}
+        sub_values = {(a.get("subcatalog") or "") for a in apps}
+        cat_unanimous = (len(cat_values) == 1)
+        sub_unanimous = (len(sub_values) == 1)
+
+        self.catalog_edit.blockSignals(True)
+        self.catalog_edit.setCurrentText(
+            next(iter(cat_values)) if cat_unanimous else "(mixed)"
+        )
+        self.catalog_edit.blockSignals(False)
+
+        self.subcatalog_edit.blockSignals(True)
+        self.subcatalog_edit.setCurrentText(
+            next(iter(sub_values)) if sub_unanimous else "(mixed)"
+        )
+        self.subcatalog_edit.blockSignals(False)
+
+        # --- Status line ---
+        statuses = sorted({(a.get("status") or "?") for a in apps})
+        self.status_label.setText(
+            f"{n} apps selected — status(es): " + ", ".join(statuses)
+        )
+
+        # --- Description: single-app-only, hidden ---
+        self.description_edit.setPlainText("")
+        self.description_edit.setVisible(False)
+
+        # --- Scraper metadata ---
+        pub_values = {(a.get("publisher") or "") for a in apps}
+        home_values = {(a.get("homepage_url") or "") for a in apps}
+        pub_unanimous = (len(pub_values) == 1)
+        home_unanimous = (len(home_values) == 1)
+
+        self.publisher_edit.blockSignals(True)
+        self.publisher_edit.setText(next(iter(pub_values)) if pub_unanimous else "")
+        self.publisher_edit.setPlaceholderText(
+            f"({n} apps — same value)" if pub_unanimous and next(iter(pub_values))
+            else "(mixed — type to set for all selected)"
+        )
+        self.publisher_edit.blockSignals(False)
+
+        self.homepage_edit.blockSignals(True)
+        self.homepage_edit.setText(next(iter(home_values)) if home_unanimous else "")
+        self.homepage_edit.setPlaceholderText(
+            f"({n} apps — same value)" if home_unanimous and next(iter(home_values))
+            else "(mixed — type to set for all selected)"
+        )
+        self.homepage_edit.blockSignals(False)
+
+        # Single-app-only read-onlys: clear
+        self.latest_version_edit.setText("")
+        self.winget_id_edit.setText("")
+        self.choco_id_edit.setText("")
+
+        # --- Tags: union across all selected apps ---
+        union = set()
+        for a in apps:
+            tag_rows = conn.execute(
+                "SELECT t.name FROM tags t JOIN app_tags at ON at.tag_id = t.id "
+                "WHERE at.app_id = ?",
+                (a["id"],),
+            ).fetchall()
+            for r in tag_rows:
+                union.add(r["name"])
+        self.scraped_tags_edit.blockSignals(True)
+        self.scraped_tags_edit.setText(", ".join(sorted(union)))
+        self.scraped_tags_edit.setPlaceholderText(
+            f"(union of {n} apps' tags — type to replace for all)"
+        )
+        self.scraped_tags_edit.blockSignals(False)
+
+        self.scrape_source_label.setText(f"{n} apps selected")
+
+        # --- Variants table hidden in multi mode ---
+        self.variants_table.setRowCount(0)
+        self.variants_box.setVisible(False)
+
+        # --- Bulk action buttons ---
+        self.verify_btn.setText(f"Mark all {n} verified")
+        self.reresolve_btn.setText(f"Re-resolve all {n}")
+
+        # --- Baseline snapshot ---
+        self._baseline = {
+            "publisher":    self.publisher_edit.text(),
+            "homepage_url": self.homepage_edit.text(),
+            "tags":         self.scraped_tags_edit.text(),
+        }
+
+    # ------------------------------------------------------------------
+    # Field commit handlers
+    # ------------------------------------------------------------------
+    def _commit_field(self, field: str, widget):
+        """
+        Commit catalog/subcatalog/name. In multi mode, applies the new
+        value to every selected app.
+        """
         if isinstance(widget, QComboBox):
             value = widget.currentText().strip()
         else:
             value = widget.text().strip()
+
+        # "(mixed)" is a display-only marker; ignore it as a value.
+        if value == "(mixed)":
+            return
 
         # Name is not allowed to be cleared (a nameless app is unusable in
         # the table and every picker dialog). Catalog/subcatalog CAN be
@@ -451,22 +697,81 @@ class DetailPanel(QWidget):
             return
 
         from resolver import edit_app_field
+
+        if self._multi_mode:
+            for app_id in self._multi_app_ids:
+                edit_app_field(self.db, app_id, field, value)
+            self.app_changed.emit()
+            return
+
+        if self.current_app_id is None:
+            return
         edit_app_field(self.db, self.current_app_id, field, value)
         if field == "name":
             self.name_lock_label.setText("🔒")
         self.app_changed.emit()
-        
-    def _on_catalog_changed(self, text):
-        if self.current_app_id is None:
+
+    def _commit_scraper_field(self, field: str, widget: QLineEdit) -> None:
+        """
+        Commit publisher / homepage_url. Skips the write if the text
+        hasn't actually changed, because editingFinished also fires on
+        focus-out and we must not clobber a scraped value just because
+        the user tabbed through the field.
+        """
+        new_value = widget.text().strip()
+        if new_value == self._baseline.get(field, ""):
             return
-        self._commit_field("catalog", self.catalog_edit)
+
+        if self._multi_mode:
+            targets = list(self._multi_app_ids)
+        elif self.current_app_id is not None:
+            targets = [self.current_app_id]
+        else:
+            return
+
+        conn = self.db.connect()
+        for app_id in targets:
+            conn.execute(
+                f"UPDATE apps SET {field} = ?, updated_at = datetime('now') WHERE id = ?",
+                (new_value, app_id),
+            )
+        conn.commit()
+        self._baseline[field] = new_value
+        self.app_changed.emit()
+
+    def _commit_tags(self) -> None:
+        text = self.scraped_tags_edit.text().strip()
+        if text == self._baseline.get("tags", ""):
+            return
+        tags = [t.strip() for t in text.split(",") if t.strip()]
+
+        if self._multi_mode:
+            targets = list(self._multi_app_ids)
+        elif self.current_app_id is not None:
+            targets = [self.current_app_id]
+        else:
+            return
+
+        for app_id in targets:
+            _set_app_tags(self.db, app_id, tags)
+        self._baseline["tags"] = text
+        self.app_changed.emit()
+
+    def _on_catalog_changed(self, text):
+        if self._multi_mode or self.current_app_id is not None:
+            self._commit_field("catalog", self.catalog_edit)
 
     def _on_subcatalog_changed(self, text):
-        if self.current_app_id is None:
-            return
-        self._commit_field("subcatalog", self.subcatalog_edit)
+        if self._multi_mode or self.current_app_id is not None:
+            self._commit_field("subcatalog", self.subcatalog_edit)
 
     def _mark_verified(self):
+        if self._multi_mode:
+            for app_id in self._multi_app_ids:
+                set_app_status(self.db, app_id, "verified")
+            self.app_changed.emit()
+            self.load_apps(self._multi_app_ids)
+            return
         if self.current_app_id is None:
             return
         set_app_status(self.db, self.current_app_id, "verified")
@@ -642,6 +947,34 @@ class DetailPanel(QWidget):
             QMessageBox.warning(self, "Could not run file", str(e))
 
     def _reresolve(self):
+        if self._multi_mode:
+            n = len(self._multi_app_ids)
+            confirm = QMessageBox.question(
+                self, "Re-resolve all?",
+                f"Re-resolve {n} selected apps against the current settings?\n\n"
+                "Every unlocked name/catalog/subcatalog field and every unlocked "
+                "variant will be re-derived. Locked fields are never touched.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                return
+            for app_id in list(self._multi_app_ids):
+                proposal = propose_reresolve_app(self.db, app_id)
+                accepted_app_fields = {
+                    f for f in ("name", "catalog", "subcatalog")
+                    if not proposal[f"{f}_locked"]
+                }
+                accepted_variant_ids = {
+                    vp["variant_id"] for vp in proposal["variants"]
+                    if not vp["version_locked"]
+                }
+                apply_reresolve_app(
+                    self.db, proposal, accepted_app_fields, accepted_variant_ids
+                )
+            self.app_changed.emit()
+            self.load_apps(self._multi_app_ids)
+            return
+
         if self.current_app_id is None:
             return
         proposal = propose_reresolve_app(self.db, self.current_app_id)
@@ -672,7 +1005,6 @@ class DetailPanel(QWidget):
             return
         if name:
             self.name_edit.setText(name)
-
 
 
 # =============================================================
@@ -826,13 +1158,18 @@ class SearchMatchDialog(QDialog):
 
 class FolderLayoutDialog(QDialog):
     """
-    Per-scan-root folder layout editor (Feature B). Lets the user declare,
-    for the top-level folders under a scan root (and any folder beneath
-    them, to any depth), whether that folder has a further subcategory
-    layer, has none (direct children are apps), or should be skipped
-    entirely -- plus an optional display-name override that propagates to
-    every app resolved under that folder. See scanner.resolve_scan_root_
-    layout() for how these choices translate into catalog/subcatalog/depth.
+    Per-scan-root folder layout editor (Feature B, redesigned checkpoint
+    28). Every folder in the tree gets one explicit, self-describing
+    ROLE from the same four-item dropdown regardless of depth: Catalog /
+    Subcatalog / App / Skip. An unconfigured folder's default cascades
+    from its parent's role (Catalog's children default to Subcatalog,
+    Subcatalog's children default to App, App's children stay App --
+    they're just internal/version folders at that point) -- a top-level
+    folder with no parent in the tree defaults to this root's own
+    `unconfigured_toplevel_role` ("catalog" normally, "skip" for a root
+    created via the single-catalog "-1 level" promotion in
+    `ScanRootsDialog._add_new_root()`). See scanner.resolve_scan_root_
+    layout() for how these roles translate into catalog/subcatalog/depth.
 
     The first two folder levels are populated immediately (no clicking
     needed) since that's the common "maybe one folder is mixed" case;
@@ -841,9 +1178,9 @@ class FolderLayoutDialog(QDialog):
     than a handful of os.scandir() calls.
     """
 
-    MODE_ITEMS_TOP = [("Has subcatalogs", 2), ("No subcatalogs", 0), ("Skip this folder", -1)]
-    MODE_ITEMS_CHILD = [("⤷ Inherit", None), ("Has subcatalogs", 2),
-                         ("No subcatalogs", 0), ("Skip this folder", -1)]
+    ROLE_ITEMS = [("Catalog", "catalog"), ("Subcatalog", "subcatalog"),
+                  ("App", "app"), ("Skip", "skip")]
+    ROLE_CASCADE = {"catalog": "subcatalog", "subcatalog": "app", "app": "app", "skip": "skip"}
 
     def __init__(self, db: Database, scan_root_row: dict, parent=None,
                  only_new_folders: Optional[list] = None):
@@ -864,7 +1201,7 @@ class FolderLayoutDialog(QDialog):
             self._saved_layout = {}
         # Working copy the dialog edits live; only written back on OK.
         self._working_layout = dict(self._saved_layout)
-        self._rows = {}  # rel_key -> {"item", "combo", "rename", "preview", "is_top"}
+        self._rows = {}  # rel_key -> {"item", "combo", "rename", "preview", "rel_parts"}
 
         title = "Folder layout — " + self.root_path
         if self.new_folder_names:
@@ -874,11 +1211,12 @@ class FolderLayoutDialog(QDialog):
         outer = QVBoxLayout(self)
 
         intro_text = (
-            "Declare how this root's folders are organized: which top-level folders have "
-            "a further subcategory layer, which don't, and which to skip entirely. "
-            "Expand a row (▸) to override an individual child folder, at any depth. "
-            "The Preview column shows the catalog / subcatalog / app-name triple your "
-            "choice would produce."
+            "Declare what each folder IS: a Catalog, a Subcatalog, the App itself, or "
+            "Skip it entirely. An unconfigured folder defaults to whatever makes sense "
+            "below its parent (a Catalog's children default to Subcatalog, a "
+            "Subcatalog's children default to App) -- expand a row (▸) and change any "
+            "individual folder that doesn't fit the pattern, at any depth. The Preview "
+            "column shows what that folder actually resolves to."
         )
         if self.new_folder_names:
             intro_text = (
@@ -890,28 +1228,26 @@ class FolderLayoutDialog(QDialog):
         intro.setWordWrap(True)
         outer.addWidget(intro)
 
-        # -- top strip: root-is-catalog toggle --------------------------
+        # -- top strip: default for a top-level folder with no entry -----
         top_strip = QHBoxLayout()
-        self.root_is_catalog_cb = QCheckBox("This root is itself a single catalog")
-        self.root_is_catalog_cb.setChecked(bool(scan_root_row.get("root_is_catalog")))
-        self.root_is_catalog_cb.toggled.connect(self._on_root_is_catalog_toggled)
-        top_strip.addWidget(self.root_is_catalog_cb)
-        top_strip.addWidget(QLabel("Catalog name:"))
-        self.catalog_name_edit = QLineEdit(
-            scan_root_row.get("root_catalog_name") or Path(self.root_path).name
-        )
-        self.catalog_name_edit.setEnabled(self.root_is_catalog_cb.isChecked())
-        self.catalog_name_edit.textChanged.connect(self._refresh_all_previews)
-        top_strip.addWidget(self.catalog_name_edit)
+        top_strip.addWidget(QLabel("New top-level folders here default to:"))
+        self.default_toplevel_combo = QComboBox()
+        self.default_toplevel_combo.addItem("Catalog (normal root)", "catalog")
+        self.default_toplevel_combo.addItem("Skip (only explicitly-added folders are scanned)", "skip")
+        current_default = scan_root_row.get("unconfigured_toplevel_role") or "catalog"
+        idx = self.default_toplevel_combo.findData(current_default)
+        self.default_toplevel_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.default_toplevel_combo.currentIndexChanged.connect(self._on_default_toplevel_changed)
+        top_strip.addWidget(self.default_toplevel_combo)
         top_strip.addStretch()
         outer.addLayout(top_strip)
 
         # -- main tree ----------------------------------------------------
         self.tree = QTreeWidget()
         self.tree.setColumnCount(4)
-        self.tree.setHeaderLabels(["Folder", "Subcatalogs?", "Rename (optional)", "Preview"])
+        self.tree.setHeaderLabels(["Folder", "Role", "Rename (optional)", "Preview"])
         self.tree.setColumnWidth(0, 220)
-        self.tree.setColumnWidth(1, 160)
+        self.tree.setColumnWidth(1, 130)
         self.tree.setColumnWidth(2, 180)
         self.tree.itemExpanded.connect(self._on_item_expanded)
         outer.addWidget(self.tree)
@@ -921,7 +1257,7 @@ class FolderLayoutDialog(QDialog):
         # -- footer ---------------------------------------------------------
         footer = QHBoxLayout()
         default_all_btn = QPushButton("Use default for all")
-        default_all_btn.setToolTip("Resets every visible row to \"Has subcatalogs\" / inherit.")
+        default_all_btn.setToolTip("Resets every visible row to its cascaded default role.")
         default_all_btn.clicked.connect(self._use_default_for_all)
         footer.addWidget(default_all_btn)
         expand_all_btn = QPushButton("Expand all")
@@ -941,6 +1277,30 @@ class FolderLayoutDialog(QDialog):
         outer.addLayout(footer)
 
     # ------------------------------------------------------------------
+    # role/default helpers
+    # ------------------------------------------------------------------
+    def _explicit_role_and_name(self, rel_key: str):
+        entry = self._working_layout.get(rel_key)
+        if isinstance(entry, dict):
+            return entry.get("role"), entry.get("name")
+        if entry in ("catalog", "subcatalog", "app", "skip"):
+            return entry, None
+        return None, None
+
+    def _default_role_for(self, rel_parts: tuple) -> str:
+        """Cascades down from the nearest ANCESTOR's role (checking the
+        working layout directly, not the tree widget, so this stays
+        correct even for a not-yet-populated row) -- or this root's
+        top-level default when there's no parent at all."""
+        if len(rel_parts) == 1:
+            return self.default_toplevel_combo.currentData()
+        parent_key = "/".join(p.lower() for p in rel_parts[:-1])
+        parent_role, _ = self._explicit_role_and_name(parent_key)
+        if parent_role is None:
+            parent_role = self._default_role_for(rel_parts[:-1])
+        return self.ROLE_CASCADE.get(parent_role, "app")
+
+    # ------------------------------------------------------------------
     # tree population
     # ------------------------------------------------------------------
     def _populate_top_level(self):
@@ -949,7 +1309,7 @@ class FolderLayoutDialog(QDialog):
             label = f"{name}   (NEW)" if name.lower() in self.new_folder_names else name
             item = QTreeWidgetItem(self.tree, [label])
             self.tree.addTopLevelItem(item)
-            self._add_row(item, (name,), is_top=True)
+            self._add_row(item, (name,))
             # Level 2 is populated immediately (not lazy) -- this is the
             # "mixed catalog" case the user actually has, so it shouldn't
             # require an extra click to discover.
@@ -957,20 +1317,14 @@ class FolderLayoutDialog(QDialog):
 
     def _populate_children(self, parent_item: QTreeWidgetItem, rel_parts: tuple):
         child_names = list_child_folders(self.root_path, os.path.join(*rel_parts))
-        parent_key = "/".join(p.lower() for p in rel_parts)
-        parent_row = self._rows.get(parent_key)
-        if parent_row is not None and child_names:
-            parent_row["first_child_name"] = child_names[0]
         for name in child_names:
             child_parts = rel_parts + (name,)
             child_item = QTreeWidgetItem(parent_item, [name])
-            self._add_row(child_item, child_parts, is_top=False)
+            self._add_row(child_item, child_parts)
             # Lazy placeholder: a dummy child gives this row an expand
             # arrow without touching the disk again until the user
             # actually clicks it (any depth beyond level 2).
             QTreeWidgetItem(child_item, ["…loading…"])
-        if parent_row is not None and child_names:
-            self._update_preview(parent_key)
 
     def _on_item_expanded(self, item: QTreeWidgetItem):
         # Real children already populated (level <=2, or already expanded
@@ -981,22 +1335,18 @@ class FolderLayoutDialog(QDialog):
         rel_parts = item.data(0, Qt.UserRole + 1)
         self._populate_children(item, rel_parts)
 
-    def _add_row(self, item: QTreeWidgetItem, rel_parts: tuple, is_top: bool):
+    def _add_row(self, item: QTreeWidgetItem, rel_parts: tuple):
         rel_key = "/".join(p.lower() for p in rel_parts)
         item.setData(0, Qt.UserRole, rel_key)
         item.setData(0, Qt.UserRole + 1, rel_parts)
 
-        existing = self._working_layout.get(rel_key)
-        existing_mode = existing.get("mode") if isinstance(existing, dict) else existing
-        existing_name = existing.get("name") if isinstance(existing, dict) else None
+        existing_role, existing_name = self._explicit_role_and_name(rel_key)
+        default_role = self._default_role_for(rel_parts)
 
         combo = QComboBox()
-        choices = self.MODE_ITEMS_TOP if is_top else self.MODE_ITEMS_CHILD
-        for label, value in choices:
+        for label, value in self.ROLE_ITEMS:
             combo.addItem(label, value)
-        default_value = 2 if is_top else None
-        target_value = existing_mode if existing_mode is not None else default_value
-        idx = combo.findData(target_value)
+        idx = combo.findData(existing_role if existing_role is not None else default_role)
         combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.currentIndexChanged.connect(lambda _i, k=rel_key: self._on_row_changed(k))
         self.tree.setItemWidget(item, 1, combo)
@@ -1011,7 +1361,7 @@ class FolderLayoutDialog(QDialog):
 
         self._rows[rel_key] = {
             "item": item, "combo": combo, "rename": rename_edit,
-            "preview": preview_label, "is_top": is_top, "rel_parts": rel_parts,
+            "preview": preview_label, "rel_parts": rel_parts, "default_role": default_role,
         }
         self._update_row_layout_entry(rel_key)
         self._update_preview(rel_key)
@@ -1023,22 +1373,40 @@ class FolderLayoutDialog(QDialog):
         self._update_row_layout_entry(rel_key)
         self._refresh_all_previews()
 
+    def _on_default_toplevel_changed(self):
+        # Changes what an UNCONFIGURED top-level row's default is -- only
+        # affects rows that don't already have an explicit entry, and only
+        # visually until OK is pressed (recomputing each such row's combo
+        # selection + preview, without touching rows the user has already
+        # set explicitly).
+        for rel_key, row in self._rows.items():
+            if len(row["rel_parts"]) != 1:
+                continue
+            existing_role, _ = self._explicit_role_and_name(rel_key)
+            if existing_role is not None:
+                continue
+            new_default = self.default_toplevel_combo.currentData()
+            row["default_role"] = new_default
+            idx = row["combo"].findData(new_default)
+            row["combo"].blockSignals(True)
+            row["combo"].setCurrentIndex(idx if idx >= 0 else 0)
+            row["combo"].blockSignals(False)
+        self._refresh_all_previews()
+
     def _update_row_layout_entry(self, rel_key: str):
         row = self._rows.get(rel_key)
         if not row:
             return
-        mode = row["combo"].currentData()
+        role = row["combo"].currentData()
         name = row["rename"].text().strip()
-        if mode is None and not name:
-            # Pure inherit, no rename -- no entry needed (keeps the saved
-            # JSON small; see Q3 in the design notes).
+        if role == row["default_role"] and not name:
+            # Matches the cascaded default with no rename -- no entry
+            # needed (keeps the saved JSON small).
             self._working_layout.pop(rel_key, None)
         elif name:
-            entry = {"name": name}
-            entry["mode"] = mode if mode is not None else 2
-            self._working_layout[rel_key] = entry
+            self._working_layout[rel_key] = {"role": role, "name": name}
         else:
-            self._working_layout[rel_key] = mode
+            self._working_layout[rel_key] = role
 
     def _refresh_all_previews(self):
         for rel_key in self._rows:
@@ -1049,64 +1417,33 @@ class FolderLayoutDialog(QDialog):
         if not row:
             return
         rel_parts = row["rel_parts"]
-        root_is_catalog = self.root_is_catalog_cb.isChecked()
-        root_catalog_name = self.catalog_name_edit.text().strip()
-
-        # A row explicitly set to "No subcatalogs" on ITSELF (not
-        # inherited from a parent) means THIS folder is the app -- like
-        # FastStone directly under GRAPHICS. Preview that folder's own
-        # path, not a synthetic child, or resolve_scan_root_layout's
-        # self-match logic would be queried one level too deep and give a
-        # wrong (non-None) subcatalog. Everything else (has-subcatalog,
-        # inherit, or an ANCESTOR further up owning the no-subcatalog
-        # setting -- e.g. ADOBE) previews one level down instead, since
-        # the real app is a folder not yet known.
-        own_mode = row["combo"].currentData()
-        if own_mode == 0:
-            # If we already know a real child folder name (fetched when
-            # this row's own children were listed), show it as the app --
-            # matches what the user will actually see on disk. Falls back
-            # to this folder's own name when no child is known yet (the
-            # common case: the folder itself already IS the leaf/app,
-            # e.g. FastStone directly holding its installer).
-            known_child = row.get("first_child_name")
-            if known_child:
-                sample_path = os.path.join(self.root_path, *rel_parts, known_child)
-                app_label = known_child
-            else:
-                sample_path = os.path.join(self.root_path, *rel_parts)
-                app_label = rel_parts[-1]
-        else:
-            # Two synthetic segments, not one: if only "App" were appended,
-            # a row whose subcatalog would land exactly one level below it
-            # (e.g. any top-level row with no deeper override configured)
-            # would have that placeholder text leak into the COMPUTED
-            # subcatalog itself, not just the displayed app name. Using a
-            # real known child folder name (if any) for the first segment
-            # keeps the preview honest; "App" only ever appears as the
-            # final, cosmetic app-name placeholder.
-            mid_segment = row.get("first_child_name") or "Category"
-            sample_path = os.path.join(self.root_path, *rel_parts, mid_segment, "App")
-            app_label = "App"
-
+        role = row["combo"].currentData()
+        if role == "skip":
+            row["preview"].setText("(not imported — skipped)")
+            return
+        # Every role is now self-describing (Catalog/Subcatalog/App all
+        # mean "this is what I am", never "this is what my children are")
+        # so previewing is just resolving THIS folder's own path directly
+        # -- no synthetic child needed, unlike the old mode system.
+        sample_path = os.path.join(self.root_path, *rel_parts)
         catalog, subcatalog, depth, skip = resolve_scan_root_layout(
             self.root_path, sample_path, self._working_layout,
-            root_is_catalog=root_is_catalog, root_catalog_name=root_catalog_name,
+            unconfigured_toplevel_role=self.default_toplevel_combo.currentData(),
         )
         if skip:
             row["preview"].setText("(not imported — skipped)")
-            return
-        row["preview"].setText(f"{catalog or '—'} / {subcatalog or '—'} / {app_label}")
-
-    def _on_root_is_catalog_toggled(self, checked: bool):
-        self.catalog_name_edit.setEnabled(checked)
-        self._refresh_all_previews()
+        elif role == "catalog":
+            row["preview"].setText(f"Catalog: {catalog}")
+        elif role == "subcatalog":
+            row["preview"].setText(f"{catalog or '—'} / {subcatalog or '—'}  (subcategory)")
+        else:  # app
+            row["preview"].setText(f"{catalog or '—'} / {subcatalog or '—'} / {rel_parts[-1]}")
 
     def _use_default_for_all(self):
         for rel_key, row in self._rows.items():
-            default_idx = 0  # "Has subcatalogs" for top rows, "Inherit" for children
-            row["combo"].setCurrentIndex(default_idx)
             row["rename"].clear()
+            idx = row["combo"].findData(row["default_role"])
+            row["combo"].setCurrentIndex(idx if idx >= 0 else 0)
 
     # ------------------------------------------------------------------
     # save
@@ -1116,7 +1453,7 @@ class FolderLayoutDialog(QDialog):
         # default), so a future re-scan doesn't treat an already-seen,
         # unchanged folder as "new" again.
         for rel_key, row in self._rows.items():
-            if row["is_top"] and rel_key not in self._working_layout:
+            if len(row["rel_parts"]) == 1 and rel_key not in self._working_layout:
                 self._working_layout[rel_key] = row["combo"].currentData()
 
         # Prune keys whose folder no longer exists on disk (e.g. renamed/
@@ -1124,14 +1461,9 @@ class FolderLayoutDialog(QDialog):
         # cheap to do on every save.
         pruned = _prune_orphaned_layout_keys(self.root_path, self._working_layout)
 
-        root_is_catalog = self.root_is_catalog_cb.isChecked() if self.root_is_catalog_cb else \
-            bool(self.scan_root_row.get("root_is_catalog"))
-        root_catalog_name = self.catalog_name_edit.text().strip() if self.catalog_name_edit else \
-            self.scan_root_row.get("root_catalog_name")
-
         self.db.save_folder_layout(
             self.scan_root_row["id"], pruned,
-            root_is_catalog=root_is_catalog, root_catalog_name=root_catalog_name or None,
+            unconfigured_toplevel_role=self.default_toplevel_combo.currentData(),
         )
         self.accept()
 
@@ -1353,7 +1685,43 @@ class ScanRootsDialog(QDialog):
         folder = QFileDialog.getExistingDirectory(self, "Choose folder to scan")
         if not folder:
             return
-        self._rescan(folder)
+        folder = os.path.normpath(folder)
+
+        is_single_catalog = QMessageBox.question(
+            self, "Single catalog?",
+            f"Is '{os.path.basename(folder)}' itself a single catalog, rather than a "
+            "folder that CONTAINS multiple catalog subfolders?\n\n"
+            "Choosing Yes stores the scan root as its PARENT folder instead, with this "
+            "folder added as one explicit Catalog entry -- so adding several "
+            "single-catalog folders that happen to share the same parent all land on one "
+            "shared scan root instead of a separate one each.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if is_single_catalog != QMessageBox.Yes:
+            self._rescan(folder)
+            return
+
+        default_name = os.path.basename(folder)
+        catalog_name, ok = QInputDialog.getText(
+            self, "Catalog name", "Display name for this catalog:", text=default_name,
+        )
+        if not ok:
+            return
+        catalog_name = catalog_name.strip() or default_name
+
+        promoted_path = os.path.dirname(folder)
+        scan_root_id = self.db.ensure_scan_root(promoted_path)
+        layout = self.db.get_folder_layout(scan_root_id)
+        key = default_name.lower()
+        layout[key] = (
+            {"role": "catalog", "name": catalog_name} if catalog_name != default_name else "catalog"
+        )
+        # Every sibling under the promoted parent that isn't explicitly
+        # added this same way stays Skip by default -- adding ONE
+        # single-catalog folder shouldn't silently start scanning
+        # whatever else happens to live next to it.
+        self.db.save_folder_layout(scan_root_id, layout, unconfigured_toplevel_role="skip")
+        self._rescan(promoted_path)
 
     def _delete_selected_root(self):
         row_idx = self.table.currentRow()
@@ -1568,314 +1936,806 @@ class ReresolveDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
+    """
+    Settings dialog reorganized by pipeline phase.
+
+    Tabs (7):
+      1. Variant Matching   -- resolver thresholds & fuzzy clustering
+      2. Archive Handling   -- deep-inspection / archive extraction
+      3. Scanning & Noise   -- what gets scanned, what gets skipped
+      4. Naming & Renaming  -- name cleaning, categorization, relabeling
+      5. Scraper            -- metadata enrichment sources
+      6. Interface          -- UI scale & display
+      7. Watch Folders      -- Monitor job configuration
+
+    Every setting key and its backend reader is UNCHANGED. This
+    reorganization is layout-only: no DEFAULT_SETTINGS entry was added,
+    renamed, or removed; every set_setting() call writes the same key it
+    always did.
+    """
+
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
         self.db = db
-        self.setWindowTitle("Settings — applies live, no restart needed")
-        self.resize(520, 500)
-        layout = QVBoxLayout(self)
-        tabs = QTabWidget()
-        layout.addWidget(tabs)
+        self.setWindowTitle("Settings")
+        self.resize(920, 780)
+        self.setMaximumWidth(1200)
+
+        outer = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs)
 
         settings = db.get_all_settings()
 
-        # Resolver confidence
-        conf_tab = QWidget()
-        conf_form = QFormLayout(conf_tab)
+        self._build_variant_matching(settings)
+        self._build_archive_handling(settings)
+        self._build_scanning(settings)
+        self._build_naming(settings)
+        self._build_scraper(settings)
+        self._build_interface(settings)
+        self._build_watch_folders(settings)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self._save)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        outer.addLayout(btn_row)
+
+    # =====================================================================
+    # Layout helpers
+    # =====================================================================
+
+    def _desc(self, text: str) -> QLabel:
+        """Small italic description label shown under a field."""
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet("color: palette(mid); font-style: italic;")
+        return lbl
+
+    def _scroll_tab(self, title: str) -> QVBoxLayout:
+        """Create a scrollable tab; return its inner vertical layout."""
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setSpacing(14)
+        layout.setContentsMargins(12, 12, 12, 12)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(inner)
+        self.tabs.addTab(scroll, title)
+        return layout
+
+    def _group(self, title: str) -> QGroupBox:
+        """A titled group box with a vertical layout inside."""
+        box = QGroupBox(title)
+        v = QVBoxLayout(box)
+        v.setSpacing(8)
+        box._inner_layout = v
+        return box
+
+    def _labeled(self, label: str, widget, description: str = None) -> QWidget:
+        """Package label + widget + optional description into one widget."""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(3)
+        v.addWidget(QLabel(f"<b>{label}</b>"))
+        v.addWidget(widget)
+        if description:
+            v.addWidget(self._desc(description))
+        return w
+
+    def _two_col(self, parent_layout, left_widgets, right_widgets=None):
+        """Add two columns of widgets side by side inside parent_layout."""
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        left = QVBoxLayout()
+        left.setSpacing(8)
+        for w in left_widgets:
+            left.addWidget(w)
+        row.addLayout(left, 1)
+        if right_widgets is not None:
+            right = QVBoxLayout()
+            right.setSpacing(8)
+            for w in right_widgets:
+                right.addWidget(w)
+            row.addLayout(right, 1)
+        parent_layout.addLayout(row)
+
+    # =====================================================================
+    # Tab 1 -- Variant Matching
+    # =====================================================================
+
+    def _build_variant_matching(self, settings):
+        layout = self._scroll_tab("Variant Matching")
+
+        box = self._group("How variants are matched and merged into apps")
+        v = box._inner_layout
+
         self.auto_accept = QDoubleSpinBox()
         self.auto_accept.setRange(0, 1)
         self.auto_accept.setSingleStep(0.05)
         self.auto_accept.setValue(settings.get("confidence_auto_accept", 0.85))
-        conf_form.addRow("Auto-accept threshold", self.auto_accept)
 
         self.needs_review = QDoubleSpinBox()
         self.needs_review.setRange(0, 1)
         self.needs_review.setSingleStep(0.05)
         self.needs_review.setValue(settings.get("confidence_needs_review", 0.60))
-        conf_form.addRow("Needs-review threshold", self.needs_review)
+
+        self._two_col(
+            v,
+            [self._labeled(
+                "Auto-accept threshold",
+                self.auto_accept,
+                "Variants scored at or above this value are accepted automatically.")],
+            [self._labeled(
+                "Needs-review threshold",
+                self.needs_review,
+                "Variants scored below this value are flagged for manual review.")],
+        )
 
         self.fuzzy_threshold = QSpinBox()
         self.fuzzy_threshold.setRange(50, 100)
         self.fuzzy_threshold.setValue(settings.get("fuzzy_match_threshold", 88))
-        conf_form.addRow("Fuzzy match threshold (0-100)", self.fuzzy_threshold)
 
         self.prefer_pe = QCheckBox("Prefer .exe version metadata over parsed name")
         self.prefer_pe.setChecked(settings.get("prefer_pe_version_over_parsed", True))
-        conf_form.addRow(self.prefer_pe)
-        tabs.addTab(conf_tab, "Resolver")
 
-        # Archive handling
-        arch_tab = QWidget()
-        arch_form = QFormLayout(arch_tab)
-        self.read_pe_metadata_toggle = QCheckBox("Read .exe version metadata (ProductName, Version, etc.)")
-        self.read_pe_metadata_toggle.setChecked(settings.get("read_exe_metadata_enabled", False))
+        self._two_col(
+            v,
+            [self._labeled(
+                "Fuzzy match threshold (0-100)",
+                self.fuzzy_threshold,
+                "Variants whose names are at least this similar are merged into "
+                "one app. Higher = stricter merging; lower = more aggressive.")],
+            [self.prefer_pe],
+        )
+
+        layout.addWidget(box)
+        layout.addStretch()
+
+    # =====================================================================
+    # Tab 2 -- Archive Handling
+    # =====================================================================
+
+    def _build_archive_handling(self, settings):
+        layout = self._scroll_tab("Archive Handling")
+
+        box = self._group("Reading installer metadata and inspecting archives")
+        v = box._inner_layout
+
+        self.read_pe_metadata_toggle = QCheckBox(
+            "Read .exe version metadata (ProductName, Version, etc.)")
+        self.read_pe_metadata_toggle.setChecked(
+            settings.get("read_exe_metadata_enabled", False))
         self.read_pe_metadata_toggle.setToolTip(
             "OFF (default): fast, name-based identification only.\n"
             "ON: opens each .exe to read its embedded version resource --\n"
-            "more accurate, slower over a large collection."
-        )
-        arch_form.addRow(self.read_pe_metadata_toggle)
+            "more accurate, slower over a large collection.")
 
-        self.inspect_archives_toggle = QCheckBox("Inspect archive contents (.zip/.rar/.7z/.iso)")
-        self.inspect_archives_toggle.setChecked(settings.get("inspect_archive_contents_enabled", False))
+        self.inspect_archives_toggle = QCheckBox(
+            "Inspect archive contents (.zip/.rar/.7z/.iso)")
+        self.inspect_archives_toggle.setChecked(
+            settings.get("inspect_archive_contents_enabled", False))
         self.inspect_archives_toggle.setToolTip(
             "OFF (default): archives are identified by filename only.\n"
             "ON: lists archive contents, and extracts when ambiguous, to find\n"
-            "and identify the installer inside -- slower, some extraction risk."
-        )
-        arch_form.addRow(self.inspect_archives_toggle)
+            "and identify the installer inside -- slower, some extraction risk.")
 
-        self.escalate_ambiguous = QCheckBox("Fully extract archives when ambiguous")
-        self.escalate_ambiguous.setChecked(settings.get("archive_ambiguity_escalates_to_extraction", True))
-        arch_form.addRow(self.escalate_ambiguous)
+        v.addWidget(self.read_pe_metadata_toggle)
+        v.addWidget(self.inspect_archives_toggle)
+        v.addWidget(self._desc(
+            "Applies to archive files (.zip/.rar/.7z/.iso). When enabled, the "
+            "installer found inside is used as the naming source instead of "
+            "the archive's own filename."))
+        layout.addWidget(box)
+
+        # -- ambiguity / extraction block --
+        box2 = self._group("Handling unclear or large archives")
+        v2 = box2._inner_layout
+
+        self.escalate_ambiguous = QCheckBox(
+            "Extract when the archive's contents are unclear")
+        self.escalate_ambiguous.setChecked(
+            settings.get("archive_ambiguity_escalates_to_extraction", True))
 
         self.max_extract_mb = QSpinBox()
         self.max_extract_mb.setRange(1, 100_000)
         self.max_extract_mb.setValue(settings.get("archive_max_full_extract_mb", 2048))
-        arch_form.addRow("Max archive size to fully extract (MB)", self.max_extract_mb)
+        self.max_extract_mb.setSuffix(" MB")
 
-        self.purge_after = QCheckBox("Purge extracted files after inspection")
+        self._two_col(
+            v2,
+            [self._labeled(
+                "Extract when ambiguous",
+                self.escalate_ambiguous,
+                "When an archive contains multiple plausible installers, fully "
+                "extract it to pick the right one. If off, the archive's own "
+                "filename is used instead.")],
+            [self._labeled(
+                "Never extract archives larger than",
+                self.max_extract_mb,
+                "Safety limit. Archives larger than this are never fully "
+                "extracted, even when ambiguous.")],
+        )
+
+        self.purge_after = QCheckBox("Delete extracted temp files when done")
         self.purge_after.setChecked(settings.get("archive_purge_scratch_after_use", True))
-        arch_form.addRow(self.purge_after)
-        tabs.addTab(arch_tab, "Archives")
 
-        # Scan behavior
-        scan_tab = QWidget()
-        scan_form = QFormLayout(scan_tab)
-        self.incremental = QCheckBox("Incremental scan (skip unchanged folders)")
+        # scratch dir: LineEdit + Browse button
+        self.archive_scratch_dir_edit = QLineEdit(
+            settings.get("archive_scratch_dir") or "")
+        self.archive_scratch_dir_edit.setPlaceholderText(
+            "(empty = use the system temp folder)")
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._pick_archive_scratch_dir)
+        scratch_row = QWidget()
+        sr = QHBoxLayout(scratch_row)
+        sr.setContentsMargins(0, 0, 0, 0)
+        sr.addWidget(self.archive_scratch_dir_edit, 1)
+        sr.addWidget(browse_btn)
+
+        self._two_col(
+            v2,
+            [self.purge_after],
+            [self._labeled(
+                "Temporary folder for extractions",
+                scratch_row,
+                "Where archive contents are written while being inspected. "
+                "Leave empty to use the system temp folder.")],
+        )
+
+        layout.addWidget(box2)
+        layout.addStretch()
+
+    def _pick_archive_scratch_dir(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose scratch folder for archive extractions")
+        if folder:
+            self.archive_scratch_dir_edit.setText(folder)
+
+    # =====================================================================
+    # Tab 3 -- Scanning & Noise
+    # =====================================================================
+
+    def _build_scanning(self, settings):
+        layout = self._scroll_tab("Scanning & Noise")
+
+        intro = QLabel(
+            "<b>Three different things can happen to a folder:</b>"
+            "<ul>"
+            "<li><b>Skip</b> -- the folder is excluded from the scan entirely "
+            "(no app, no variant, no record). Controlled by <i>Folders to skip</i>.</li>"
+            "<li><b>Component of another app</b> -- the folder is marked as an "
+            "internal part of a bigger install, not a standalone app. Controlled "
+            "by <i>Component folder names</i>.</li>"
+            "<li><b>Scanned, but name not used</b> -- the folder still produces "
+            "apps; only its name is discarded as a naming source. Controlled by "
+            "<i>Folder names not used as app names</i>.</li>"
+            "</ul>"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        # -- Skip block --
+        box_skip = self._group("Folders to skip")
+        v = box_skip._inner_layout
+
+        self.noise_keywords = QPlainTextEdit(
+            "\n".join(settings.get("noise_folder_keywords", [])))
+        self.noise_keywords.setMaximumHeight(120)
+        v.addWidget(self._labeled(
+            "Folders to skip (name matches any keyword)",
+            self.noise_keywords,
+            "A folder whose name matches any word here is excluded from the scan "
+            "entirely -- no app, no variant, no record is created from it. "
+            "Applies to the folder name only, not to file names."))
+
+        self.noise_short_only_keywords = QPlainTextEdit(
+            "\n".join(settings.get("noise_short_only_keywords", [])))
+        self.noise_short_only_keywords.setMaximumHeight(100)
+
+        self.noise_short_only_max_len = QSpinBox()
+        self.noise_short_only_max_len.setRange(1, 200)
+        self.noise_short_only_max_len.setValue(
+            int(settings.get("noise_short_only_max_len", 25)))
+
+        self._two_col(
+            v,
+            [self._labeled(
+                "Skip these words only when the folder name is short",
+                self.noise_short_only_keywords,
+                "A subset of the list above. For these words, the skip only fires "
+                "when the folder name is short enough to basically be the word "
+                "itself -- e.g. a folder named just 'Crack' is skipped, but a "
+                "long release name that mentions 'Keygen' among many other words "
+                "is still scanned as a normal folder.")],
+            [self._labeled(
+                "What counts as a short folder name",
+                self.noise_short_only_max_len,
+                "Folder names up to this many characters long count as 'short'.")],
+        )
+        layout.addWidget(box_skip)
+
+        # -- Container block --
+        box_cont = self._group("Component folder names (parts of another app)")
+        v2 = box_cont._inner_layout
+        self.container_keywords = QPlainTextEdit(
+            "\n".join(settings.get("container_folder_keywords", [])))
+        self.container_keywords.setMaximumHeight(120)
+        v2.addWidget(self._labeled(
+            "Component folder names",
+            self.container_keywords,
+            "Folder names that indicate an internal component of a bigger app "
+            "-- e.g. 'payloads', 'redist', 'resources'. A folder matching one "
+            "of these is not treated as a standalone app."))
+        layout.addWidget(box_cont)
+
+        # -- Name-not-used block --
+        box_name = self._group("Folder and file names not used as app names")
+        v3 = box_name._inner_layout
+
+        self.ignore_folder_names = QPlainTextEdit(
+            "\n".join(settings.get("ignore_folder_names", [])))
+        self.ignore_folder_names.setMaximumHeight(100)
+
+        self.ignore_folder_name_patterns = QPlainTextEdit(
+            "\n".join(settings.get("ignore_folder_name_patterns", [])))
+        self.ignore_folder_name_patterns.setMaximumHeight(80)
+
+        self.ignore_filename_patterns = QPlainTextEdit(
+            "\n".join(settings.get("ignore_filename_patterns", [])))
+        self.ignore_filename_patterns.setMaximumHeight(80)
+
+        self._two_col(
+            v3,
+            [self._labeled(
+                "Folder names not used as app names",
+                self.ignore_folder_names,
+                "The folder is still scanned -- this only stops the resolver "
+                "from using the folder's own name as the app name. Example: a "
+                "folder called 'bin' or '32' isn't an app name; the resolver "
+                "uses the file name or a parent folder's name instead.")],
+            [self._labeled(
+                "Folder name patterns not used as app names",
+                self.ignore_folder_name_patterns,
+                "Same idea as above, for patterns rather than exact names. "
+                "Regex -- one pattern per line. Example: a folder named just a "
+                "version number ('2.0') or a bitness label ('32-bit').")],
+        )
+        v3.addWidget(self._labeled(
+            "File name patterns not used as app names",
+            self.ignore_filename_patterns,
+            "Same idea, for file names. A file matching one of these isn't used "
+            "as a naming source -- e.g. a file literally named 'setup.exe' has "
+            "no useful product name; the resolver falls back to the folder name. "
+            "Regex -- one pattern per line."))
+        layout.addWidget(box_name)
+
+        # -- Scan behavior --
+        box_behav = self._group("Scan behavior")
+        v4 = box_behav._inner_layout
+        self.incremental = QCheckBox("Skip folders that haven't changed since last scan")
         self.incremental.setChecked(settings.get("incremental_scan_by_default", True))
-        scan_form.addRow(self.incremental)
-
-        self.follow_symlinks = QCheckBox("Follow symlinks while scanning")
+        self.follow_symlinks = QCheckBox("Follow shortcuts into other folders")
         self.follow_symlinks.setChecked(settings.get("scan_follow_symlinks", False))
-        scan_form.addRow(self.follow_symlinks)
-        tabs.addTab(scan_tab, "Scan")
+        self._two_col(v4, [self.incremental], [self.follow_symlinks])
+        layout.addWidget(box_behav)
 
-        # Scraper
-        scraper_tab = QWidget()
-        scraper_form = QFormLayout(scraper_tab)
-        self.scraper_manifest_url = QLineEdit(settings.get("scraper_winget_manifest_url", ""))
-        scraper_form.addRow("Winget manifest URL (svrooij index.v2.json)", self.scraper_manifest_url)
+        layout.addStretch()
+
+    # =====================================================================
+    # Tab 4 -- Naming & Renaming
+    # =====================================================================
+
+    def _build_naming(self, settings):
+        layout = self._scroll_tab("Naming & Renaming")
+
+        intro = QLabel(
+            "These settings control how app names and category labels are "
+            "derived. They run in the order shown: first the pipeline cleans "
+            "the raw text, then rules pick the catalog and subcatalog, then "
+            "aliases relabel the finished result. "
+            "<b>Per-scan-root folder roles</b> (which folders are Catalog / "
+            "Subcatalog / App / Skip) are set in <i>Scan roots → Edit folder "
+            "layout…</i> and apply <i>on top of</i> these global rules."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        # -- The naming pipeline --
+        box_pipe = self._group("Name cleaning pipeline (runs top to bottom on each candidate)")
+        v = box_pipe._inner_layout
+
+        self.bracket_content_patterns = QPlainTextEdit(
+            "\n".join(settings.get("bracket_content_patterns", [])))
+        self.bracket_content_patterns.setMaximumHeight(70)
+
+        self.website_patterns = QPlainTextEdit(
+            "\n".join(settings.get("website_tag_patterns", [])))
+        self.website_patterns.setMaximumHeight(70)
+
+        self._two_col(
+            v,
+            [self._labeled(
+                "1. Bracket-content patterns (regex)",
+                self.bracket_content_patterns,
+                "Removes text inside (), [], or {} -- the brackets and their "
+                "contents both. Runs first. Applies to file names, folder "
+                "names, and parent folder names. Regex -- one pattern per line.")],
+            [self._labeled(
+                "2. Website/domain tag patterns (regex)",
+                self.website_patterns,
+                "Removes website names and uploader handles stamped into names "
+                "-- e.g. 'www.example.com-', 'HaxPC.net-'. Applies to file "
+                "names, folder names, and parent folder names. Regex -- one "
+                "pattern per line.")],
+        )
+
+        self.release_patterns = QPlainTextEdit(
+            "\n".join(settings.get("release_tag_patterns", [])))
+        self.release_patterns.setMaximumHeight(90)
+
+        self.ignore_filename_words = QPlainTextEdit(
+            "\n".join(settings.get("ignore_filename_words", [])))
+        self.ignore_filename_words.setMaximumHeight(90)
+
+        self._two_col(
+            v,
+            [self._labeled(
+                "3. Release-tag / scene-flag patterns (regex)",
+                self.release_patterns,
+                "Keyword stripper for scene-release flags and uploader marks "
+                "-- e.g. '-ViRiLiTY', 'Repack', 'Keygen.Only'. Each match is "
+                "removed wherever it appears in the text. Applies to file "
+                "names, folder names, and parent folder names. Regex -- one "
+                "pattern per line.")],
+            [self._labeled(
+                "4. Ignore words in FILE names (whole word, one per line)",
+                self.ignore_filename_words,
+                "Whole words stripped out of a filename before it's considered "
+                "as an app name -- e.g. 'setup', 'patch', 'trial'. Applied to "
+                "file names only.")],
+        )
+
+        self.edition_keywords = QPlainTextEdit(
+            "\n".join(settings.get("edition_keywords", [])))
+        self.edition_keywords.setMaximumHeight(90)
+
+        lang = settings.get("language_keywords", {})
+        self.language_keywords = QPlainTextEdit(
+            "\n".join(f"{k}={v}" for k, v in lang.items()))
+        self.language_keywords.setMaximumHeight(90)
+
+        self._two_col(
+            v,
+            [self._labeled(
+                "7. Edition keywords (whole word, one per line)",
+                self.edition_keywords,
+                "Edition words like 'Pro', 'Ultimate', 'Home'. Pulled out of "
+                "the name into a separate edition field, so 'Able2Extract' and "
+                "'Able2Extract Professional' cluster as one app with two "
+                "editions instead of two separate apps. Whole-word match only "
+                "-- 'Lite' won't match inside 'K-Lite'.")],
+            [self._labeled(
+                "8. Language keywords (word=Label, one per line)",
+                self.language_keywords,
+                "Language tags like 'English', 'Multilanguage'. Extracted into "
+                "a separate language field. Whole-word match only.")],
+        )
+
+        # architecture_keywords: dict of arch -> list of words, serialized
+        # as "arch: word1, word2, ..." per line
+        arch = settings.get("architecture_keywords", {})
+        arch_text = "\n".join(
+            f"{k}: {', '.join(v)}" for k, v in arch.items())
+        self.architecture_keywords = QPlainTextEdit(arch_text)
+        self.architecture_keywords.setMaximumHeight(80)
+
+        self.build_number_pattern = QLineEdit(
+            settings.get("build_number_pattern", ""))
+
+        self._two_col(
+            v,
+            [self._labeled(
+                "Architecture keywords (arch: word1, word2, ...)",
+                self.architecture_keywords,
+                "Words that mark a build's architecture -- 'x64', '32bit', "
+                "'arm64', etc. Extracted into a separate architecture field.")],
+            [self._labeled(
+                "9. Build-number pattern (regex, one capture group)",
+                self.build_number_pattern,
+                "Recognizes build numbers appended to a version -- e.g. "
+                "'Build 212' in 'ACDSee 6.2 Build 212'. The matched text moves "
+                "from the name into the version. Regex -- must contain exactly "
+                "one capture group.")],
+        )
+
+        self.bare_number_check = QCheckBox(
+            "Treat a trailing bare number as the version")
+        self.bare_number_check.setChecked(
+            settings.get("allow_bare_trailing_number_as_version", True))
+
+        # App synonyms and portable words side by side
+        synonyms = settings.get("app_name_synonyms", [])
+        syn_text = "\n".join(
+            f"{item['pattern']}={item['replacement']}"
+            for item in synonyms if "pattern" in item)
+        self.synonyms_edit = QPlainTextEdit(syn_text)
+        self.synonyms_edit.setMaximumHeight(80)
+
+        self.portable_words_edit = QPlainTextEdit(
+            "\n".join(settings.get("portable_indicator_words", [])))
+        self.portable_words_edit.setMaximumHeight(80)
+
+        self._two_col(
+            v,
+            [self._labeled(
+                "App name synonyms (pattern=replacement)",
+                self.synonyms_edit,
+                "Explicit corrections for known misspellings or rebrands -- "
+                "e.g. '^(demon|deamon)\\s+tools=DAEMON Tools'. Checked after "
+                "all other cleaning, before clustering. Regex -- one "
+                "pattern=replacement per line.")],
+            [self._labeled(
+                "Portable indicator words (one per line)",
+                self.portable_words_edit,
+                "Words that mark a build as portable -- e.g. 'portable', "
+                "'paf'. A portable build gets a '(Portable)' suffix and a "
+                "'Portable' tag.")],
+        )
+
+        v.addWidget(self.bare_number_check)
+        v.addWidget(self._desc(
+            "If the cleaned name ends in a bare number with no other version "
+            "context -- e.g. 'Able2Extract Professional 10' -- treat that "
+            "number as the version. Only applies to the LAST number in the name."))
+
+        layout.addWidget(box_pipe)
+
+        # -- Categorization & relabeling --
+        box_cat = self._group("Categorization and relabeling")
+        v2 = box_cat._inner_layout
+
+        cat_rules = settings.get("category_rules", [])
+        cat_text = "\n".join(
+            f"{r['pattern']}={r['value']}"
+            for r in cat_rules if "pattern" in r)
+        self.category_rules_edit = QPlainTextEdit(cat_text)
+        self.category_rules_edit.setMaximumHeight(80)
+
+        subcat_rules = settings.get("subcategory_rules", [])
+        subcat_text = "\n".join(
+            f"{r['pattern']}={r['value']}"
+            for r in subcat_rules if "pattern" in r)
+        self.subcategory_rules_edit = QPlainTextEdit(subcat_text)
+        self.subcategory_rules_edit.setMaximumHeight(80)
+
+        self._two_col(
+            v2,
+            [self._labeled(
+                "Force a catalog based on folder path (pattern=value)",
+                self.category_rules_edit,
+                "Regex matched against the folder's full relative path. First "
+                "matching rule wins. Runs at scan time, before the default "
+                "first-segment-is-catalog fallback. Applies to the raw folder "
+                "path.")],
+            [self._labeled(
+                "Force a subcategory based on folder path (pattern=value)",
+                self.subcategory_rules_edit,
+                "Same as above, for subcatalog. Checked after category rules.")],
+        )
+
+        aliases = settings.get("folder_name_aliases", {})
+        self.folder_aliases = QPlainTextEdit(
+            "\n".join(f"{k}={v}" for k, v in aliases.items()))
+        self.folder_aliases.setMaximumHeight(80)
+        v2.addWidget(self._labeled(
+            "Rename catalogs and subcatalogs (alias=display name)",
+            self.folder_aliases,
+            "Relabels the finished catalog or subcatalog string without "
+            "touching anything on disk. Exact case-insensitive match -- not "
+            "regex. Runs at resolve time, after the catalog/subcatalog string "
+            "has already been decided. Example: 'burners=CD/DVD Burner'."))
+
+        self.fallback_catalog_name = QLineEdit(
+            settings.get("fallback_catalog_name", "MISC"))
+        self.fallback_subcatalog_name = QLineEdit(
+            settings.get("fallback_subcatalog_name", "MISC"))
+
+        self._two_col(
+            v2,
+            [self._labeled(
+                "Catalog name when nothing else specifies one",
+                self.fallback_catalog_name,
+                "Used when a folder structure doesn't yield a clear catalog "
+                "-- e.g. a loose installer with no category folder around it.")],
+            [self._labeled(
+                "Subcatalog name when nothing else specifies one",
+                self.fallback_subcatalog_name,
+                "Same as above, for subcatalog.")],
+        )
+
+        layout.addWidget(box_cat)
+        layout.addStretch()
+
+    # =====================================================================
+    # Tab 5 -- Scraper
+    # =====================================================================
+
+    def _build_scraper(self, settings):
+        layout = self._scroll_tab("Scraper")
+
+        # -- Sources --
+        box_src = self._group("Metadata sources")
+        v = box_src._inner_layout
+
+        self.scraper_manifest_url = QLineEdit(
+            settings.get("scraper_winget_manifest_url", ""))
+        v.addWidget(self._labeled(
+            "Winget manifest URL",
+            self.scraper_manifest_url,
+            "Source of the large offline Winget app list used for background "
+            "enrichment. Re-downloaded when the local cache is older than the "
+            "'refresh after N hours' setting below."))
+
+        self.winutil_url_edit = QLineEdit(
+            settings.get("scraper_winutil_apps_url", ""))
+        v.addWidget(self._labeled(
+            "Winutil apps URL",
+            self.winutil_url_edit,
+            "Optional secondary source with richer per-app metadata "
+            "(description, category, homepage) than the Winget manifest."))
+
+        layout.addWidget(box_src)
+
+        # -- Refresh / search limits --
+        box_lim = self._group("Refresh and search limits")
+        v2 = box_lim._inner_layout
 
         self.scraper_staleness_hours = QSpinBox()
         self.scraper_staleness_hours.setRange(1, 24 * 30)
-        self.scraper_staleness_hours.setValue(int(settings.get("scraper_manifest_staleness_hours", 4)))
-        scraper_form.addRow("Re-download manifest if cache is older than (hours)", self.scraper_staleness_hours)
-
-        self.scraper_auto_rename = QCheckBox("Auto-rename an app to the manifest's display name on a match")
-        self.scraper_auto_rename.setChecked(bool(settings.get("scraper_auto_rename", False)))
-        scraper_form.addRow(self.scraper_auto_rename)
-        scraper_form.addRow(QLabel(
-            "Off by default -- a manifest match still fills in publisher/description/\n"
-            "tags/version, it just won't overwrite an already-resolved app name.\n"
-            "Locked names (name_locked) are never renamed either way."
-        ))
-
-        self.scraper_auto_enrich_statuses = QPlainTextEdit(
-            "\n".join(settings.get("scraper_auto_enrich_statuses", ["resolved", "verified"]))
-        )
-        self.scraper_auto_enrich_statuses.setMaximumHeight(60)
-        scraper_form.addRow("App statuses eligible for \"Scrape all\" (one per line)", self.scraper_auto_enrich_statuses)
+        self.scraper_staleness_hours.setValue(
+            int(settings.get("scraper_manifest_staleness_hours", 4)))
+        self.scraper_staleness_hours.setSuffix(" hours")
 
         self.scraper_choco_max_results = QSpinBox()
         self.scraper_choco_max_results.setRange(1, 20)
-        self.scraper_choco_max_results.setValue(int(settings.get("scraper_choco_default_max_results", 5)))
-        scraper_form.addRow("Default Chocolatey search result count", self.scraper_choco_max_results)
-        tabs.addTab(scraper_tab, "Scraper")
+        self.scraper_choco_max_results.setValue(
+            int(settings.get("scraper_choco_default_max_results", 5)))
 
-        # Appearance
-        appearance_tab = QWidget()
-        appearance_form = QFormLayout(appearance_tab)
+        self._two_col(
+            v2,
+            [self._labeled(
+                "Refresh the manifest after",
+                self.scraper_staleness_hours,
+                "The manifest is re-downloaded the next time a scrape runs "
+                "once it's older than this.")],
+            [self._labeled(
+                "Results per Chocolatey search",
+                self.scraper_choco_max_results,
+                "How many candidates the manual Chocolatey search returns.")],
+        )
+        layout.addWidget(box_lim)
+
+        # -- Behaviour --
+        box_beh = self._group("Scrape behavior")
+        v3 = box_beh._inner_layout
+
+        self.scraper_auto_rename = QCheckBox(
+            "Rename apps from the manifest (may override resolver names)")
+        self.scraper_auto_rename.setChecked(
+            bool(settings.get("scraper_auto_rename", False)))
+        v3.addWidget(self.scraper_auto_rename)
+        v3.addWidget(self._desc(
+            "Off by default -- a manifest match still fills in publisher/"
+            "description/tags/version, it just won't overwrite an "
+            "already-resolved app name. Locked names (name_locked) are never "
+            "renamed either way."))
+
+        self.scraper_auto_enrich_statuses = QPlainTextEdit(
+            "\n".join(settings.get("scraper_auto_enrich_statuses",
+                                    ["resolved", "verified"])))
+        self.scraper_auto_enrich_statuses.setMaximumHeight(60)
+
+        self.scraper_winget_show_for_auto_scrape = QCheckBox(
+            "Fetch full details via winget show (slow)")
+        self.scraper_winget_show_for_auto_scrape.setChecked(
+            bool(settings.get("scraper_winget_show_for_auto_scrape", False)))
+
+        self.scraper_winget_show_timeout = QSpinBox()
+        self.scraper_winget_show_timeout.setRange(1, 60)
+        self.scraper_winget_show_timeout.setValue(
+            int(settings.get("scraper_winget_show_timeout_seconds", 10)))
+        self.scraper_winget_show_timeout.setSuffix(" seconds")
+
+        self._two_col(
+            v3,
+            [self._labeled(
+                "Which apps 'Scrape all' touches (one status per line)",
+                self.scraper_auto_enrich_statuses,
+                "Only these app statuses are attempted during a batch scrape. "
+                "Manual search/match on a single app isn't restricted by this.")],
+            [self._labeled(
+                "winget show details",
+                self.scraper_winget_show_for_auto_scrape,
+                "Adds a per-app `winget show` call for extra details. Off by "
+                "default -- a few hundred ms per app adds up over a large "
+                "batch. The manual 'Search & match…' dialog always uses it for "
+                "the single app you pick, regardless of this setting.")],
+        )
+
+        self._two_col(
+            v3,
+            [self._labeled(
+                "winget show timeout",
+                self.scraper_winget_show_timeout,
+                "How long to wait for one `winget show` call before giving up.")],
+            [],
+        )
+
+        layout.addWidget(box_beh)
+        layout.addStretch()
+
+    # =====================================================================
+    # Tab 6 -- Interface
+    # =====================================================================
+
+    def _build_interface(self, settings):
+        layout = self._scroll_tab("Interface")
+
+        box = self._group("Display")
+        v = box._inner_layout
+
         self.ui_scale = QDoubleSpinBox()
         self.ui_scale.setRange(0.5, 3.0)
         self.ui_scale.setSingleStep(0.1)
         self.ui_scale.setValue(settings.get("ui_scale_multiplier", 1.0))
-        appearance_form.addRow("UI scale multiplier", self.ui_scale)
-        appearance_form.addRow(QLabel(
-            "Scales all fonts and widget sizes. Takes effect after restarting\n"
-            "the app (Qt reads this before the window is created)."
-        ))
-        tabs.addTab(appearance_tab, "Appearance")
+        v.addWidget(self._labeled(
+            "Interface scale multiplier",
+            self.ui_scale,
+            "Scales all fonts and widget sizes. Takes effect after restarting "
+            "the app (Qt reads this before the window is created)."))
 
-        # Keywords
-        kw_tab = QWidget()
-        kw_layout = QVBoxLayout(kw_tab)
-        kw_layout.addWidget(QLabel(
-            "<b>Keywords</b> are exact‑match (case‑insensitive) words or phrases.<br>"
-            "They are applied as <u>whole‑token</u> matches (i.e., they must be separate words).<br>"
-            "They are used to strip generic words, classify folders, extract edition/language tokens."
-        ))
-        self.container_keywords = QPlainTextEdit("\n".join(settings.get("container_folder_keywords", [])))
-        kw_layout.addWidget(self.container_keywords)
-        kw_layout.addWidget(QLabel("Noise folder keywords (one per line):"))
-        self.noise_keywords = QPlainTextEdit("\n".join(settings.get("noise_folder_keywords", [])))
-        kw_layout.addWidget(self.noise_keywords)
+        layout.addWidget(box)
 
-        kw_layout.addWidget(QLabel(
-            "Noise keywords excluded ONLY when the folder name is short (see max\n"
-            "length below) -- e.g. a folder literally named \"Crack\" or \"Skins\" is\n"
-            "skipped entirely, but a long release name that merely mentions one of\n"
-            "these words among much more content (\"Adobe.Captivate...Keygen.Only-\n"
-            "ViRiLiTY\") is still the real install folder and is kept:"
-        ))
-        self.noise_short_only_keywords = QPlainTextEdit("\n".join(settings.get("noise_short_only_keywords", [])))
-        self.noise_short_only_keywords.setMaximumHeight(70)
-        kw_layout.addWidget(self.noise_short_only_keywords)
+        # Read-only info
+        info = self._group("Catalog info")
+        vi = info._inner_layout
+        conn = self.db.connect()
+        app_count = conn.execute("SELECT COUNT(*) AS n FROM apps").fetchone()["n"]
+        variant_count = conn.execute("SELECT COUNT(*) AS n FROM variants").fetchone()["n"]
+        vi.addWidget(QLabel(f"<b>Database:</b> {self.db.path}"))
+        vi.addWidget(QLabel(f"<b>Apps:</b> {app_count}"))
+        vi.addWidget(QLabel(f"<b>Variants:</b> {variant_count}"))
+        layout.addWidget(info)
 
-        short_len_row = QHBoxLayout()
-        short_len_row.addWidget(QLabel("Max folder name length still counted as \"short\":"))
-        self.noise_short_only_max_len = QSpinBox()
-        self.noise_short_only_max_len.setRange(1, 200)
-        self.noise_short_only_max_len.setValue(int(settings.get("noise_short_only_max_len", 25)))
-        short_len_row.addWidget(self.noise_short_only_max_len)
-        short_len_row.addStretch()
-        kw_layout.addLayout(short_len_row)
-        tabs.addTab(kw_tab, "Keywords")
+        layout.addStretch()
 
-        # Filters
-        filters_tab = QWidget()
-        filters_layout = QVBoxLayout(filters_tab)
-        filters_layout.addWidget(QLabel(
-            "<b>Filters</b> are <u>regular expressions</u> (regex) that match substrings.<br>"
-            "They are applied in the order shown below during the name‑cleaning pipeline.<br>"
-            "Each step is documented in the pipeline description (see below)."
-        ))
+    # =====================================================================
+    # Tab 7 -- Watch Folders (Monitor)
+    # =====================================================================
 
-        filters_layout.addWidget(QLabel("1. Bracket-content patterns (regex):"))
-        self.bracket_content_patterns = QPlainTextEdit("\n".join(settings.get("bracket_content_patterns", [])))
-        self.bracket_content_patterns.setMaximumHeight(60)
-        filters_layout.addWidget(self.bracket_content_patterns)
+    def _build_watch_folders(self, settings):
+        layout = self._scroll_tab("Watch Folders")
 
-        filters_layout.addWidget(QLabel("2. Website/domain tag patterns (regex):"))
-        self.website_patterns = QPlainTextEdit("\n".join(settings.get("website_tag_patterns", [])))
-        self.website_patterns.setMaximumHeight(70)
-        filters_layout.addWidget(self.website_patterns)
-
-        filters_layout.addWidget(QLabel("3. Release-tag / scene-flag patterns (regex):"))
-        self.release_patterns = QPlainTextEdit("\n".join(settings.get("release_tag_patterns", [])))
-        self.release_patterns.setMaximumHeight(70)
-        filters_layout.addWidget(self.release_patterns)
-
-        filters_layout.addWidget(QLabel("4. Ignore words in FILE names (whole word, one per line):"))
-        self.ignore_filename_words = QPlainTextEdit("\n".join(settings.get("ignore_filename_words", [])))
-        self.ignore_filename_words.setMaximumHeight(70)
-        filters_layout.addWidget(self.ignore_filename_words)
-
-        filters_layout.addWidget(QLabel("5. Ignore FOLDER names (whole name, one per line):"))
-        self.ignore_folder_names = QPlainTextEdit("\n".join(settings.get("ignore_folder_names", [])))
-        self.ignore_folder_names.setMaximumHeight(70)
-        filters_layout.addWidget(self.ignore_folder_names)
-
-        filters_layout.addWidget(QLabel("5b. Ignore FOLDER name patterns (regex, fullmatch):"))
-        self.ignore_folder_name_patterns = QPlainTextEdit("\n".join(settings.get("ignore_folder_name_patterns", [])))
-        self.ignore_folder_name_patterns.setMaximumHeight(60)
-        filters_layout.addWidget(self.ignore_folder_name_patterns)
-
-        filters_layout.addWidget(QLabel("5c. Ignore FILE name patterns (regex, fullmatch):"))
-        self.ignore_filename_patterns = QPlainTextEdit("\n".join(settings.get("ignore_filename_patterns", [])))
-        self.ignore_filename_patterns.setMaximumHeight(60)
-        filters_layout.addWidget(self.ignore_filename_patterns)
-
-        filters_layout.addWidget(QLabel("6. Catalog/subcatalog display-name conversions (RAW=Display):"))
-        aliases = settings.get("folder_name_aliases", {})
-        self.folder_aliases = QPlainTextEdit("\n".join(f"{k}={v}" for k, v in aliases.items()))
-        self.folder_aliases.setMaximumHeight(70)
-        filters_layout.addWidget(self.folder_aliases)
-
-        filters_layout.addWidget(QLabel("7. Edition keywords (whole word, one per line):"))
-        self.edition_keywords = QPlainTextEdit("\n".join(settings.get("edition_keywords", [])))
-        self.edition_keywords.setMaximumHeight(70)
-        filters_layout.addWidget(self.edition_keywords)
-
-        filters_layout.addWidget(QLabel("8. Language keywords (word=Label, one per line):"))
-        lang = settings.get("language_keywords", {})
-        self.language_keywords = QPlainTextEdit("\n".join(f"{k}={v}" for k, v in lang.items()))
-        self.language_keywords.setMaximumHeight(60)
-        filters_layout.addWidget(self.language_keywords)
-
-        filters_layout.addWidget(QLabel("9. Build-number pattern (regex, one capture group):"))
-        self.build_number_pattern = QLineEdit(settings.get("build_number_pattern", ""))
-        filters_layout.addWidget(self.build_number_pattern)
-
-        filters_scroll = QScrollArea()
-        filters_scroll.setWidgetResizable(True)
-        filters_scroll.setWidget(filters_tab)
-        tabs.addTab(filters_scroll, "Filters")
-
-        btn_row = QHBoxLayout()
-        save_btn = QPushButton("Save")
-        save_btn.clicked.connect(self._save)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_row.addStretch()
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(save_btn)
-        layout.addLayout(btn_row)
-
-        # ---- Advanced tab ----
-        adv_tab = QWidget()
-        adv_layout = QVBoxLayout(adv_tab)
-
-        # App name synonyms (pattern=replacement)
-        syn_group = QGroupBox("App name synonyms (pattern=replacement)")
-        syn_layout = QVBoxLayout(syn_group)
-        self.synonyms_edit = QPlainTextEdit()
-        self._populate_synonyms(self.synonyms_edit, settings.get("app_name_synonyms", []))
-        syn_layout.addWidget(self.synonyms_edit)
-        adv_layout.addWidget(syn_group)
-
-        # Category rules (pattern=value)
-        cat_group = QGroupBox("Category rules (pattern=value)")
-        cat_layout = QVBoxLayout(cat_group)
-        self.category_rules_edit = QPlainTextEdit()
-        self._populate_rules(self.category_rules_edit, settings.get("category_rules", []))
-        cat_layout.addWidget(self.category_rules_edit)
-        adv_layout.addWidget(cat_group)
-
-        # Subcategory rules (pattern=value)
-        subcat_group = QGroupBox("Subcategory rules (pattern=value)")
-        subcat_layout = QVBoxLayout(subcat_group)
-        self.subcategory_rules_edit = QPlainTextEdit()
-        self._populate_rules(self.subcategory_rules_edit, settings.get("subcategory_rules", []))
-        subcat_layout.addWidget(self.subcategory_rules_edit)
-        adv_layout.addWidget(subcat_group)
-
-        # Winutil URL
-        url_layout = QFormLayout()
-        self.winutil_url_edit = QLineEdit(settings.get("scraper_winutil_apps_url", ""))
-        url_layout.addRow("Winutil apps URL", self.winutil_url_edit)
-        adv_layout.addLayout(url_layout)
-
-        # Portable indicator words (one per line)
-        port_group = QGroupBox("Portable indicator words (one per line)")
-        port_layout = QVBoxLayout(port_group)
-        self.portable_words_edit = QPlainTextEdit()
-        self._populate_list(self.portable_words_edit, settings.get("portable_indicator_words", []))
-        port_layout.addWidget(self.portable_words_edit)
-        adv_layout.addWidget(port_group)
-
-        # Allow bare trailing number as version
-        self.bare_number_check = QCheckBox("Allow bare trailing number as version")
-        self.bare_number_check.setChecked(settings.get("allow_bare_trailing_number_as_version", True))
-        adv_layout.addWidget(self.bare_number_check)
-
-        adv_layout.addStretch()
-        tabs.addTab(adv_tab, "Advanced")
-
-        # Monitor
-        mon_tab = QWidget()
-        mon_layout = QVBoxLayout(mon_tab)
-
-        mon_layout.addWidget(QLabel(
+        intro = QLabel(
             "<b>Monitor job</b> — a manually-triggered pass over the folders "
             "below. New .exe / .msi / archive files are identified, matched to "
             "an existing app (or flagged for creation of a new one), and moved "
             "into the organized structure. Already-compressed inputs are moved "
             "as-is; everything else is archived first. Nothing on disk changes "
             "until you review the dry-run plan and click <b>Execute</b>."
-        ))
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
 
-        mon_layout.addWidget(QLabel("Folders to monitor:"))
+        box_folders = self._group("Folders to watch")
+        v = box_folders._inner_layout
+
         self.monitor_folders_table = QTableWidget(0, 1)
         self.monitor_folders_table.setHorizontalHeaderLabels(["Folder"])
         self.monitor_folders_table.horizontalHeader().setStretchLastSection(True)
@@ -1885,58 +2745,73 @@ class SettingsDialog(QDialog):
         self.monitor_folders_table.setMinimumHeight(120)
         for f in settings.get("monitor_folders", []):
             self._append_monitor_folder_row(f)
-        mon_layout.addWidget(self.monitor_folders_table)
+        v.addWidget(self.monitor_folders_table)
 
-        mon_folder_btns = QHBoxLayout()
-        mon_add_btn = QPushButton("Add folder…")
-        mon_add_btn.clicked.connect(self._add_monitor_folder)
-        mon_del_btn = QPushButton("Delete selected")
-        mon_del_btn.clicked.connect(self._remove_monitor_folders)
-        mon_folder_btns.addWidget(mon_add_btn)
-        mon_folder_btns.addWidget(mon_del_btn)
-        mon_folder_btns.addStretch()
-        mon_layout.addLayout(mon_folder_btns)
+        row = QHBoxLayout()
+        add_btn = QPushButton("Add folder…")
+        add_btn.clicked.connect(self._add_monitor_folder)
+        del_btn = QPushButton("Delete selected")
+        del_btn.clicked.connect(self._remove_monitor_folders)
+        row.addWidget(add_btn)
+        row.addWidget(del_btn)
+        row.addStretch()
+        v.addLayout(row)
+        layout.addWidget(box_folders)
 
-        mon_form = QFormLayout()
+        # -- Extensions & filters --
+        box_ext = self._group("File filters")
+        v2 = box_ext._inner_layout
+
         self.monitor_extensions = QPlainTextEdit(
-            " ".join(settings.get("monitor_extensions", []))
-        )
+            " ".join(settings.get("monitor_extensions", [])))
         self.monitor_extensions.setMaximumHeight(40)
-        self.monitor_extensions.setToolTip("Space-separated, leading dot required")
-        mon_form.addRow("Extensions to watch:", self.monitor_extensions)
 
         self.monitor_already_compressed = QPlainTextEdit(
-            " ".join(settings.get("monitor_already_compressed_extensions", []))
-        )
+            " ".join(settings.get("monitor_already_compressed_extensions", [])))
         self.monitor_already_compressed.setMaximumHeight(40)
-        self.monitor_already_compressed.setToolTip(
-            "Files with these extensions are moved as-is, not re-compressed"
+
+        self._two_col(
+            v2,
+            [self._labeled(
+                "Extensions to watch",
+                self.monitor_extensions,
+                "Space-separated, leading dot required.")],
+            [self._labeled(
+                "Already-compressed extensions",
+                self.monitor_already_compressed,
+                "Files with these extensions are moved as-is, not re-compressed.")],
         )
-        mon_form.addRow("Already-compressed extensions:", self.monitor_already_compressed)
 
         self.monitor_skip_partial = QPlainTextEdit(
-            " ".join(settings.get("monitor_skip_partial_extensions", []))
-        )
+            " ".join(settings.get("monitor_skip_partial_extensions", [])))
         self.monitor_skip_partial.setMaximumHeight(40)
-        self.monitor_skip_partial.setToolTip(
-            "Files ending in these are ignored entirely (mid-download markers)"
-        )
-        mon_form.addRow("Skip partial-download suffixes:", self.monitor_skip_partial)
 
         self.monitor_min_size = QSpinBox()
         self.monitor_min_size.setRange(0, 100_000)
         self.monitor_min_size.setValue(int(settings.get("monitor_min_size_mb", 1)))
         self.monitor_min_size.setSuffix(" MB")
-        mon_form.addRow("Minimum file size:", self.monitor_min_size)
+
+        self._two_col(
+            v2,
+            [self._labeled(
+                "Skip partial-download suffixes",
+                self.monitor_skip_partial,
+                "Files ending in these are ignored entirely (mid-download markers).")],
+            [self._labeled(
+                "Minimum file size",
+                self.monitor_min_size,
+                "Smaller files are ignored.")],
+        )
+        layout.addWidget(box_ext)
+
+        # -- Settle / archive / mode --
+        box_act = self._group("Settling and archive options")
+        v3 = box_act._inner_layout
 
         self.monitor_settle = QSpinBox()
         self.monitor_settle.setRange(0, 300)
         self.monitor_settle.setValue(int(settings.get("monitor_settle_seconds", 3)))
         self.monitor_settle.setSuffix(" seconds")
-        self.monitor_settle.setToolTip(
-            "A file must be unchanged for this long before it's processed"
-        )
-        mon_form.addRow("Settle delay:", self.monitor_settle)
 
         self.monitor_format = QComboBox()
         self.monitor_format.addItems(["7z", "zip", "rar"])
@@ -1944,54 +2819,51 @@ class SettingsDialog(QDialog):
         idx = self.monitor_format.findText(fmt)
         if idx >= 0:
             self.monitor_format.setCurrentIndex(idx)
-        mon_form.addRow("Default archive format:", self.monitor_format)
+
+        self._two_col(
+            v3,
+            [self._labeled(
+                "Settle delay",
+                self.monitor_settle,
+                "A file must be unchanged for this long before it's processed.")],
+            [self._labeled(
+                "Default archive format",
+                self.monitor_format,
+                "Format used when compressing non-archive installers.")],
+        )
 
         self.monitor_move_mode = QComboBox()
         self.monitor_move_mode.addItems(["move", "copy"])
-        self.monitor_move_mode.setCurrentText(settings.get("monitor_move_mode", "move"))
-        mon_form.addRow("Default mode:", self.monitor_move_mode)
+        self.monitor_move_mode.setCurrentText(
+            settings.get("monitor_move_mode", "move"))
 
         self.monitor_auto_scrape = QCheckBox(
-            "Refresh Winget metadata for an app right after a file is attached"
-        )
+            "Refresh Winget metadata for an app right after a file is attached")
         self.monitor_auto_scrape.setChecked(
-            bool(settings.get("monitor_auto_scrape_on_attach", True))
+            bool(settings.get("monitor_auto_scrape_on_attach", True)))
+
+        self._two_col(
+            v3,
+            [self._labeled(
+                "Default mode",
+                self.monitor_move_mode,
+                "Move = the original file is removed after being placed. "
+                "Copy = the original stays where it was.")],
+            [self.monitor_auto_scrape],
         )
-        mon_form.addRow(self.monitor_auto_scrape)
+        layout.addWidget(box_act)
+        layout.addStretch()
 
-        mon_layout.addLayout(mon_form)
-        mon_layout.addStretch()
-        tabs.addTab(mon_tab, "Monitor")
-        # Long descriptive labels have no word wrap by default; their
-        # single-line natural width would otherwise force the whole tab
-        # widget (and therefore the dialog) to expand well past the
-        # screen. Wrap anything long enough to be prose rather than a
-        # field label, and cap the dialog's opening size so a huge
-        # display doesn't make it fill the entire screen.
-        for lbl in self.findChildren(QLabel):
-            text = lbl.text() or ""
-            if len(text) > 60 and " " in text and "://" not in text:
-                lbl.setWordWrap(True)
-        self.resize(700, 620)
-        self.setMaximumWidth(1100)
-
-    def _populate_synonyms(self, text_edit, data):
-        lines = [f"{item['pattern']}={item['replacement']}" for item in data if 'pattern' in item]
-        text_edit.setPlainText("\n".join(lines))
-
-    def _populate_rules(self, text_edit, data):
-        lines = [f"{item['pattern']}={item['value']}" for item in data if 'pattern' in item]
-        text_edit.setPlainText("\n".join(lines))
-
-    def _populate_list(self, text_edit, data):
-        text_edit.setPlainText("\n".join(data) if isinstance(data, list) else "")
+    # ---------------------------------------------------------------------
+    # Watch Folders -- table helpers (unchanged from previous implementation)
+    # ---------------------------------------------------------------------
 
     def _append_monitor_folder_row(self, folder: str):
         row = self.monitor_folders_table.rowCount()
         self.monitor_folders_table.insertRow(row)
         self.monitor_folders_table.setItem(row, 0, QTableWidgetItem(folder))
 
-    def _current_monitor_folders(self) -> list[str]:
+    def _current_monitor_folders(self) -> list:
         out = []
         for r in range(self.monitor_folders_table.rowCount()):
             item = self.monitor_folders_table.item(r, 0)
@@ -2000,8 +2872,7 @@ class SettingsDialog(QDialog):
         return out
 
     def _add_monitor_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Choose folder to monitor")
+        folder = QFileDialog.getExistingDirectory(self, "Choose folder to monitor")
         if not folder:
             return
         if folder in self._current_monitor_folders():
@@ -2013,53 +2884,96 @@ class SettingsDialog(QDialog):
             {idx.row() for idx in self.monitor_folders_table.selectedIndexes()},
             reverse=True,
         )
-        if not rows:
-            return
         for r in rows:
             self.monitor_folders_table.removeRow(r)
-    
+
+    # =====================================================================
+    # Save
+    # =====================================================================
+
     def _save(self):
-        self.db.set_setting("confidence_auto_accept", self.auto_accept.value(), bump_version=True, note="settings dialog save")
-        self.db.set_setting("confidence_needs_review", self.needs_review.value(), bump_version=False)
-        self.db.set_setting("fuzzy_match_threshold", self.fuzzy_threshold.value(), bump_version=False)
-        self.db.set_setting("prefer_pe_version_over_parsed", self.prefer_pe.isChecked(), bump_version=False)
-        self.db.set_setting("read_exe_metadata_enabled", self.read_pe_metadata_toggle.isChecked(), bump_version=False)
-        self.db.set_setting("inspect_archive_contents_enabled", self.inspect_archives_toggle.isChecked(), bump_version=False)
-        self.db.set_setting("archive_ambiguity_escalates_to_extraction", self.escalate_ambiguous.isChecked(), bump_version=False)
-        self.db.set_setting("archive_max_full_extract_mb", self.max_extract_mb.value(), bump_version=False)
-        self.db.set_setting("archive_purge_scratch_after_use", self.purge_after.isChecked(), bump_version=False)
-        self.db.set_setting("incremental_scan_by_default", self.incremental.isChecked(), bump_version=False)
-        self.db.set_setting("scan_follow_symlinks", self.follow_symlinks.isChecked(), bump_version=False)
+        # -- Variant Matching --
+        self.db.set_setting("confidence_auto_accept", self.auto_accept.value(),
+                            bump_version=True, note="settings dialog save")
+        self.db.set_setting("confidence_needs_review", self.needs_review.value(),
+                            bump_version=False)
+        self.db.set_setting("fuzzy_match_threshold", self.fuzzy_threshold.value(),
+                            bump_version=False)
+        self.db.set_setting("prefer_pe_version_over_parsed",
+                            self.prefer_pe.isChecked(), bump_version=False)
 
-        self.db.set_setting("scraper_winget_manifest_url", self.scraper_manifest_url.text().strip(), bump_version=False)
-        self.db.set_setting("scraper_manifest_staleness_hours", self.scraper_staleness_hours.value(), bump_version=False)
-        self.db.set_setting("scraper_auto_rename", self.scraper_auto_rename.isChecked(), bump_version=False)
-        self.db.set_setting("scraper_auto_enrich_statuses", [l.strip() for l in self.scraper_auto_enrich_statuses.toPlainText().splitlines() if l.strip()], bump_version=False)
-        self.db.set_setting("scraper_choco_default_max_results", self.scraper_choco_max_results.value(), bump_version=False)
-        self.db.set_setting("ui_scale_multiplier", self.ui_scale.value(), bump_version=False)
+        # -- Archive Handling --
+        self.db.set_setting("read_exe_metadata_enabled",
+                            self.read_pe_metadata_toggle.isChecked(),
+                            bump_version=False)
+        self.db.set_setting("inspect_archive_contents_enabled",
+                            self.inspect_archives_toggle.isChecked(),
+                            bump_version=False)
+        self.db.set_setting("archive_ambiguity_escalates_to_extraction",
+                            self.escalate_ambiguous.isChecked(),
+                            bump_version=False)
+        self.db.set_setting("archive_max_full_extract_mb",
+                            self.max_extract_mb.value(), bump_version=False)
+        self.db.set_setting("archive_purge_scratch_after_use",
+                            self.purge_after.isChecked(), bump_version=False)
+        scratch = self.archive_scratch_dir_edit.text().strip() or None
+        self.db.set_setting("archive_scratch_dir", scratch, bump_version=False)
 
-        self.db.set_setting("container_folder_keywords", [l.strip() for l in self.container_keywords.toPlainText().splitlines() if l.strip()], bump_version=False)
-        self.db.set_setting("noise_folder_keywords", [l.strip() for l in self.noise_keywords.toPlainText().splitlines() if l.strip()], bump_version=False)
-        self.db.set_setting("noise_short_only_keywords", [l.strip() for l in self.noise_short_only_keywords.toPlainText().splitlines() if l.strip()], bump_version=False)
-        self.db.set_setting("noise_short_only_max_len", self.noise_short_only_max_len.value(), bump_version=False)
+        # -- Scanning & Noise --
+        self.db.set_setting("noise_folder_keywords",
+                            [l.strip() for l in
+                             self.noise_keywords.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("noise_short_only_keywords",
+                            [l.strip() for l in
+                             self.noise_short_only_keywords.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("noise_short_only_max_len",
+                            self.noise_short_only_max_len.value(),
+                            bump_version=False)
+        self.db.set_setting("container_folder_keywords",
+                            [l.strip() for l in
+                             self.container_keywords.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("ignore_folder_names",
+                            [l.strip() for l in
+                             self.ignore_folder_names.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("ignore_folder_name_patterns",
+                            [l.strip() for l in
+                             self.ignore_folder_name_patterns.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("ignore_filename_patterns",
+                            [l.strip() for l in
+                             self.ignore_filename_patterns.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("incremental_scan_by_default",
+                            self.incremental.isChecked(), bump_version=False)
+        self.db.set_setting("scan_follow_symlinks",
+                            self.follow_symlinks.isChecked(), bump_version=False)
 
-        self.db.set_setting("bracket_content_patterns", [l.strip() for l in self.bracket_content_patterns.toPlainText().splitlines() if l.strip()], bump_version=False)
-        self.db.set_setting("website_tag_patterns", [l.strip() for l in self.website_patterns.toPlainText().splitlines() if l.strip()], bump_version=False)
-        self.db.set_setting("release_tag_patterns", [l.strip() for l in self.release_patterns.toPlainText().splitlines() if l.strip()], bump_version=False)
-        self.db.set_setting("ignore_filename_words", [l.strip() for l in self.ignore_filename_words.toPlainText().splitlines() if l.strip()], bump_version=False)
-        self.db.set_setting("ignore_folder_names", [l.strip() for l in self.ignore_folder_names.toPlainText().splitlines() if l.strip()], bump_version=False)
-        self.db.set_setting("ignore_folder_name_patterns", [l.strip() for l in self.ignore_folder_name_patterns.toPlainText().splitlines() if l.strip()], bump_version=False)
-        self.db.set_setting("ignore_filename_patterns", [l.strip() for l in self.ignore_filename_patterns.toPlainText().splitlines() if l.strip()], bump_version=False)
+        # -- Naming & Renaming --
+        self.db.set_setting("bracket_content_patterns",
+                            [l.strip() for l in
+                             self.bracket_content_patterns.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("website_tag_patterns",
+                            [l.strip() for l in
+                             self.website_patterns.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("release_tag_patterns",
+                            [l.strip() for l in
+                             self.release_patterns.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("ignore_filename_words",
+                            [l.strip() for l in
+                             self.ignore_filename_words.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("edition_keywords",
+                            [l.strip() for l in
+                             self.edition_keywords.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
 
-        alias_dict = {}
-        for line in self.folder_aliases.toPlainText().splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                if k.strip():
-                    alias_dict[k.strip().lower()] = v.strip()
-        self.db.set_setting("folder_name_aliases", alias_dict, bump_version=False)
-
-        self.db.set_setting("edition_keywords", [l.strip() for l in self.edition_keywords.toPlainText().splitlines() if l.strip()], bump_version=False)
         lang_dict = {}
         for line in self.language_keywords.toPlainText().splitlines():
             if "=" in line:
@@ -2067,9 +2981,23 @@ class SettingsDialog(QDialog):
                 if k.strip():
                     lang_dict[k.strip().lower()] = v.strip()
         self.db.set_setting("language_keywords", lang_dict, bump_version=False)
-        self.db.set_setting("build_number_pattern", self.build_number_pattern.text().strip(), bump_version=False)
 
-        # Advanced settings
+        arch_dict = {}
+        for line in self.architecture_keywords.toPlainText().splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                words = [w.strip() for w in v.split(",") if w.strip()]
+                if k.strip():
+                    arch_dict[k.strip()] = words
+        self.db.set_setting("architecture_keywords", arch_dict, bump_version=False)
+
+        self.db.set_setting("build_number_pattern",
+                            self.build_number_pattern.text().strip(),
+                            bump_version=False)
+        self.db.set_setting("allow_bare_trailing_number_as_version",
+                            self.bare_number_check.isChecked(),
+                            bump_version=False)
+
         synonyms = []
         for line in self.synonyms_edit.toPlainText().splitlines():
             if "=" in line:
@@ -2077,6 +3005,11 @@ class SettingsDialog(QDialog):
                 if k.strip():
                     synonyms.append({"pattern": k.strip(), "replacement": v.strip()})
         self.db.set_setting("app_name_synonyms", synonyms, bump_version=False)
+
+        self.db.set_setting("portable_indicator_words",
+                            [l.strip() for l in
+                             self.portable_words_edit.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
 
         cat_rules = []
         for line in self.category_rules_edit.toPlainText().splitlines():
@@ -2094,38 +3027,76 @@ class SettingsDialog(QDialog):
                     subcat_rules.append({"pattern": k.strip(), "value": v.strip()})
         self.db.set_setting("subcategory_rules", subcat_rules, bump_version=False)
 
-        self.db.set_setting("scraper_winutil_apps_url", self.winutil_url_edit.text().strip(), bump_version=False)
+        alias_dict = {}
+        for line in self.folder_aliases.toPlainText().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                if k.strip():
+                    alias_dict[k.strip().lower()] = v.strip()
+        self.db.set_setting("folder_name_aliases", alias_dict, bump_version=False)
 
-        portable_words = [line.strip() for line in self.portable_words_edit.toPlainText().splitlines() if line.strip()]
-        self.db.set_setting("portable_indicator_words", portable_words, bump_version=False)
+        self.db.set_setting("fallback_catalog_name",
+                            self.fallback_catalog_name.text().strip(),
+                            bump_version=False)
+        self.db.set_setting("fallback_subcatalog_name",
+                            self.fallback_subcatalog_name.text().strip(),
+                            bump_version=False)
 
-        self.db.set_setting("allow_bare_trailing_number_as_version", self.bare_number_check.isChecked(), bump_version=False)
+        # -- Scraper --
+        self.db.set_setting("scraper_winget_manifest_url",
+                            self.scraper_manifest_url.text().strip(),
+                            bump_version=False)
+        self.db.set_setting("scraper_winutil_apps_url",
+                            self.winutil_url_edit.text().strip(),
+                            bump_version=False)
+        self.db.set_setting("scraper_manifest_staleness_hours",
+                            self.scraper_staleness_hours.value(),
+                            bump_version=False)
+        self.db.set_setting("scraper_auto_rename",
+                            self.scraper_auto_rename.isChecked(),
+                            bump_version=False)
+        self.db.set_setting("scraper_auto_enrich_statuses",
+                            [l.strip() for l in
+                             self.scraper_auto_enrich_statuses.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("scraper_choco_default_max_results",
+                            self.scraper_choco_max_results.value(),
+                            bump_version=False)
+        self.db.set_setting("scraper_winget_show_for_auto_scrape",
+                            self.scraper_winget_show_for_auto_scrape.isChecked(),
+                            bump_version=False)
+        self.db.set_setting("scraper_winget_show_timeout_seconds",
+                            self.scraper_winget_show_timeout.value(),
+                            bump_version=False)
 
-        # Monitor
-        self.db.set_setting(
-            "monitor_folders",
-            self._current_monitor_folders(),
-            bump_version=False)
-        self.db.set_setting(
-            "monitor_extensions",
-            self.monitor_extensions.toPlainText().split(),
-            bump_version=False)
-        self.db.set_setting(
-            "monitor_already_compressed_extensions",
-            self.monitor_already_compressed.toPlainText().split(),
-            bump_version=False)
-        self.db.set_setting(
-            "monitor_skip_partial_extensions",
-            self.monitor_skip_partial.toPlainText().split(),
-            bump_version=False)
-        self.db.set_setting("monitor_min_size_mb", self.monitor_min_size.value(), bump_version=False)
-        self.db.set_setting("monitor_settle_seconds", self.monitor_settle.value(), bump_version=False)
-        self.db.set_setting("monitor_archive_format", self.monitor_format.currentText(), bump_version=False)
-        self.db.set_setting("monitor_move_mode", self.monitor_move_mode.currentText(), bump_version=False)
-        self.db.set_setting("monitor_auto_scrape_on_attach", self.monitor_auto_scrape.isChecked(), bump_version=False)
+        # -- Interface --
+        self.db.set_setting("ui_scale_multiplier", self.ui_scale.value(),
+                            bump_version=False)
+
+        # -- Watch Folders --
+        self.db.set_setting("monitor_folders",
+                            self._current_monitor_folders(), bump_version=False)
+        self.db.set_setting("monitor_extensions",
+                            self.monitor_extensions.toPlainText().split(),
+                            bump_version=False)
+        self.db.set_setting("monitor_already_compressed_extensions",
+                            self.monitor_already_compressed.toPlainText().split(),
+                            bump_version=False)
+        self.db.set_setting("monitor_skip_partial_extensions",
+                            self.monitor_skip_partial.toPlainText().split(),
+                            bump_version=False)
+        self.db.set_setting("monitor_min_size_mb",
+                            self.monitor_min_size.value(), bump_version=False)
+        self.db.set_setting("monitor_settle_seconds",
+                            self.monitor_settle.value(), bump_version=False)
+        self.db.set_setting("monitor_archive_format",
+                            self.monitor_format.currentText(), bump_version=False)
+        self.db.set_setting("monitor_move_mode",
+                            self.monitor_move_mode.currentText(), bump_version=False)
+        self.db.set_setting("monitor_auto_scrape_on_attach",
+                            self.monitor_auto_scrape.isChecked(), bump_version=False)
 
         self.accept()
-
 
 class CsvExportDialog(QDialog):
     def __init__(self, parent=None):
@@ -2213,11 +3184,10 @@ class MainWindow(QMainWindow):
         necessarily the exact instant the underlying OS thread has fully
         wound down -- dropping the last Python reference to a QThread
         that Qt doesn't yet consider finished() prints "QThread:
-        Destroyed while thread is still running" and can crash outright
-        (this is what caused the occasional crash after Re-resolve
-        all -> Clean library). wait() blocks until the thread has
-        genuinely finished; if it already has (the overwhelmingly common
-        case), it returns immediately, so this costs nothing in practice.
+        Destroyed while thread is still running" and can crash outright.
+        wait() blocks until the thread has genuinely finished; if it
+        already has (the overwhelmingly common case), it returns
+        immediately, so this costs nothing in practice.
         """
         worker = self._active_worker
         if worker is not None:
@@ -2270,7 +3240,7 @@ class MainWindow(QMainWindow):
         )
         monitor_action.triggered.connect(self._run_monitor)
         toolbar.addAction(monitor_action)
-        
+
         toolbar.addSeparator()
 
         export_action = QAction("Export CSV…", self)
@@ -2330,11 +3300,19 @@ class MainWindow(QMainWindow):
         self.model = AppsTableModel(self.db)
         self.table = QTableView()
         self.table.setModel(self.model)
+        # Custom delegate makes a selected row visually distinct even when
+        # the model returns a status BackgroundRole (amber/rose/blue/gray).
+        # Without this, the custom background can mask Qt's own selection
+        # highlight.
+        self.table.setItemDelegate(AppsTableDelegate(self.table))
         self.table.horizontalHeader().setSectionsMovable(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setSortingEnabled(True)
-        self.table.selectionModel().currentRowChanged.connect(self._on_selection_changed)
+        # selectionChanged (not currentRowChanged) -- we need to know when
+        # the selection SIZE changes so the detail panel can switch into
+        # multi-edit mode.
+        self.table.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_apps_context_menu)
         splitter.addWidget(self.table)
@@ -2357,23 +3335,65 @@ class MainWindow(QMainWindow):
         self.status_bar.addWidget(self.status_label)
 
     def _capture_state(self) -> dict:
-        """Capture current sort column/order and selected app id."""
+        """Capture current sort column/order and selected app id(s)."""
         return {
             'sort_col': self.table.horizontalHeader().sortIndicatorSection(),
             'sort_order': self.table.horizontalHeader().sortIndicatorOrder(),
             'app_id': self.detail_panel.current_app_id,
+            'multi_app_ids': (
+                list(self.detail_panel._multi_app_ids)
+                if self.detail_panel._multi_mode else None
+            ),
         }
 
     def _restore_state(self, state: dict):
-        """Restore sort and selection from a captured state."""
+        """Restore sort and selection (single or multi) from a captured state."""
         if state['sort_col'] >= 0:
             self.table.sortByColumn(state['sort_col'], state['sort_order'])
-        if state['app_id'] is not None:
-            for row in range(self.model.rowCount()):
-                if self.model.app_id_at(row) == state['app_id']:
-                    self.table.selectRow(row)
-                    self.detail_panel.load_app(state['app_id'])
-                    break
+
+        sel_model = self.table.selectionModel()
+        sel_model.blockSignals(True)
+        try:
+            multi_ids = state.get('multi_app_ids')
+            if multi_ids:
+                sel_model.clearSelection()
+
+                # Pick the "current" row (used for keyboard focus / scroll
+                # position) but do NOT go through QTableView.setCurrentIndex()
+                # -- its default selection command is ClearAndSelect, which
+                # would collapse our multi-selection down to a single row.
+                first_idx = None
+                for row in range(self.model.rowCount()):
+                    if self.model.app_id_at(row) in multi_ids:
+                        first_idx = self.model.index(row, 0)
+                        break
+
+                if first_idx is not None:
+                    # NoUpdate = set current index without touching selection.
+                    sel_model.setCurrentIndex(
+                        first_idx, QItemSelectionModel.NoUpdate
+                    )
+
+                # Now select every row that belongs to the multi-selection.
+                for row in range(self.model.rowCount()):
+                    if self.model.app_id_at(row) in multi_ids:
+                        idx = self.model.index(row, 0)
+                        sel_model.select(
+                            idx,
+                            QItemSelectionModel.Select | QItemSelectionModel.Rows,
+                        )
+
+            elif state['app_id'] is not None:
+                for row in range(self.model.rowCount()):
+                    if self.model.app_id_at(row) == state['app_id']:
+                        self.table.selectRow(row)   # ClearAndSelect -- fine for single
+                        break
+        finally:
+            sel_model.blockSignals(False)
+
+        # Manually re-trigger the panel update; blockSignals above
+        # suppressed the normal selectionChanged path.
+        self._on_selection_changed()
 
     def select_app_by_id(self, app_id: int) -> bool:
         """
@@ -2428,7 +3448,8 @@ class MainWindow(QMainWindow):
     def refresh_all(self, preserve_state: bool = True):
         """
         Refresh the entire UI (table, catalog list, column visibility).
-        If preserve_state is True, restore sort order and selected app.
+        If preserve_state is True, restore sort order and selection
+        (single or multi).
         """
         state = self._capture_state() if preserve_state else None
 
@@ -2476,13 +3497,25 @@ class MainWindow(QMainWindow):
         self.model.scrape_status_filter = None if scrape_status == "(all)" else scrape_status
         self.model.refresh()
 
-    def _on_selection_changed(self, current, previous):
-        if not current.isValid():
+    def _on_selection_changed(self, *args):
+        """
+        Dispatch to the detail panel based on how many rows are selected:
+          - 0 selected -> clear()
+          - 1 selected -> load_app() (full single-app view)
+          - N > 1      -> load_apps() (multi-edit view)
+        """
+        selected_rows = self.table.selectionModel().selectedRows()
+        if not selected_rows:
             self.detail_panel.clear()
             return
-        app_id = self.model.app_id_at(current.row())
-        if app_id is not None:
-            self.detail_panel.load_app(app_id)
+        app_ids = [self.model.app_id_at(r.row()) for r in selected_rows]
+        app_ids = [i for i in app_ids if i is not None]
+        if not app_ids:
+            self.detail_panel.clear()
+        elif len(app_ids) == 1:
+            self.detail_panel.load_app(app_ids[0])
+        else:
+            self.detail_panel.load_apps(app_ids)
 
     def _selected_app_ids(self) -> list[int]:
         rows = {idx.row() for idx in self.table.selectionModel().selectedRows()}
@@ -2535,7 +3568,7 @@ class MainWindow(QMainWindow):
                                 QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
             for app_id in app_ids:
                 self.db.delete_app(app_id)
-            self.refresh_all()   # replaces load_filters() + load_table()
+            self.refresh_all()
 
     def open_selected_location(self):
         app_ids = self._selected_app_ids()
@@ -2794,7 +3827,6 @@ class MainWindow(QMainWindow):
         if self.detail_panel.current_app_id is not None:
             self.detail_panel.load_app(self.detail_panel.current_app_id)
 
-
     # ---------------------------------------------------------------
     # Monitor job (checkpoint 18) -- all logic lives in monitor.py;
     # this is just the wiring that keeps it inside the shared
@@ -2842,8 +3874,6 @@ class MainWindow(QMainWindow):
         self._release_worker()
         self.status_label.setText("Monitor failed.")
         QMessageBox.critical(self, "Monitor failed", err)
-
-
 
     def _on_scan_progress(self, progress):
         self.status_label.setText(

@@ -617,25 +617,26 @@ def _derive_catalog_subcatalog(
 
 
 # ---------------------------------------------------------------------
-# Feature B: per-scan-root folder layout (arbitrary-depth subcategory
-# chains, per-folder skip/rename). resolver.py and classify_folder() are
-# unchanged -- all of this feeds them the same shape of data (catalog,
-# subcatalog, depth) they always received, just computed more flexibly.
+# Feature B / checkpoint 28: per-scan-root folder layout. Every folder in
+# a scan root has one of four explicit ROLES -- "catalog" | "subcatalog"
+# | "app" | "skip" -- picked from the same dropdown at any depth in
+# gui_main.FolderLayoutDialog. resolver.py and classify_folder() are
+# unchanged -- this still just feeds them (catalog, subcatalog, depth).
 # ---------------------------------------------------------------------
 
-def _layout_mode_of(entry, default=None):
-    """
-    A layout entry is either a bare int (-1/0/2) or a dict
-    {"mode": -1|0|2, "name": "Custom Label"}. Returns just the mode.
-    """
+VALID_ROLES = ("catalog", "subcatalog", "app", "skip")
+
+
+def _layout_role_of(entry, default=None):
+    """A layout entry is either a bare role string or a dict
+    {"role": "...", "name": "Custom Label"}. Returns just the role."""
     if entry is None:
         return default
     if isinstance(entry, dict):
-        return entry.get("mode", default)
-    try:
-        return int(entry)
-    except (TypeError, ValueError):
-        return default
+        return entry.get("role", default)
+    if entry in VALID_ROLES:
+        return entry
+    return default
 
 
 def _layout_label_for(raw_name: Optional[str], key: Optional[str], layout: dict,
@@ -657,63 +658,75 @@ def _layout_label_for(raw_name: Optional[str], key: Optional[str], layout: dict,
     return raw_name
 
 
-def _layout_find_skip(keys: list[str], layout: dict) -> bool:
+def _resolve_role_chain(keys: list[str], layout: dict, unconfigured_toplevel_role: str) -> list[str]:
     """
-    A folder is skipped if ANY ancestor (or itself) is explicitly marked
-    -1 -- "do not scan/import this folder or anything under it" is
-    absolute; a deeper override cannot un-skip a subtree. Checked
-    shallow-to-deep only for readability; order doesn't affect the result.
+    Walks the chain TOP-DOWN (unlike the old mode system, roles cascade
+    forward rather than needing a deepest-match backward search), one
+    role per folder in the chain. A folder with no explicit layout entry
+    defaults to: `unconfigured_toplevel_role` if it's the top-level
+    folder (no parent in the chain), else cascaded from its parent's
+    role -- catalog's children default to subcatalog, subcatalog's
+    children default to app, and an app's children stay app (they're
+    just internal/version folders at that point, not further category
+    tiers). A `skip` role also cascades down (redundant with the
+    resolve function's early skip-check, kept here for consistency).
     """
-    return any(_layout_mode_of(layout.get(k)) == -1 for k in keys)
-
-
-def _layout_nearest_ancestor(keys: list[str], layout: dict) -> tuple[Optional[int], Optional[int]]:
-    """
-    Deepest-match-wins lookup: keys[i] is the cumulative lowercased
-    relative-path key for parts[0..i] (1-indexed depth = i+1). Returns
-    (matched_depth, mode) for the deepest key present in the layout, or
-    (None, None) if nothing at any level was explicitly configured.
-    Assumes _layout_find_skip() has already ruled out a -1 anywhere in
-    this chain, so entries seen here are only 0 or 2.
-    """
-    for depth in range(len(keys), 0, -1):
-        entry = layout.get(keys[depth - 1])
-        if entry is not None:
-            return depth, _layout_mode_of(entry, default=2)
-    return None, None
+    roles = []
+    for i, key in enumerate(keys):
+        explicit = _layout_role_of(layout.get(key))
+        if explicit is not None:
+            role = explicit
+        elif i == 0:
+            role = unconfigured_toplevel_role
+        else:
+            parent_role = roles[i - 1]
+            role = {"catalog": "subcatalog", "subcatalog": "app"}.get(parent_role, parent_role)
+        roles.append(role)
+    return roles
 
 
 def resolve_scan_root_layout(
     root: str,
     folder_path: str,
     layout: dict,
-    root_is_catalog: bool = False,
-    root_catalog_name: Optional[str] = None,
+    unconfigured_toplevel_role: str = "catalog",
     settings: Optional[dict] = None,
 ) -> tuple[Optional[str], Optional[str], int, bool]:
     """
-    Generalization of _derive_catalog_subcatalog() that understands the
-    user's declared per-folder layout: an arbitrary chain of subcategory
-    tiers (not just a fixed 2), per-folder skip, and per-folder rename.
+    Computes (catalog, subcatalog, depth, skip) for one folder, driven by
+    the user's declared per-folder layout (an explicit role -- catalog /
+    subcatalog / app / skip -- at any depth, with cascading defaults
+    where unconfigured; see _resolve_role_chain() above).
 
     Returns (catalog, subcatalog, depth, skip). When skip is True, catalog/
     subcatalog/depth are meaningless (None, None, 0) -- the caller must not
     yield a raw_candidates row for this folder or descend into it.
 
-    The load-bearing idea (unchanged from the original 2-tier design):
-    resolver.extract_fields() still expects "depth <= 2 = category label,
-    not an app name". We never touch that contract -- we just compute a
-    `depth` number that honours it, however deep the user's real chain is.
+    catalog = the label of the DEEPEST folder in the chain with role
+    "catalog" (normally there's exactly one, at the top; marking a
+    deeper folder "catalog" too restarts categorization from there,
+    discarding anything shallower -- an intentional escape hatch for an
+    unusual nested structure, not the common case).
+    subcatalog = the label of the deepest "subcatalog"-role folder that
+    sits BELOW the chosen catalog; None if there isn't one.
+    depth: resolver.extract_fields() expects "depth <= 2 = category
+    label, not an app name" -- boosted to max(raw_depth, 3) whenever the
+    folder ITSELF has role "app", so a direct child of a catalog (no
+    subcatalog tier at all, e.g. ADOBE/Photoshop) is still trusted as a
+    real name; left unchanged otherwise since a folder still mid-chain
+    is never treated as an app-name candidate anyway.
 
-    Walkthrough (see Part 2 of the design doc for the full derivation):
-      layout={"adobe": 0}
-        ADOBE/Photoshop            -> catalog=ADOBE, subcatalog=None, depth=3
-      layout={} (nothing configured -- the all-default case)
-        GRAPHICS/Converters/Acme   -> catalog=GRAPHICS, subcatalog=Converters, depth=3
-      layout={"graphics/converters/video": 0}   (only this one override)
-        GRAPHICS/Converters/appname1        -> subcatalog=Converters (still just default)
-        GRAPHICS/Converters/Video/AcmeConvert -> subcatalog=Video (nearer tier wins)
-      layout={"tutorials": -1}
+    Walkthrough:
+      layout={"adobe": "app"}  (ADOBE's children are apps directly)
+        ADOBE/Photoshop                        -> catalog=ADOBE, subcatalog=None, depth=3
+      layout={}  (nothing configured -- the all-default case)
+        GRAPHICS/Converters/Acme                -> catalog=GRAPHICS, subcatalog=Converters, depth=3
+      layout={"graphics/converters/video": "app"}   (Video treated as just another app-territory folder, not a tier)
+        GRAPHICS/Converters/appname1            -> subcatalog=Converters (default cascade)
+        GRAPHICS/Converters/Video/AcmeConvert   -> subcatalog=Converters too (Video adds no tier since it's not marked "subcatalog")
+      layout={"graphics/converters/video": "subcatalog"}   (Video IS a further tier)
+        GRAPHICS/Converters/Video/AcmeConvert   -> catalog=GRAPHICS, subcatalog=Video, depth=4
+      layout={"tutorials": "skip"}
         TUTORIALS/anything -> skip=True, never yielded, walk doesn't descend
     """
     rel = os.path.relpath(folder_path, root)
@@ -732,64 +745,31 @@ def resolve_scan_root_layout(
         acc.append(p.lower())
         keys.append("/".join(acc))
 
-    if _layout_find_skip(keys, layout):
+    roles = _resolve_role_chain(keys, layout, unconfigured_toplevel_role)
+    if any(r == "skip" for r in roles):
         return None, None, 0, True
 
-    # How many leading real folders the catalog tier consumes: 1 normally
-    # (parts[0] IS the catalog folder), 0 when this root is itself a single
-    # catalog (there's no on-disk folder occupying that role).
-    offset = 0 if root_is_catalog else 1
-
     taxonomy_catalog = _apply_taxonomy_rules(rel_str, settings.get("category_rules", []))
-    if root_is_catalog:
-        catalog = root_catalog_name or Path(root).name
-    else:
-        catalog = _layout_label_for(parts[0] if parts else None, keys[0] if keys else None,
-                                     layout, taxonomy_catalog)
-
-    matched_depth, mode = _layout_nearest_ancestor(keys, layout)
-    if matched_depth is None:
-        # Nothing explicitly configured anywhere in this chain -- default
-        # is "has subcatalog", applied just past the catalog boundary.
-        matched_depth, mode = offset, 2
-
     taxonomy_subcatalog = _apply_taxonomy_rules(rel_str, settings.get("subcategory_rules", []))
 
-    if mode == 0:
-        # The folder at matched_depth declared "my children are apps
-        # directly" -- terminate the subcategory chain there. Two distinct
-        # shapes both reach this branch: an ANCESTOR several levels up was
-        # marked mode=0 (e.g. "graphics/converters"=0, and we're deriving
-        # for a descendant of Converters -- subcatalog becomes Converters'
-        # own name), or the CURRENT folder's own key was marked mode=0
-        # (e.g. "graphics/faststone"=0, self-match -- FastStone itself is
-        # the app, so what matters is FastStone's own parent, one level
-        # shallower than an ancestor-match would use).
-        is_self_match = (matched_depth == len(parts))
-        boundary_idx = matched_depth - (2 if is_self_match else 1)
-        if boundary_idx >= offset:
-            raw_sub = parts[boundary_idx] if boundary_idx < len(parts) else None
-            subcatalog = _layout_label_for(raw_sub, keys[boundary_idx] if boundary_idx < len(keys) else None,
-                                            layout, taxonomy_subcatalog)
-        else:
-            subcatalog = None
-        # +1 so a folder that would otherwise land on the resolver's
-        # "shallow, don't trust this name" tier (<=2) is correctly treated
-        # as an app tier instead. Harmless no-op for already-deep folders.
-        depth = len(parts) + 1
-    else:
-        # mode == 2 ("has subcatalog", default): the chain continues past
-        # matched_depth, so the very next folder after it is the
-        # subcatalog for now (a deeper explicit override, if any, would
-        # have already won via matched_depth in the lookup above).
-        sub_idx = matched_depth
-        if sub_idx < len(parts):
-            raw_sub = parts[sub_idx]
-            subcatalog = _layout_label_for(raw_sub, keys[sub_idx], layout, taxonomy_subcatalog)
-        else:
-            subcatalog = None
-        depth = len(parts)
+    catalog_idx = max((i for i, r in enumerate(roles) if r == "catalog"), default=None)
+    if catalog_idx is None:
+        # No catalog anywhere in the chain (e.g. unconfigured_toplevel_role
+        # is "skip" and nothing further down was explicitly marked
+        # "catalog" either) -- nothing to name this folder under.
+        return None, None, 0, False
+    catalog = _layout_label_for(parts[catalog_idx], keys[catalog_idx], layout, taxonomy_catalog)
 
+    subcatalog_idx = max(
+        (i for i in range(catalog_idx + 1, len(roles)) if roles[i] == "subcatalog"),
+        default=None,
+    )
+    subcatalog = (
+        _layout_label_for(parts[subcatalog_idx], keys[subcatalog_idx], layout, taxonomy_subcatalog)
+        if subcatalog_idx is not None else None
+    )
+
+    depth = max(len(parts), 3) if roles[-1] == "app" else len(parts)
     return catalog, subcatalog, depth, False
 
 
@@ -1002,8 +982,7 @@ def walk_scan_root(
     follow_symlinks: bool = False,
     error_sink: Optional[list] = None,
     folder_layout: Optional[dict] = None,
-    root_is_catalog: bool = False,
-    root_catalog_name: Optional[str] = None,
+    unconfigured_toplevel_role: str = "catalog",
 ) -> Iterator[ScanCandidate]:
     root = os.path.abspath(root)
     walk_root = _apply_long_path_prefix(root)
@@ -1040,7 +1019,7 @@ def walk_scan_root(
 
         catalog, subcatalog, depth, skip = resolve_scan_root_layout(
             root, display_dirpath, folder_layout or {},
-            root_is_catalog=root_is_catalog, root_catalog_name=root_catalog_name,
+            unconfigured_toplevel_role=unconfigured_toplevel_role,
             settings=settings,
         )
         if skip:
@@ -1195,8 +1174,9 @@ def run_scan(
 
     scan_root_row = db.get_scan_root_by_id(scan_root_id)
     folder_layout = db.get_folder_layout(scan_root_id)
-    root_is_catalog = bool(scan_root_row["root_is_catalog"]) if scan_root_row else False
-    root_catalog_name = scan_root_row["root_catalog_name"] if scan_root_row else None
+    unconfigured_toplevel_role = (
+        (scan_root_row["unconfigured_toplevel_role"] or "catalog") if scan_root_row else "catalog"
+    )
 
     incremental = settings.get("incremental_scan_by_default", True)
     existing_fingerprints = {}
@@ -1215,8 +1195,7 @@ def run_scan(
             follow_symlinks=settings.get("scan_follow_symlinks", False),
             error_sink=scan_errors,
             folder_layout=folder_layout,
-            root_is_catalog=root_is_catalog,
-            root_catalog_name=root_catalog_name,
+            unconfigured_toplevel_role=unconfigured_toplevel_role,
         ):
             if cancel_flag and cancel_flag():
                 log.warning("Scan cancelled by user.")

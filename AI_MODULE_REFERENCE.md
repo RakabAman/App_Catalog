@@ -122,7 +122,7 @@ store.
 |---|---|
 | `settings` | key -> JSON-encoded value. Live, editable from Settings dialog, no restart needed. |
 | `settings_version` | Bumped whenever a resolution-affecting setting changes. `apps`/`variants` record which version produced them. |
-| `scan_roots` | One row per folder root ever scanned. `last_scan_started_at`/`last_scan_finished_at`/`last_scan_status` track re-scan state. |
+| `scan_roots` | One row per folder root ever scanned. `last_scan_started_at`/`last_scan_finished_at`/`last_scan_status` track re-scan state. Checkpoint 25 added `folder_layouts_json`; checkpoint 28 replaced `root_is_catalog`/`root_catalog_name` (unused going forward, kept as harmless dead columns) with `unconfigured_toplevel_role` (see `scanner.py` section below). |
 | `raw_candidates` | Scanner output. One row per detected install unit (folder + primary file). PE metadata, archive-inspection bookkeeping, and a fingerprint (for incremental-rescan skip) live here. **Never mutated by the resolver.** |
 | `scan_errors` | Folders the scanner couldn't read (permission denied, path too long). Surfaced in the GUI after a scan so failures aren't silent. |
 | `apps` | The clean, canonical, user-facing entity. See column list below. |
@@ -165,6 +165,16 @@ this one is about scraper auto-rename), `latest_version`, `last_scraped`,
   for settings that don't affect resolution logic (UI prefs, scraper
   config) vs `True` (default) for anything that changes how names get
   resolved.
+- **Checkpoint 25 (Feature B)**: `.get_scan_root_by_path(path)` /
+  `.get_scan_root_by_id(id)` -- full row as a dict. `.ensure_scan_root
+  (path)` -- insert-if-missing, used by the GUI to open
+  `FolderLayoutDialog` BEFORE a scan job runs (`scan_roots` rows are
+  normally created/updated by `scanner._upsert_scan_root()` at scan
+  time; this is the one place something else creates the row first).
+  `.get_folder_layout(scan_root_id)` -- parsed `folder_layouts_json`
+  dict (empty if never configured). `.save_folder_layout(scan_root_id,
+  layout, unconfigured_toplevel_role=None)` (signature changed in
+  checkpoint 28 -- was `root_is_catalog`/`root_catalog_name`).
 
 ---
 
@@ -176,9 +186,15 @@ note its much stricter safety requirements).
 
 ### Key pieces
 
-- `walk_scan_root(root, settings, ...)` -- the main entry, does an
+- `walk_scan_root(root, settings, ..., folder_layout=None,
+  unconfigured_toplevel_role="catalog")` -- the main entry, does an
   `os.walk`-style traversal, classifying every folder via
-  `classify_folder()` and building `ScanCandidate` objects.
+  `classify_folder()` and building `ScanCandidate` objects. Checkpoint
+  25/28: the two kwargs feed `resolve_scan_root_layout()` (below); when
+  it reports `skip=True` for a folder, `walk_scan_root` sets
+  `dirnames[:] = []` before `continue`-ing so the walk never descends
+  into a skipped subtree at all, rather than just discarding candidates
+  from it after the fact.
 - `classify_folder(folder_path, file_names, subfolder_names, settings, depth)`
   -- returns a `Classification` (`unit_type`: noise|container|install_unit|
   unresolved). This is where `noise_folder_keywords`/
@@ -195,13 +211,52 @@ note its much stricter safety requirements).
 - `list_archive()` / `extract_and_inspect()` -- archive content
   inspection, cheap listing first, escalates to real extraction only when
   ambiguous (see `_evaluate_ambiguity()`).
-- `_derive_catalog_subcatalog(root, folder_path, settings)` -- computes
-  catalog/subcatalog from the relative path. Checkpoint 15: now checks
-  `_apply_taxonomy_rules()` against `category_rules`/`subcategory_rules`
-  settings FIRST (regex-against-full-relative-path, first-match-wins),
-  falling back to the original "first path segment = catalog, second =
-  subcatalog" behavior when no rule matches or none are configured. Empty
-  rule lists by default -- zero behavior change until rules are added.
+- `_derive_catalog_subcatalog(root, folder_path, settings)` -- LEGACY
+  fixed-2-tier derivation (`catalog=parts[0]`, `subcatalog=parts[1]`,
+  always). Checkpoint 15: checks `_apply_taxonomy_rules()` against
+  `category_rules`/`subcategory_rules` settings first. Checkpoint 25:
+  no longer the real code path for an actual scan -- superseded entirely
+  by `resolve_scan_root_layout()` below, kept only for reference.
+- **`resolve_scan_root_layout(root, folder_path, layout,
+  unconfigured_toplevel_role, settings) -> (catalog, subcatalog, depth,
+  skip)`** (checkpoint 25, **rewritten in checkpoint 28** around a
+  cleaner model -- read this note over the docstring's own worked
+  examples if the two ever seem to disagree, the docstring is
+  authoritative) -- the REAL catalog/subcatalog/depth derivation
+  `walk_scan_root()` actually calls. Every folder in `layout` (flat map,
+  key = lowercased relative path, value = a role string `"catalog"` |
+  `"subcatalog"` | `"app"` | `"skip"`, or `{"role":.., "name":..}` for a
+  renamed folder) is SELF-describing -- a folder marked `"app"`
+  unambiguously means "I am the app," never "my children are." An
+  unconfigured folder's role cascades from its parent
+  (`_resolve_role_chain()`: catalog->subcatalog->app->app, walked
+  top-down since roles cascade forward now, not backward-searched like
+  checkpoint 25's original mode system) or from `unconfigured_toplevel_
+  role` for a top-level folder with no parent in the chain. `catalog` =
+  the deepest folder in the chain with role `"catalog"` (normally
+  exactly one, at the top -- marking one deeper too is allowed and
+  intentionally restarts categorization from there). `subcatalog` = the
+  deepest `"subcatalog"`-role folder below that catalog, or `None`.
+  Depth still gets boosted to `max(raw_depth, 3)` whenever the folder
+  ITSELF has role `"app"`, same "don't let the resolver's shallow-name
+  distrust misfire on a direct catalog child" idea as the original
+  design, just driven off the folder's own resolved role now rather
+  than a matched ancestor's mode. Because roles are self-describing, the
+  self-match-vs-ancestor-match distinction that made checkpoint 25's
+  version tricky (and buggy once) doesn't exist anymore. One real
+  trade-off worth knowing: since a Catalog's children default to
+  Subcatalog (never App), a catalog with NO real subcategory tier (every
+  child folder directly holds its installer) needs each such child
+  EXPLICITLY marked `"app"` -- marking the catalog folder itself `"app"`
+  does not work, there'd be no folder left with role `"catalog"` to name
+  anything under (see `PROGRESS.md` checkpoint 28 for the confirming
+  test).
+- `list_top_level_folders(root)` / `list_child_folders(root, rel_parent)`
+  (checkpoint 25) -- single, non-recursive `os.scandir()` calls, used by
+  `gui_main.FolderLayoutDialog`'s lazy tree (levels 1-2 populated
+  eagerly, level 3+ on-demand when a row is expanded) and by
+  `MainWindow._maybe_show_folder_layout_dialog()` to detect new
+  top-level folders on a re-scan.
 - `compute_folder_fingerprint()` -- used for incremental re-scan
   (unchanged folders are skipped on a re-scan of an existing root; see
   `ScanRootsDialog` in `gui_main.py` for the UI to trigger this).
@@ -383,9 +438,26 @@ the GUI can treat a Winget result and a Chocolatey result identically):
 
 **New in checkpoint 15**, adopted from a side-by-side review of a
 parallel DeepSeek build of this app (see `PROGRESS.md` checkpoint 15 for
-the full comparison of what was/wasn't adopted and why). Four independent
-groups:
+the full comparison of what was/wasn't adopted and why). Checkpoints
+25-27 added a sixth group (scan root lifecycle management -- listed
+first below since it now runs before the duplicate-detection group in
+the file itself). Six independent groups:
 
+0. **`update_scan_root_path(db, scan_root_id, new_root_path) -> dict`**
+   (checkpoint 25, "repath") -- for a moved/remounted drive. Rewrites
+   the scan root's `path` plus every already-catalogued path derived
+   from it (`raw_candidates.folder_path`, `variants.source_path` via a
+   join, `scan_errors.path`) in one transaction. Prefix-match only
+   (`_starts_with_root()`/`_rewrite_prefix()`), never a substring
+   replace. Does NOT re-scan/re-resolve. Logged to `audit_log`.
+   **`delete_scan_root(db, scan_root_id) -> dict`** (checkpoint 26) --
+   deletes the `scan_roots` row (cascading `raw_candidates`/
+   `scan_errors` via existing FKs); deliberately does NOT touch
+   `apps`/`variants` -- `variants.raw_candidate_id` is `ON DELETE SET
+   NULL`, so already-resolved apps just lose their link back to the
+   deleted root's raw scan data rather than disappearing. GUI: "Change
+   path…" / "Delete selected root…" buttons per row in
+   `ScanRootsDialog`.
 1. **`find_duplicate_groups(db, fuzzy_threshold=None) -> list[DuplicateGroup]`**
    -- read-only. Exact `normalized_key` collisions + fuzzy near-misses
    (same threshold as clustering, by default) that never merged at
@@ -435,18 +507,29 @@ groups:
      knowing anything about Qt.
 5. **`scan_for_missing_sources(db, root_path=None) -> list[MissingItem]`**
    / **`execute_clean_library(db, missing_items) -> CleanLibraryResult`**
-   -- **checkpoint 22, "Clean library".** Deliberately the OPPOSITE of a
-   scan/re-scan: never looks for new install units, only confirms
-   variants ALREADY in the catalog still exist (`os.path.exists()` per
-   variant, scoped to variants under `root_path` when given). Removal
-   deletes both the `variants` row and its `raw_candidates` row -- the
-   latter matters, or a future Resolve run without a fresh Scan first
-   could silently re-create the exact variant just removed, since
-   Resolve reads `raw_candidates` from the DB, not the live filesystem.
-   An app left with zero variants after removal is deleted outright (FK
-   cascades handle its tags etc.). Read-only scan / destructive-but-
-   DB-only execute, same two-step shape as reorganize -- see
-   `PROGRESS.md` checkpoint 22.
+   -- **checkpoint 22, "Clean library"**; extended in checkpoint 27.
+   Deliberately the OPPOSITE of a scan/re-scan: never looks for new
+   install units, only confirms variants ALREADY in the catalog are
+   still valid, scoped to variants under `root_path` when given (`None`
+   = whole catalog, wired to `ScanRootsDialog`'s "Clean library (all
+   roots)" in checkpoint 26). Checks, per variant, in order: (1)
+   `raw_candidate_id IS NULL` (its scan root was deleted via
+   `delete_scan_root()`) -> `MissingItem.reason="scan root no longer
+   tracked"`; (2) its scan root is still registered but
+   `os.path.isdir(root.path)` is `False` (drive unplugged/remounted) ->
+   `reason="scan root path unreachable"`, flagged WITHOUT checking the
+   individual file (one `isdir()` per root, cached, not per-variant);
+   (3) otherwise the original `os.path.exists()` per-file check ->
+   `reason="file not found"`. `CleanLibraryReviewDialog` (`gui_main.py`)
+   shows the reason in its own column. Removal deletes both the
+   `variants` row and its `raw_candidates` row (when it has one -- case
+   1 above won't) -- the latter matters, or a future Resolve run without
+   a fresh Scan first could silently re-create the exact variant just
+   removed, since Resolve reads `raw_candidates` from the DB, not the
+   live filesystem. An app left with zero variants after removal is
+   deleted outright (FK cascades handle its tags etc.). Read-only scan /
+   destructive-but-DB-only execute, same two-step shape as reorganize --
+   see `PROGRESS.md` checkpoints 22 and 27.
 
 ---
 
@@ -551,14 +634,62 @@ Organized top-to-bottom in `gui_main.py` as:
    (lists every app except the current parent; picked id returned by
    `selected_app_id()` after `exec()`). Note: `db.connect().execute(...)`,
    not `db.cursor.execute(...)`.
-4. `ScanRootsDialog` -- lists `scan_roots`, one-click re-scan (reuses the
-   existing `_run_scan_and_resolve()` worker path), plus (checkpoint 22)
-   a per-row "Clean library" button -> `MainWindow._run_clean_library()`
-   -> `CleanLibraryScanWorker` -> `CleanLibraryReviewDialog` (new
-   checkpoint 22 dialog, sits right after `ScanRootsDialog` in this file
-   -- checkbox-per-row review + "Remove N selected" ->
-   `app_manager.execute_clean_library()`, then auto-opens the HTML
-   report the same way `OrganizeDialog` does).
+4. `ScanRootsDialog` -- lists `scan_roots`. Consolidated into the single
+   entry point for scan-root management in checkpoint 26 (the main
+   toolbar's separate "Add scan root…" `QAction` was removed): "Add new
+   scan root…" (checkpoint 28: now asks "is this itself a single
+   catalog?" first -- see `FolderLayoutDialog` entry below for what that
+   triggers), "Delete selected root…" (checkpoint 26,
+   `app_manager.delete_scan_root()` -- non-destructive, see that
+   function's own doc in the `app_manager.py` section), per-row
+   "Re-scan now" / "Change path…" (checkpoint 25, `update_scan_root_
+   path()`) / "Clean library" (checkpoint 22) / "Edit folder layout…"
+   (checkpoint 25, opens `FolderLayoutDialog` directly without a scan),
+   plus checkpoint 26's "Re-scan all roots" (sequential batch, see
+   `MainWindow._run_rescan_all_roots()`/`_advance_batch_rescan()` below)
+   and "Clean library (all roots)" (`_run_clean_library(None)`).
+4b. `FolderLayoutDialog` (checkpoint 25, **redesigned checkpoint 28**) --
+   per-scan-root folder layout editor, lazy `QTreeWidget` (levels 1-2
+   populated eagerly, deeper levels resolve on-demand via `scanner.
+   list_child_folders()` the moment a row is expanded). Every row gets
+   an identical 4-item role dropdown (`ROLE_ITEMS`: Catalog / Subcatalog
+   / App / Skip) regardless of depth -- no more separate top-level-vs-
+   child dropdowns or a symbolic "inherit" state; an unconfigured row's
+   default is computed by `_default_role_for()`, cascading down from its
+   parent's role (or this root's `unconfigured_toplevel_role` for a
+   top-level row), and is a concrete, editable value the moment the row
+   appears. The Preview column just calls `scanner.resolve_scan_root_
+   layout()` on the row's OWN path directly and formats by role -- no
+   synthetic child-folder trick needed anymore (see the `scanner.py`
+   section for why that's now unnecessary). Opened three ways:
+   automatically before a scan via `MainWindow._maybe_show_folder_
+   layout_dialog()` (first-ever scan of a root, or a re-scan that found
+   new top-level folders -- shows the FULL dialog either way, new rows
+   just marked "(NEW)"), directly via `ScanRootsDialog`'s "Edit folder
+   layout…" button (no scan triggered), or right after `ScanRootsDialog.
+   _add_new_root()`'s single-catalog promotion (see below).
+   **Checkpoint 28's "-1 level" single-catalog promotion**: picking a
+   folder as "itself a single catalog" (a `QMessageBox.question` prompt
+   in `_add_new_root()`) does NOT store that folder as the scan root --
+   it prompts for a display name (`QInputDialog.getText`, default =
+   folder's basename), walks up one level (`os.path.dirname`), and
+   `db.ensure_scan_root()`s the PARENT as the actual root, writing an
+   explicit `"catalog"` (or `{"role":"catalog","name":...}` if renamed)
+   entry for the originally-picked folder plus setting that root's
+   `unconfigured_toplevel_role` to `"skip"`. Adding a second single-
+   catalog folder that shares the same parent (e.g. `C:\Program\
+   Graphic` then `C:\Program\Desktop`) needed NO new dedup code at all --
+   it lands on the same `scan_roots` row for free, since `ensure_scan_
+   root()` is already insert-if-missing keyed on the unique `path`
+   column; both catalogs just merge into the same `folder_layouts_json`.
+4c. `CleanLibraryReviewDialog` (checkpoint 22) -- sits right after
+   `ScanRootsDialog` in this file. Checkbox-per-row review (default
+   checked) of what `MainWindow._run_clean_library()` ->
+   `CleanLibraryScanWorker` -> `app_manager.scan_for_missing_sources()`
+   found; checkpoint 27 added a "Reason" column (`file not found` /
+   `scan root path unreachable` / `scan root no longer tracked`).
+   "Remove N selected" -> `app_manager.execute_clean_library()`, then
+   auto-opens the HTML report the same way `OrganizeDialog` does.
 5. `ReresolveDialog` -- review/accept a single app's
    `propose_reresolve_app()` diff.
 6. `SettingsDialog` -- tabbed: Resolver / Archives / Scan / Scraper /
@@ -578,11 +709,28 @@ Organized top-to-bottom in `gui_main.py` as:
    `_current_catalog_selection()`) + detail-panel splitter
    (`_build_central_widget`), and all the top-level action handlers
    (`_run_scan_and_resolve`, `_run_resolve_all`, `_run_scrape`,
-   `_run_monitor` (checkpoint 18), `_run_clean_library` (checkpoint 22),
-   `_show_apps_context_menu`, `_open_organize_dialog`,
-   `_show_column_picker`/`_apply_column_visibility` (checkpoint 15,
-   `visible_columns` setting), `_open_settings`, CSV export/import
-   handlers).
+   `_run_monitor` (checkpoint 18), `_run_clean_library` (checkpoint 22;
+   `root_path=None` = whole catalog, checkpoint 26),
+   `_run_rescan_all_roots`/`_advance_batch_rescan` (checkpoint 26 --
+   sequential batch across every scan root; continuation is driven from
+   `_on_scan_resolve_finished`/`_on_job_failed` via a `_batch_rescan_
+   current_path` flag, NOT a fresh `.connect()` made after the worker's
+   `.start()` already returned -- that was tried first and lost a race
+   against a fast-finishing worker, see `PROGRESS.md` checkpoint 26),
+   `_maybe_show_folder_layout_dialog` (checkpoint 25), `_show_apps_
+   context_menu`, `_open_organize_dialog`, `_show_column_picker`/
+   `_apply_column_visibility` (checkpoint 15, `visible_columns` setting),
+   `_open_settings`, CSV export/import handlers). **`_release_worker()`**
+   (checkpoint 27) -- EVERY completion/failure handler clears
+   `self._active_worker` through this helper, never by assigning `None`
+   directly; it calls `worker.wait()` first, which is a no-op if the
+   thread's already finished (the common case) but closes a real race
+   that caused an intermittent `QThread: Destroyed while thread is still
+   running` crash (the custom `finished_ok`/`failed` signals fire from
+   inside `run()`, which doesn't guarantee the OS thread has fully wound
+   down by the time the slot runs on the main thread). Any NEW worker
+   completion handler must go through this helper too, not
+   `self._active_worker = None` directly.
 
 `MainWindow.select_app_by_id(app_id)` is the "jump to app" API used by
 `OrganizeDialog`'s report tab when a finding is double-clicked -- it

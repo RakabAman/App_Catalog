@@ -1931,3 +1931,421 @@ requirements.txt` (checked in this sandbox).
   flags specifically with PySide6's Qt DLLs. Worth reconsidering only
   after a plain (non-UPX) build is confirmed working on the target
   Windows machine.
+
+## Checkpoint 25: Scan root repath (Feature A) + per-root folder layout config (Feature B)
+
+Two independent features requested together, discussed and designed
+before any code was written (see the conversation's own back-and-forth
+for the full design negotiation -- summarized here is the final shape
+and what was actually verified).
+
+### Feature A: `update_scan_root_path()`
+
+For when an external/backup drive holding a scan root changes mount
+point (`D:\` -> `E:\`, or a UNC path gets remounted) -- rewrites the
+scan root's `path` plus every already-catalogued path derived from it
+(`raw_candidates.folder_path`, `variants.source_path` via a join since
+variants don't store `scan_root_id` directly, `scan_errors.path`) in one
+transaction. Prefix-match only, via `_starts_with_root()`/
+`_rewrite_prefix()` -- never a naive substring replace, so a sibling
+path that merely shares characters with the old root (`D:\PROGRAMS2\`
+vs root `D:\PROGRAMS`) is never touched. Does NOT re-scan or re-resolve;
+the folder structure under the root is assumed unchanged. Logged to
+`audit_log` (`entity_type="scan_root"`, `action="path_change"`).
+GUI: "Change path…" button per row in `ScanRootsDialog`.
+
+**Verified**: ran a real scan+resolve against a synthetic tree, called
+`update_scan_root_path()` to move it to a different path, and confirmed
+every `raw_candidates`/`variants` row's path was rewritten correctly
+with a matching `audit_log` entry -- not just read the code, actually
+executed it against a live DB.
+
+### Feature B: per-scan-root folder layout (`resolve_scan_root_layout()`)
+
+The scanner's old `_derive_catalog_subcatalog()` only ever supported a
+FIXED two-tier structure: `catalog = parts[0]`, `subcatalog = parts[1]`,
+always, regardless of how deep the real folder nesting went. This broke
+down for the user's actual drive layout in three ways: (1) some catalogs
+have NO subcategory tier at all (`ADOBE\Photoshop\` -- Photoshop
+shouldn't be mistaken for a category), (2) some catalogs MIX direct apps
+and subcategory folders side by side (`GRAPHICS\FastStone\` next to
+`GRAPHICS\Converters\`), and (3) some subcategories nest an arbitrary
+number of levels deep (`GRAPHICS\Converters\Video\AcmeConvert\` --
+`Video` should be the subcatalog for apps below it, not `Converters`).
+
+New DB shape (`scan_roots` table, additive migrations): `root_is_catalog`
+(this root's own folder IS a single catalog, no top-level catalog
+folder), `root_catalog_name`, `folder_layouts_json` -- a flat map keyed
+by lowercased relative path, values either a bare int (`-1` skip / `0`
+no-subcatalog / `2` has-subcatalog) or `{"mode": ..., "name": "..."}`
+when the folder's also been renamed for display.
+
+`scanner.resolve_scan_root_layout(root, folder_path, layout,
+root_is_catalog, root_catalog_name, settings) -> (catalog, subcatalog,
+depth, skip)` replaces the old function as the real code path (the old
+`_derive_catalog_subcatalog` is kept only as what an empty/unconfigured
+layout degrades to). Core algorithm, arrived at after working through
+several wrong drafts (see below):
+
+- **Skip**: any ancestor (or the folder itself) marked `-1` in the
+  layout excludes the whole subtree -- checked shallow-to-deep, no
+  override possible below an ancestor's skip (matches "do not scan/
+  import this folder or anything under it" literally).
+- **Deepest-match-wins ancestor lookup** (`_layout_nearest_ancestor`):
+  walks from the folder's own key up to the shallowest, returns the
+  first configured `(depth, mode)` found; unconfigured anywhere
+  defaults to `(depth=1, mode=2)` -- "has subcatalog" starting just past
+  the catalog boundary.
+- **`mode == 0` (no subcatalog)**: two genuinely different index
+  arithmetics depending on WHERE the match happened, both needed to get
+  the nested case right:
+  - **Ancestor-match** (`matched_depth < len(parts)`, e.g. `"graphics/
+    converters"` configured `0` while deriving for a descendant of
+    Converters): `subcatalog = parts[matched_depth - 1]` -- the
+    ancestor's own name.
+  - **Self-match** (`matched_depth == len(parts)`, e.g. `"graphics/
+    faststone"` configured `0` while deriving for FastStone itself):
+    `subcatalog = parts[matched_depth - 2]` -- one level shallower,
+    since here the CURRENT folder is the app, not an ancestor of it.
+    Getting this wrong (using the ancestor formula for a self-match)
+    was the first real bug caught while testing: it produced
+    `subcatalog="FastStone"` (i.e. the app naming itself) instead of
+    `None`.
+  - Either way, `None` if the resulting boundary index is at or before
+    the catalog folder itself (matches the original `ADOBE` example).
+- **`mode == 2` (has subcatalog, incl. default)**: `subcatalog =
+  parts[matched_depth]` -- the very next folder past wherever the chain
+  was last explicitly anchored (or past the catalog boundary, if never
+  anchored at all).
+- **Depth**: `+1` when `mode == 0`, unchanged otherwise -- same
+  correction the original design used, just now applied relative to
+  the ACTUAL matched depth rather than assumed to always be 1, so it
+  keeps working correctly no matter how many real tiers exist above it.
+
+This means the user's exact nested case needs only ONE override
+(`"graphics/converters/video": 0`) -- `GRAPHICS\Converters\appname1`
+(no override in its chain) still correctly resolves to
+`subcatalog="Converters"` via the plain default-mode-2 path, while
+`GRAPHICS\Converters\Video\AcmeConvert` resolves to
+`subcatalog="Video"` via the self/ancestor-match logic above. Renaming
+(`{"mode":.., "name":..}`) is a pure label substitution at whichever
+position the algorithm lands on -- no separate propagation logic, every
+descendant just inherits the label automatically since it's written
+straight into the string the scanner hands to `raw_candidates`.
+
+`gui_main.FolderLayoutDialog`: lazy-expanding `QTreeWidget` (levels 1-2
+populated immediately since "some folder might be mixed" is the common
+case; level 3+ resolves on-demand the moment a level-2 row is expanded,
+via `list_child_folders()`), per-row mode combo + rename field + live
+preview column. Two real UI-layer bugs caught and fixed while testing
+against a real widget tree (not just the underlying function):
+- **Preview self-match bug**: the preview always appended a synthetic
+  child segment to compute "what would an app here look like", which
+  turned a genuine self-match (FastStone) into a false ancestor-match,
+  showing a non-`None` subcatalog. Fixed by branching on the ROW's own
+  combo selection: `mode == 0` previews the row's own path directly
+  (self-match), everything else appends a synthetic child.
+- **Placeholder leak into the computed value**: for a `mode == 2` row
+  exactly one level above where its subcatalog would land (every
+  top-level row with no deeper override), the synthetic placeholder
+  segment's literal text ("App") leaked into the COMPUTED subcatalog,
+  not just the displayed name, because it landed at the exact index
+  `resolve_scan_root_layout` reads. Fixed by appending two synthetic
+  segments (a real known child name when available, else a generic
+  "Category", then "App") so the computed subcatalog always lands on a
+  real-ish name.
+- **Case-sensitivity bug in `_prune_orphaned_layout_keys`**: joining
+  the LOWERCASED layout keys directly into a path and calling
+  `os.path.isdir()` silently reports every folder "missing" on a
+  case-sensitive filesystem (this sandbox; would also be fragile
+  cross-platform in general), which would have wiped the ENTIRE saved
+  layout on every save. Fixed with `_folder_exists_case_insensitive()`,
+  walking one segment at a time via `os.scandir()` with case-insensitive
+  name matching.
+
+Auto-trigger: `MainWindow._maybe_show_folder_layout_dialog()` runs
+before every scan -- opens the full dialog (all top-level folders shown,
+new ones pre-filled at default and marked "(NEW)") on the very first
+scan of a root, or whenever a re-scan finds top-level folders not yet
+present as an explicit key in `folder_layouts_json`. Top-level rows are
+always written explicitly on OK (even at the default value) specifically
+so an unchanged, already-seen folder never re-triggers the dialog on a
+later re-scan.
+
+**Verified**: `resolve_scan_root_layout()` tested against 9 cases
+(ADOBE no-subcatalog, default 2-tier, mixed direct-app with explicit
+override, skip, the nested case with only the deepest folder overridden,
+rename via dict entry, `root_is_catalog` default, `root_is_catalog` with
+an override, and a version-subfolder-stays-put case) -- all correct,
+including the exact nested scenario from the design discussion. Then a
+FULL end-to-end run: built a synthetic tree matching the real reported
+layout, ran `run_scan()` + `run_resolve()` against it for real, and
+confirmed the final `apps` rows (name, catalog, subcatalog) come out
+right for all four structural cases at once in a single scan.
+
+## Checkpoint 26: ScanRootsDialog consolidation + global batch operations
+
+`ScanRootsDialog` is now the single entry point for scan root management
+-- the main toolbar's standalone "Add scan root…" `QAction` was removed
+(`_pick_and_scan_root()` deleted along with it); the dialog's own "Add
+new scan root…" button was already equivalent and is simpler to reason
+about with one entry point instead of two paths to the same job.
+
+Four new/changed buttons in `ScanRootsDialog`:
+- **"Delete selected root…"** -> `app_manager.delete_scan_root(db,
+  scan_root_id)`. Deliberately non-destructive to the catalog: deletes
+  the `scan_roots` row (cascading `raw_candidates`/`scan_errors` via the
+  existing `ON DELETE CASCADE` FKs), but `variants.raw_candidate_id` is
+  `ON DELETE SET NULL` (already the schema's design, not new), so
+  already-resolved apps/variants are left in place, just unlinked from
+  their (now gone) raw scan data. Confirmed via a real delete against a
+  live DB: app row survived, its variant's `raw_candidate_id` went to
+  `NULL` rather than the variant disappearing.
+- **"Re-scan all roots"** -> `MainWindow._run_rescan_all_roots()` /
+  `_advance_batch_rescan()`. Re-scans every known root sequentially
+  (never in parallel -- the DB connection/worker pattern isn't set up
+  for concurrent jobs), reusing the exact same single-root path per
+  root (including `FolderLayoutDialog` if that root has new folders); a
+  root that fails or gets skipped (dialog cancelled) doesn't stop the
+  rest of the batch, and a summary lists anything that had a problem.
+- **"Clean library (all roots)"** -> `MainWindow._run_clean_library(None)`.
+  `app_manager.scan_for_missing_sources()` already supported
+  `root_path=None` meaning "check the whole catalog" -- it just wasn't
+  wired to any button; this was a pure GUI wiring task, not a backend
+  change.
+
+**Bug caught and fixed while building the batch re-scan, before it ever
+shipped**: the first draft connected to each worker's `finished_ok`
+signal to advance to the next root AFTER calling
+`_run_scan_and_resolve()` (i.e., after `.start()` had already been
+called on that worker). For a fast/trivial scan, the worker could finish
+and emit `finished_ok` before that `.connect()` line even ran -- Qt
+signals only notify connections that existed AT emit time, so the
+connection was silently missed and the batch stalled after the first
+root. Confirmed with a traced test: `_advance_batch_rescan` was only
+ever called once despite two roots being queued, yet the SECOND root's
+app still appeared in the final `apps` table -- misleadingly, because
+`ScanAndResolveWorker` calls `run_resolve(db)` with no `scan_root_id`
+scope, so the FIRST root's resolve pass re-derived the second root's
+already-scanned (but not yet re-scanned) `raw_candidates` too, masking
+the stall. Rebuilt to piggyback on the handlers ALREADY connected before
+`.start()` (`_on_scan_resolve_finished`, `_on_job_failed`) via a
+`_batch_rescan_current_path` instance flag rather than a fresh
+post-start connection -- re-verified with the DB wiped between steps
+(including `raw_candidates`, not just `apps`) so a stalled batch
+couldn't hide behind resolve's global scope a second time; both roots
+were confirmed freshly re-scanned in sequence. Also verified the
+mid-batch-failure and mid-batch-cancel-and-skip paths independently.
+
+## Checkpoint 27: Fixed intermittent QThread crash + clean library scan-root-awareness
+
+Two issues reported after checkpoint 26 shipped, from real use.
+
+### `QThread: Destroyed while thread '' is still running` (intermittent crash)
+
+**Reported**: crash running Clean library right after Re-resolve all,
+"happens some times" -- i.e. timing-dependent, which is the signature of
+this exact class of bug.
+
+**Root cause**: every job's completion/failure handler in `MainWindow`
+did `self._active_worker = None` directly inside the slot fired by that
+worker's own custom `finished_ok`/`failed` signal. That signal is
+emitted from INSIDE the worker thread's `run()`, which does not
+guarantee the underlying OS thread has fully wound down and reached a
+state Qt considers `finished()` by the time the (queued, cross-thread)
+slot actually executes on the main thread. Dropping the last Python
+reference to a `QThread` object before Qt considers it finished is
+exactly what produces this message, and can escalate to a real crash
+rather than just a warning depending on timing -- which matches "happens
+some times" precisely. (`AI_MODULE_REFERENCE.md`'s `app_organizer.py`
+section already documented awareness of this general class of risk for
+a different worker -- `OrganizeDialog.closeEvent` blocking close during
+an active reorganize -- but the fix hadn't been generalized to every
+`_active_worker` site in `MainWindow`.)
+
+**Fix**: one helper, used everywhere `_active_worker` gets cleared on
+completion (7 call sites -- scan+resolve, resolve-only, scrape,
+monitor, clean-library, and the generic job-failed handler):
+```python
+def _release_worker(self):
+    worker = self._active_worker
+    if worker is not None:
+        worker.wait()
+    self._active_worker = None
+```
+`wait()` blocks until the thread has genuinely finished; in the
+overwhelming common case (it already has, by the time the slot runs)
+this returns immediately and costs nothing. Closes the race entirely
+rather than narrowing the window.
+
+**Verified**: ran scan+resolve -> resolve-all -> clean-library(None)
+back to back against a real `MainWindow` instance repeatedly; also
+re-ran the full checkpoint 26 batch-rescan test suite (sequential
+processing, mid-batch failure, mid-batch skip) against the changed
+code to confirm `_release_worker()` didn't introduce a stall of its own
+(it doesn't -- `wait()` on an already-finished thread returns
+instantly, confirmed by timing the full 3-step sequence at 0.04s wall
+time in the same headless harness).
+
+### Clean library now understands *why* a variant might be gone
+
+**Reported**: after using "Delete selected root…" (checkpoint 26) to
+forget a scan root, running Clean library said "Everything already in
+the catalog in the whole catalog still exists on disk. Nothing to clean
+up." -- not a bug, but a real mismatch with what the user wanted: Delete
+scan root is deliberately non-destructive (see checkpoint 26), so the
+files it used to track are usually still sitting on disk wherever they
+were, and Clean library's ONLY job was ever "does this exact file still
+exist" -- it had no concept of scan roots at all.
+
+Asked whether "delete scan root" should become destructive instead
+(cascade-delete its apps); declined in favor of keeping deletion
+non-destructive and extending Clean library's own rules instead:
+
+`scan_for_missing_sources()` now checks, per variant, in order:
+1. **`raw_candidate_id IS NULL`** (its scan root was deleted via
+   "Delete selected root", per checkpoint 26's `ON DELETE SET NULL`
+   design) -> flagged missing, `reason="scan root no longer tracked"`.
+   This is what makes deleting a scan root and then running Clean
+   library actually remove its apps, as requested.
+2. **Its scan root IS still registered, but `os.path.isdir(root.path)`
+   is `False`** (external/network drive unplugged, letter remounted
+   elsewhere) -> flagged missing, `reason="scan root path unreachable"`,
+   WITHOUT checking the individual file -- one `os.path.isdir()` per
+   scan root (cached in a dict, not per-variant) rather than every one
+   of that root's files individually failing the same underlying check.
+3. Otherwise, the original per-file `os.path.exists()` check,
+   `reason="file not found"`.
+
+`MissingItem` gained a `reason: str = "file not found"` field (default
+preserves the old behavior for any caller not yet aware of it).
+`CleanLibraryReviewDialog` shows a new "Reason" column so the user can
+see which of the three rules caught each item before confirming
+removal. `execute_clean_library()` needed no changes -- it already
+handles a `None` `raw_candidate_id` gracefully (just skips the
+`raw_candidates` delete for that item), which covers case 1 for free.
+
+**Verified**: built a 3-root synthetic scenario exercising all three
+paths at once (one root deleted via `delete_scan_root()`, one root's
+folder removed from disk with `shutil.rmtree()` while its `scan_roots`
+row stayed, one root left completely untouched) and confirmed
+`scan_for_missing_sources(db, root_path=None)` returned exactly the two
+expected items with the correct `reason` on each, the untouched root's
+app was correctly left alone, and `execute_clean_library()` removed
+both flagged apps cleanly.
+
+## Checkpoint 28: Folder layout redesign -- explicit self-describing roles + "-1 level" single-catalog promotion
+
+Reported after using checkpoint 25's mode system in practice: the
+`Has subcatalogs / No subcatalogs / Skip / ⤷ Inherit` labels weren't
+informative, and the "root is itself a single catalog" checkbox didn't
+match how the user actually wanted to add a single-catalog folder (they
+wanted it to fold into a SHARED scan root with other single-catalog
+folders next to it, not become its own separate root). Discussed fully
+before coding (per the user's own request) -- two real design forks
+resolved by explicit Q&A before any code changed, both confirmed correct
+against the final implementation below.
+
+### Terminology + cascading defaults (supersedes checkpoint 25's mode system)
+
+Every folder is now one of four SELF-describing roles -- **Catalog /
+Subcatalog / App / Skip** -- picked from the identical dropdown at any
+depth (no more `Has subcatalogs` describing a folder's CHILDREN, no more
+a separate "⤷ Inherit" pseudo-state). An unconfigured folder's default
+cascades from its parent's role: Catalog's children default to
+Subcatalog, Subcatalog's children default to App, and an App's children
+stay App (they're just internal/version folders by that point, never
+re-categorized). A brand-new top-level folder with no parent in the tree
+defaults to a NEW per-root setting, `unconfigured_toplevel_role`
+(`scan_roots` column, `'catalog'` normally, `'skip'` for a root created
+via the promotion below) -- exposed as a small dropdown in
+`FolderLayoutDialog`'s top strip, replacing the old "This root is itself
+a single catalog" checkbox + catalog-name field entirely.
+
+`scanner.resolve_scan_root_layout()` was rewritten around this (the old
+`_layout_mode_of`/`_layout_find_skip`/`_layout_nearest_ancestor` int-mode
+helpers are gone, replaced by `_layout_role_of()` and
+`_resolve_role_chain()`): walks the chain TOP-DOWN computing one role per
+folder (forward, cascading), rather than the old backward deepest-match
+search. `catalog` = the label of the DEEPEST folder in the chain with
+role `"catalog"` (normally exactly one, at the top; marking a folder
+deeper in the chain `"catalog"` too is allowed and intentionally
+"restarts" categorization from there, discarding anything shallower --
+an escape hatch for an unusual nested structure, confirmed working via
+`_add_new_root`'s test below, not expected to be common). `subcatalog` =
+the deepest `"subcatalog"`-role folder below that catalog, or `None`.
+Depth still gets boosted to `max(raw_depth, 3)` whenever the folder
+ITSELF has role `"app"` (same load-bearing idea as before -- keep the
+resolver's "depth<=2 = don't trust this name" rule from misfiring on a
+direct catalog child -- just computed off the folder's own resolved role
+now instead of a matched-ancestor's mode).
+
+Because every role is now self-describing, most of checkpoint 25's
+self-match-vs-ancestor-match complexity (and its associated bugs) simply
+disappears: a folder marked `"app"` unambiguously means "I am the app,"
+never "my children are," so `FolderLayoutDialog`'s preview no longer
+needs any synthetic child-segment trick at all -- it just resolves the
+row's own path directly and formats by role (`"Catalog: {name}"` /
+`"{catalog} / {subcatalog} (subcategory)"` / `"{catalog} / {subcatalog}
+/ {this folder's name}"` for App / `"(not imported — skipped)"`).
+
+**One real trade-off surfaced during testing, flagged but not asked
+about further given how explicitly the cascade rule was described
+twice**: since a Catalog's children now default to Subcatalog (not
+App), a catalog with NO real subcategory tier at all (a flat catalog
+where every child folder directly holds an installer, e.g. the original
+design doc's `ADOBE\Photoshop\` example) needs each such child
+EXPLICITLY marked `"app"` to flatten it -- marking the catalog folder
+itself `"app"` doesn't work (there'd be no folder left with role
+`"catalog"` in the chain, so nothing could be named at all; confirmed
+via `catalog_idx = max(...)` returning `None` when tested this way).
+Verified this isn't silently broken, just requires the explicit
+override: the promotion test below (`Desktop/SomeApp`, no subcategory
+tier, `SomeApp` left at its cascaded-default `"subcatalog"` role rather
+than explicitly flattened to `"app"`) still resolved to a real app row
+(`catalog="Desktop"`, `subcatalog="SomeApp"`) because
+`resolver.extract_fields()` fell back to naming it from the installer
+file itself rather than the folder -- not silently lost, just not the
+ideal `subcatalog=None` shape it would have gotten with an explicit
+`"app"` override on `SomeApp`.
+
+### "-1 level" single-catalog promotion (supersedes checkpoint 25's `root_is_catalog` checkbox)
+
+Picking a folder as "itself a single catalog" no longer stores IT as the
+scan root. `ScanRootsDialog._add_new_root()` now asks (`QMessageBox.
+question`) whether the picked folder is itself a single catalog; if yes,
+prompts for a display name (`QInputDialog.getText`, defaulting to the
+folder's basename), then walks up one level (`os.path.dirname`) and
+`db.ensure_scan_root()`s THAT as the actual scan root, writing an
+explicit `{"role": "catalog", "name": ...}` (or bare `"catalog"` when
+the name wasn't changed) entry for the originally-picked folder, and
+setting that root's `unconfigured_toplevel_role` to `"skip"`.
+
+The requested dedup ("adding `C:\Program\Graphic` and `C:\Program\
+Desktop` both as single catalogs should collapse into ONE scan root at
+`C:\Program\`, editing either affects the same shared config") needed
+NO new dedup logic at all -- it falls straight out of `scan_roots.path`
+already being unique and `ensure_scan_root()` already being
+insert-if-missing: the second "add as single catalog" call just reuses
+the same row and merges its own catalog entry into the same
+`folder_layouts_json`.
+
+**Verified** end-to-end against a real `MainWindow`/`ScanRootsDialog`,
+not just the underlying functions: added `/tmp/Program/Graphic` and
+`/tmp/Program/Desktop` as single catalogs in two separate calls
+(monkeypatching `QFileDialog.getExistingDirectory`, `QMessageBox.
+question`, and `QInputDialog.getText` to simulate the two prompts) and
+confirmed (a) exactly ONE `scan_roots` row exists, at `/tmp/Program`,
+with `unconfigured_toplevel_role="skip"` and a `folder_layouts_json`
+containing both `"graphic": "catalog"` and `"desktop": "catalog"`, (b)
+a THIRD sibling folder (`/tmp/Program/Junk/randomstuff`, never
+explicitly added) produced no app at all -- confirming the skip-by-
+default behavior -- and (c) both `Graphic\Converters\AcmeConvert` and
+`Desktop\SomeApp` still resolved to real, correctly-catalogued apps.
+
+Also re-verified the full four-scenario walkthrough from checkpoint 25
+(flat catalog, default 2-tier, mixed direct-app, nested subcategory with
+rename) against the new role vocabulary end-to-end (`run_scan()` +
+`run_resolve()` against a synthetic tree, not just `resolve_scan_root_
+layout()` in isolation) -- all four still produce the correct final
+`apps` rows.

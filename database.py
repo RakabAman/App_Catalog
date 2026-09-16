@@ -333,20 +333,34 @@ class Database:
             ("apps", "license", "TEXT"),
             # Feature B: per-scan-root folder layout (see scanner.py's
             # resolve_scan_root_layout() and gui_main.FolderLayoutDialog).
-            # root_is_catalog: this root's own folder IS a single catalog
-            # (no top-level catalog-tier folders below it).
+            # Checkpoint 28 superseded root_is_catalog/root_catalog_name
+            # below with the "-1 level" promotion (a folder added as "this
+            # is a single catalog" now gets stored as an explicit Catalog
+            # entry in its PARENT's layout, with scan_roots.path itself
+            # promoted to that parent -- see PROGRESS.md checkpoint 28).
+            # Columns kept (harmless, unused by the resolver going
+            # forward) rather than dropped, since SQLite's DROP COLUMN
+            # support is version-dependent and there's no real data to
+            # migrate off them yet.
             ("scan_roots", "root_is_catalog", "INTEGER DEFAULT 0"),
-            # Only meaningful when root_is_catalog=1; defaults to the root
-            # folder's basename in the GUI, but stored explicitly so it
-            # survives a repath (Feature A) even if the basename changes.
             ("scan_roots", "root_catalog_name", "TEXT"),
             # Flat JSON map, keyed by lowercased relative path from the
-            # root. Values are either an int (-1 skip / 0 no-subcatalog /
-            # 2 has-subcatalog) or an object {"mode": ..., "name": "..."}
-            # when the folder has also been renamed for display purposes.
-            # Missing key = inherit from nearest configured ancestor, else
-            # default to 2. See scanner.resolve_scan_root_layout().
+            # root. Values are either a role string -- "catalog" |
+            # "subcatalog" | "app" | "skip" -- or an object
+            # {"role": ..., "name": "..."} when the folder's also been
+            # renamed for display purposes. Missing key = cascade default
+            # from the parent's role (catalog->subcatalog->app->app), or
+            # `unconfigured_toplevel_role` for a top-level folder with no
+            # parent in the tree. See scanner.resolve_scan_root_layout().
             ("scan_roots", "folder_layouts_json", "TEXT DEFAULT '{}'"),
+            # Checkpoint 28: per-root default for a top-level folder with
+            # no explicit layout entry. Normal roots ('catalog', the
+            # default) auto-treat every top-level folder as a catalog;
+            # a root created via the single-catalog "-1 level" promotion
+            # is set to 'skip' instead, so a sibling folder under the
+            # promoted parent that was never explicitly added doesn't
+            # silently start getting scanned too.
+            ("scan_roots", "unconfigured_toplevel_role", "TEXT DEFAULT 'catalog'"),
         ]
         for table, column, coldef in migrations:
             try:
@@ -518,20 +532,28 @@ class Database:
 
     def save_folder_layout(
         self, scan_root_id: int, layout: dict,
-        root_is_catalog: Optional[bool] = None,
-        root_catalog_name: Optional[str] = None,
+        unconfigured_toplevel_role: Optional[str] = None,
     ) -> None:
+        """
+        unconfigured_toplevel_role: 'catalog' (default -- every top-level
+        folder with no explicit entry is treated as its own catalog) or
+        'skip' (used for a root created via the single-catalog "-1 level"
+        promotion -- a sibling folder under the promoted parent that was
+        never explicitly added stays out of the scan until the user
+        deliberately changes it). None leaves whatever was already saved
+        unchanged.
+        """
         conn = self.connect()
-        if root_is_catalog is None:
+        if unconfigured_toplevel_role is None:
             conn.execute(
                 "UPDATE scan_roots SET folder_layouts_json = ? WHERE id = ?",
                 (json.dumps(layout), scan_root_id),
             )
         else:
             conn.execute(
-                "UPDATE scan_roots SET folder_layouts_json = ?, root_is_catalog = ?, "
-                "root_catalog_name = ? WHERE id = ?",
-                (json.dumps(layout), int(root_is_catalog), root_catalog_name, scan_root_id),
+                "UPDATE scan_roots SET folder_layouts_json = ?, "
+                "unconfigured_toplevel_role = ? WHERE id = ?",
+                (json.dumps(layout), unconfigured_toplevel_role, scan_root_id),
             )
         conn.commit()
 

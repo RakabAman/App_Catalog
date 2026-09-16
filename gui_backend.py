@@ -10,7 +10,8 @@ import traceback
 from typing import Optional
 
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QThread, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPalette
+from PySide6.QtWidgets import QStyledItemDelegate, QStyle, QStyleOptionViewItem
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QDialogButtonBox, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QVBoxLayout,
@@ -456,6 +457,34 @@ class AppsTableModel(QAbstractTableModel):
         if 0 <= row < len(self._rows):
             return self._rows[row]
         return None
+
+
+class AppsTableDelegate(QStyledItemDelegate):
+    """
+    Ensures a SELECTED row is always visually distinguishable from an
+    unselected one, even when the model supplies a custom BackgroundRole
+    for status coloring (needs_review = amber, scrape_failed = rose,
+    not_yet_enriched = blue, ignored = gray). Without this, the custom
+    background can visually mask Qt's own selection highlight, leaving
+    the user unable to tell which row is currently selected.
+
+    When the row is selected we force the standard highlight background
+    and the standard highlighted-text color, overriding whatever the
+    model returned for BackgroundRole/ForegroundRole. Unselected rows
+    keep their status colors untouched.
+    """
+    def initStyleOption(self, option: QStyleOptionViewItem, index) -> None:
+        super().initStyleOption(option, index)
+        if option.state & QStyle.State_Selected:
+            # Force a solid selection background...
+            option.backgroundBrush = option.palette.highlight()
+            # ...and force the highlighted-text color so the model's
+            # dark status foreground can't make the selected row's
+            # text unreadable against the highlight.
+            hl_text = option.palette.highlightedText().color()
+            option.palette.setColor(QPalette.Text, hl_text)
+            option.palette.setColor(QPalette.WindowText, hl_text)
+            option.palette.setColor(QPalette.HighlightedText, hl_text)
 
 
 # =============================================================
