@@ -555,6 +555,13 @@ class ScanCandidate:
 
     fingerprint: Optional[str] = None
 
+    # Single App/Variant role (see resolve_scan_root_layout /
+    # walk_scan_root): a manual rename on the marked folder, used verbatim
+    # as the app/variant name by the resolver, bypassing its normal
+    # file/folder/parent-folder naming cascade. None for every ordinary
+    # candidate.
+    forced_name: Optional[str] = None
+
 
 def _apply_taxonomy_rules(rel_path_str: str, rules: list) -> Optional[str]:
     """
@@ -624,7 +631,7 @@ def _derive_catalog_subcatalog(
 # unchanged -- this still just feeds them (catalog, subcatalog, depth).
 # ---------------------------------------------------------------------
 
-VALID_ROLES = ("catalog", "subcatalog", "app", "skip")
+VALID_ROLES = ("catalog", "subcatalog", "app", "single_app", "skip")
 
 
 def _layout_role_of(entry, default=None):
@@ -680,6 +687,12 @@ def _resolve_role_chain(keys: list[str], layout: dict, unconfigured_toplevel_rol
             role = unconfigured_toplevel_role
         else:
             parent_role = roles[i - 1]
+            # single_app is terminal like app -- its children never get an
+            # independent role at all (the whole subtree is swallowed into
+            # one candidate by walk_scan_root), so this mapping is really
+            # only reachable in the FolderLayoutDialog preview, which calls
+            # resolve_scan_root_layout() on individual folders regardless
+            # of what's below them.
             role = {"catalog": "subcatalog", "subcatalog": "app"}.get(parent_role, parent_role)
         roles.append(role)
     return roles
@@ -691,16 +704,29 @@ def resolve_scan_root_layout(
     layout: dict,
     unconfigured_toplevel_role: str = "catalog",
     settings: Optional[dict] = None,
-) -> tuple[Optional[str], Optional[str], int, bool]:
+) -> tuple[Optional[str], Optional[str], int, bool, bool, Optional[str]]:
     """
-    Computes (catalog, subcatalog, depth, skip) for one folder, driven by
-    the user's declared per-folder layout (an explicit role -- catalog /
-    subcatalog / app / skip -- at any depth, with cascading defaults
-    where unconfigured; see _resolve_role_chain() above).
+    Computes (catalog, subcatalog, depth, skip, is_single_app, forced_name)
+    for one folder, driven by the user's declared per-folder layout (an
+    explicit role -- catalog / subcatalog / app / single_app / skip -- at
+    any depth, with cascading defaults where unconfigured; see
+    _resolve_role_chain() above).
 
-    Returns (catalog, subcatalog, depth, skip). When skip is True, catalog/
-    subcatalog/depth are meaningless (None, None, 0) -- the caller must not
-    yield a raw_candidates row for this folder or descend into it.
+    Returns (catalog, subcatalog, depth, skip, is_single_app, forced_name).
+    When skip is True, catalog/subcatalog/depth are meaningless (None,
+    None, 0) -- the caller must not yield a raw_candidates row for this
+    folder or descend into it.
+
+    is_single_app is True when THIS folder's own role is "single_app" --
+    a whole-subtree "this is one app/variant" marker (see walk_scan_root(),
+    which stops normal per-file/per-subfolder classification and instead
+    treats everything below this folder as belonging to one install unit).
+    forced_name is the manual rename the user typed on that same folder in
+    FolderLayoutDialog, if any -- the resolver uses it verbatim as the
+    app/variant name instead of running its usual naming cascade. It is
+    only ever populated when is_single_app is True; renames on catalog/
+    subcatalog/app folders continue to only affect the catalog/subcatalog
+    label, not this field.
 
     catalog = the label of the DEEPEST folder in the chain with role
     "catalog" (normally there's exactly one, at the top; marking a
@@ -747,7 +773,14 @@ def resolve_scan_root_layout(
 
     roles = _resolve_role_chain(keys, layout, unconfigured_toplevel_role)
     if any(r == "skip" for r in roles):
-        return None, None, 0, True
+        return None, None, 0, True, False, None
+
+    is_single_app = roles[-1] == "single_app"
+    forced_name = None
+    if is_single_app:
+        this_entry = layout.get(keys[-1])
+        if isinstance(this_entry, dict) and this_entry.get("name"):
+            forced_name = this_entry["name"]
 
     taxonomy_catalog = _apply_taxonomy_rules(rel_str, settings.get("category_rules", []))
     taxonomy_subcatalog = _apply_taxonomy_rules(rel_str, settings.get("subcategory_rules", []))
@@ -757,7 +790,7 @@ def resolve_scan_root_layout(
         # No catalog anywhere in the chain (e.g. unconfigured_toplevel_role
         # is "skip" and nothing further down was explicitly marked
         # "catalog" either) -- nothing to name this folder under.
-        return None, None, 0, False
+        return None, None, 0, False, is_single_app, forced_name
     catalog = _layout_label_for(parts[catalog_idx], keys[catalog_idx], layout, taxonomy_catalog)
 
     subcatalog_idx = max(
@@ -769,8 +802,8 @@ def resolve_scan_root_layout(
         if subcatalog_idx is not None else None
     )
 
-    depth = max(len(parts), 3) if roles[-1] == "app" else len(parts)
-    return catalog, subcatalog, depth, False
+    depth = max(len(parts), 3) if roles[-1] in ("app", "single_app") else len(parts)
+    return catalog, subcatalog, depth, False, is_single_app, forced_name
 
 
 def list_top_level_folders(root: str) -> list[str]:
@@ -850,17 +883,55 @@ def _group_installer_files(file_names: list[str]) -> list[list[str]]:
     return list(groups.values())
 
 
-def _pick_representative(group: list[str]) -> tuple[Optional[str], Optional[str]]:
+def _installer_name_rank(path: str, settings: dict) -> int:
+    """
+    Ranks a filename against the preferred-installer-name hierarchy
+    (config.py's preferred_installer_exact_names / _prefixes / _contains):
+    tier 1 (exact match) beats tier 2 (prefix) beats tier 3 (contains)
+    beats no match at all. This is checked BEFORE the older generic
+    setup*/install* prefix bonus in _pick_representative(), and replaces
+    it -- a real installer sitting next to a differently-named component
+    (e.g. "7z2408-x64.exe" next to "7-Zip Help.pdf") gets no bonus from
+    any tier, which is correct: nothing here claims to BE the installer by
+    name, so the surrounding pool/depth/part rules alone decide.
+    """
+    n = Path(path).name.lower()
+    exact = {v.lower() for v in settings.get("preferred_installer_exact_names", [])}
+    prefixes = [v.lower() for v in settings.get("preferred_installer_prefixes", [])]
+    contains = [v.lower() for v in settings.get("preferred_installer_contains", [])]
+
+    if n in exact:
+        return 3
+    if any(n.startswith(p) for p in prefixes):
+        return 2
+    if any(c in n for c in contains):
+        return 1
+    return 0
+
+
+def _pick_representative(group: list[str], settings: Optional[dict] = None) -> tuple[Optional[str], Optional[str]]:
     """Within one group (usually a single file, occasionally multi-part
-    segments), pick the file that best represents the whole group: prefer
-    a real installer over a bare archive, then setup*/install* naming,
-    then the first part over later parts/segments."""
+    segments, or -- for a single_app folder -- every installer-like file
+    anywhere in the subtree), pick the file that best represents the whole
+    group: prefer a real installer over a bare archive, then the
+    preferred-installer-name hierarchy (see _installer_name_rank -- exact
+    "setup.exe"-style name > starts-with > contains > no match at all),
+    then the SHALLOWEST path (fewest subfolders -- a top-level setup.exe
+    beats a nested Redist/vcredist.exe or a component installer one folder
+    down), then the first part over later parts/segments.
+
+    Entries may be bare filenames (normal per-folder grouping) or
+    relative paths with subfolders (single_app's recursive collection,
+    e.g. "Setup/setup.exe") -- the depth tiebreak is a no-op for the
+    bare-filename case since every entry there sits at depth 0 anyway."""
+    settings = settings or {}
     installers = [f for f in group if Path(f).suffix.lower() in INSTALLER_EXTS]
     archives = [f for f in group if Path(f).suffix.lower() in ARCHIVE_EXTS]
 
-    def _score(name: str) -> tuple:
-        n = name.lower()
-        prefix_score = 2 if (n.startswith("setup") or n.startswith("install")) else 0
+    def _score(path: str) -> tuple:
+        n = Path(path).name.lower()
+        name_rank = _installer_name_rank(path, settings)
+        depth = len(Path(path).parts) - 1  # subfolder count; 0 = folder root
         # prefer earlier parts: "part1"/"r00" before "part2"/"r01" etc, and
         # a bare "name.rar" (no part suffix at all) is the best representative
         part_num = 0
@@ -870,7 +941,7 @@ def _pick_representative(group: list[str]) -> tuple[Optional[str], Optional[str]
         rm = re.search(r"\.r(\d{2,3})$", n)
         if rm:
             part_num = int(rm.group(1)) + 1  # r00 comes after the base .rar
-        return (prefix_score, -part_num)
+        return (name_rank, -depth, -part_num)
 
     pool = installers or archives
     if not pool:
@@ -879,13 +950,13 @@ def _pick_representative(group: list[str]) -> tuple[Optional[str], Optional[str]
     return best, Path(best).suffix.lower().lstrip(".")
 
 
-def _pick_primary_file(file_names: list[str]) -> tuple[Optional[str], Optional[str]]:
+def _pick_primary_file(file_names: list[str], settings: Optional[dict] = None) -> tuple[Optional[str], Optional[str]]:
     """Back-compat single-result helper, kept for anything still calling it
     directly -- prefer a real installer over a bare archive."""
     groups = _group_installer_files(file_names)
     if not groups:
         return None, None
-    return _pick_representative(groups[0])
+    return _pick_representative(groups[0], settings)
 
 
 def _enrich_install_candidate(
@@ -901,7 +972,7 @@ def _enrich_install_candidate(
     import copy
     candidate = copy.copy(base_candidate)
 
-    primary_name, primary_type = _pick_representative(group_files)
+    primary_name, primary_type = _pick_representative(group_files, settings)
     candidate.primary_file_name = primary_name
     candidate.primary_file_type = primary_type
 
@@ -976,6 +1047,85 @@ def _enrich_install_candidate(
     return candidate
 
 
+def _collect_single_app_files(subtree_root: str, error_sink: Optional[list],
+                                display_dirpath: str) -> list[dict]:
+    """
+    Recursively collects every file anywhere under a single_app-role
+    folder, as {"relpath": ..., "size": ..., "mtime": ...}. A single_app
+    folder means the WHOLE subtree is one app/variant (e.g.
+    Photoshop/cs10/ with installers/components scattered across its own
+    subfolders) -- so unlike the normal per-folder walk, this needs every
+    file below the marked folder in one flat list: to pick the single best
+    installer across the whole subtree (see _pick_representative's
+    shallow-depth tiebreak) and to build a fingerprint that reflects
+    changes anywhere below it, since none of these subfolders are ever
+    visited/classified independently by the outer os.walk loop.
+    """
+    collected = []
+    for dirpath, _dirnames, filenames in os.walk(subtree_root):
+        for name in filenames:
+            full_path = os.path.join(dirpath, name)
+            relpath = os.path.relpath(full_path, subtree_root)
+            try:
+                stat = os.stat(full_path)
+                collected.append({"relpath": relpath, "size": stat.st_size, "mtime": stat.st_mtime})
+            except OSError as e:
+                msg = f"{type(e).__name__}: {e}"
+                log.warning("PARTIAL READ ERROR in %s :: %s", full_path, msg)
+                if error_sink is not None:
+                    error_sink.append((display_dirpath, msg))
+    return collected
+
+
+def _build_single_app_candidate(
+    dirpath: str, display_dirpath: str, catalog: Optional[str], subcatalog: Optional[str],
+    depth: int, forced_name: Optional[str], settings: dict, error_sink: Optional[list],
+) -> ScanCandidate:
+    """
+    Builds the ONE ScanCandidate for an entire single_app-role subtree.
+    Reuses _enrich_install_candidate() unchanged for the actual file-
+    picking/PE-reading/archive-inspection work -- it already accepts a
+    dirpath + a list of candidate filenames and internally calls
+    _pick_representative() over them, so handing it every installer-like
+    RELATIVE PATH found anywhere in the subtree (instead of bare filenames
+    from one folder) needs no changes there at all.
+    """
+    files = _collect_single_app_files(dirpath, error_sink, display_dirpath)
+
+    candidate = ScanCandidate(
+        folder_path=display_dirpath,
+        catalog=catalog,
+        subcatalog=subcatalog,
+        depth=depth,
+        unit_type="install_unit",
+        unit_type_reason="folder layout: single app/variant",
+        forced_name=forced_name,
+    )
+    candidate.all_files = [
+        {"name": f["relpath"], "size": f["size"], "type": Path(f["relpath"]).suffix.lower().lstrip(".")}
+        for f in files
+    ]
+    fp_blob = "\n".join(
+        f"{f['relpath']}|{f['size']}|{int(f['mtime'])}"
+        for f in sorted(files, key=lambda x: x["relpath"].lower())
+    ).encode("utf-8", errors="replace")
+    candidate.fingerprint = hashlib.sha1(fp_blob).hexdigest()
+
+    group_files = [f["relpath"] for f in files]
+    candidate = _enrich_install_candidate(candidate, dirpath, group_files, settings)
+
+    if not candidate.primary_file_name:
+        # classify_folder() is never consulted for a single_app folder
+        # (it's forced to install_unit above), so a genuinely empty/
+        # non-installer subtree needs its own fallback here instead of
+        # silently posing as a found install unit with no file.
+        candidate.unit_type = "unresolved"
+        candidate.unit_type_reason = (
+            "single app/variant folder: no installer/archive file found anywhere in subtree"
+        )
+    return candidate
+
+
 def walk_scan_root(
     root: str,
     settings: dict,
@@ -1017,7 +1167,7 @@ def walk_scan_root(
         subfolder_names = [e.name for e in entries if e.is_dir(follow_symlinks=False)]
         file_names = [e.name for e in file_entries]
 
-        catalog, subcatalog, depth, skip = resolve_scan_root_layout(
+        catalog, subcatalog, depth, skip, is_single_app, forced_name = resolve_scan_root_layout(
             root, display_dirpath, folder_layout or {},
             unconfigured_toplevel_role=unconfigured_toplevel_role,
             settings=settings,
@@ -1026,6 +1176,20 @@ def walk_scan_root(
             log.info("SKIPPED (folder layout: skip mode) %s", display_dirpath)
             # Do not descend into a skipped subtree at all -- no candidate
             # row, and os.walk must not visit anything below it either.
+            dirnames[:] = []
+            continue
+
+        if is_single_app:
+            candidate = _build_single_app_candidate(
+                dirpath, display_dirpath, catalog, subcatalog, depth,
+                forced_name, settings, error_sink,
+            )
+            log.info("SINGLE APP/VARIANT: [%s/%s] %s  (file: %s)",
+                      candidate.catalog, candidate.subcatalog,
+                      display_dirpath, candidate.primary_file_name)
+            yield candidate
+            # The whole subtree is already consumed as one unit -- never
+            # walk into it as separate folders/candidates of its own.
             dirnames[:] = []
             continue
 
@@ -1310,9 +1474,9 @@ def _upsert_candidate(conn, scan_root_id: int, c: ScanCandidate):
             pe_product_name, pe_product_version, pe_file_version, pe_company_name,
             pe_original_filename, pe_source,
             archive_inspected, archive_extraction_level, archive_extract_reason,
-            unit_type, unit_type_reason, fingerprint,
+            unit_type, unit_type_reason, fingerprint, forced_name,
             first_seen_at, last_seen_at
-        ) VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?, ?,?,?, datetime('now'), datetime('now'))
+        ) VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?, ?,?,?,?, datetime('now'), datetime('now'))
         ON CONFLICT(scan_root_id, folder_path, primary_file_name) DO UPDATE SET
             catalog=excluded.catalog, subcatalog=excluded.subcatalog, depth=excluded.depth,
             primary_file_name=excluded.primary_file_name, primary_file_type=excluded.primary_file_type,
@@ -1324,7 +1488,8 @@ def _upsert_candidate(conn, scan_root_id: int, c: ScanCandidate):
             archive_extraction_level=excluded.archive_extraction_level,
             archive_extract_reason=excluded.archive_extract_reason,
             unit_type=excluded.unit_type, unit_type_reason=excluded.unit_type_reason,
-            fingerprint=excluded.fingerprint, last_seen_at=datetime('now')
+            fingerprint=excluded.fingerprint, forced_name=excluded.forced_name,
+            last_seen_at=datetime('now')
         """,
         (
             scan_root_id, c.folder_path, c.catalog, c.subcatalog, c.depth,
@@ -1333,6 +1498,6 @@ def _upsert_candidate(conn, scan_root_id: int, c: ScanCandidate):
             c.pe_product_name, c.pe_product_version, c.pe_file_version, c.pe_company_name,
             c.pe_original_filename, c.pe_source,
             int(c.archive_inspected), c.archive_extraction_level, c.archive_extract_reason,
-            c.unit_type, c.unit_type_reason, c.fingerprint,
+            c.unit_type, c.unit_type_reason, c.fingerprint, c.forced_name,
         ),
     )

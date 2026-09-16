@@ -97,6 +97,33 @@ DEFAULT_SETTINGS = {
     ],
     "noise_short_only_max_len": 25,
 
+    # -- preferred installer filename hierarchy ---------------------------
+    # When a folder/subtree has multiple installer-like files, this ranks
+    # which one is THE installer vs. a component/redist/updater sitting
+    # alongside it -- checked in tier order (tier 1 = strongest signal),
+    # ABOVE the older generic "real installer beats a bare archive" rule
+    # in _pick_representative(). All matching is case-insensitive; entries
+    # are bare names/prefixes, not regex. Applies everywhere an installer
+    # is picked among several candidates -- both the normal per-folder
+    # grouping and a "Single App/Variant" folder's whole-subtree pick.
+    #   tier 1 -- EXACT filename match (the strongest, least ambiguous
+    #   signal: this literally IS one of the well-known installer names)
+    "preferred_installer_exact_names": [
+        "setup.exe", "install.exe", "installer.exe",
+        "setup.msi", "install.msi", "installer.msi",
+    ],
+    #   tier 2 -- filename STARTS WITH one of these (e.g. "setup_v2.3.exe",
+    #   "installshield.exe")
+    "preferred_installer_prefixes": [
+        "setup", "install", "installer",
+    ],
+    #   tier 3 -- filename CONTAINS one of these anywhere (weakest signal --
+    #   still better than an unrelated component like "vcredist_x64.exe"
+    #   or "dotnetfx.exe" sitting in the same folder/subtree)
+    "preferred_installer_contains": [
+        "setup", "install",
+    ],
+
     # -- release-group / scene tag stripping (regex fragments) -------------
     # ORDER OF THE NAME-CLEANING PIPELINE (applied in this exact sequence
     # to the chosen source text before version/edition/arch/language are

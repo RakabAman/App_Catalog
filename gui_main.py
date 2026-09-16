@@ -1160,8 +1160,8 @@ class FolderLayoutDialog(QDialog):
     """
     Per-scan-root folder layout editor (Feature B, redesigned checkpoint
     28). Every folder in the tree gets one explicit, self-describing
-    ROLE from the same four-item dropdown regardless of depth: Catalog /
-    Subcatalog / App / Skip. An unconfigured folder's default cascades
+    ROLE from the same dropdown regardless of depth: Catalog /
+    Subcatalog / App / Single App/Variant / Skip. An unconfigured folder's default cascades
     from its parent's role (Catalog's children default to Subcatalog,
     Subcatalog's children default to App, App's children stay App --
     they're just internal/version folders at that point) -- a top-level
@@ -1179,8 +1179,9 @@ class FolderLayoutDialog(QDialog):
     """
 
     ROLE_ITEMS = [("Catalog", "catalog"), ("Subcatalog", "subcatalog"),
-                  ("App", "app"), ("Skip", "skip")]
-    ROLE_CASCADE = {"catalog": "subcatalog", "subcatalog": "app", "app": "app", "skip": "skip"}
+                  ("App", "app"), ("Single App/Variant", "single_app"), ("Skip", "skip")]
+    ROLE_CASCADE = {"catalog": "subcatalog", "subcatalog": "app", "app": "app",
+                     "single_app": "single_app", "skip": "skip"}
 
     def __init__(self, db: Database, scan_root_row: dict, parent=None,
                  only_new_folders: Optional[list] = None):
@@ -1283,7 +1284,7 @@ class FolderLayoutDialog(QDialog):
         entry = self._working_layout.get(rel_key)
         if isinstance(entry, dict):
             return entry.get("role"), entry.get("name")
-        if entry in ("catalog", "subcatalog", "app", "skip"):
+        if entry in ("catalog", "subcatalog", "app", "single_app", "skip"):
             return entry, None
         return None, None
 
@@ -1354,6 +1355,7 @@ class FolderLayoutDialog(QDialog):
         rename_edit = QLineEdit(existing_name or "")
         rename_edit.setPlaceholderText("(use folder name)")
         rename_edit.textChanged.connect(lambda _t, k=rel_key: self._on_row_changed(k))
+        combo.currentIndexChanged.connect(lambda _i, k=rel_key: self._update_rename_placeholder(k))
         self.tree.setItemWidget(item, 2, rename_edit)
 
         preview_label = QLabel("")
@@ -1365,6 +1367,22 @@ class FolderLayoutDialog(QDialog):
         }
         self._update_row_layout_entry(rel_key)
         self._update_preview(rel_key)
+        self._update_rename_placeholder(rel_key)
+
+    def _update_rename_placeholder(self, rel_key: str):
+        # The rename box means "category label" for Catalog/Subcatalog,
+        # nothing in particular for App -- but for Single App/Variant it's
+        # the app/variant NAME override, which is a different enough
+        # meaning that it's worth flagging right on the field itself
+        # rather than only in the role dropdown text.
+        row = self._rows.get(rel_key)
+        if not row:
+            return
+        role = row["combo"].currentData()
+        if role == "single_app":
+            row["rename"].setPlaceholderText("(app/variant name — leave blank to auto-name)")
+        else:
+            row["rename"].setPlaceholderText("(use folder name)")
 
     # ------------------------------------------------------------------
     # live editing
@@ -1426,7 +1444,7 @@ class FolderLayoutDialog(QDialog):
         # so previewing is just resolving THIS folder's own path directly
         # -- no synthetic child needed, unlike the old mode system.
         sample_path = os.path.join(self.root_path, *rel_parts)
-        catalog, subcatalog, depth, skip = resolve_scan_root_layout(
+        catalog, subcatalog, depth, skip, is_single_app, forced_name = resolve_scan_root_layout(
             self.root_path, sample_path, self._working_layout,
             unconfigured_toplevel_role=self.default_toplevel_combo.currentData(),
         )
@@ -1436,6 +1454,16 @@ class FolderLayoutDialog(QDialog):
             row["preview"].setText(f"Catalog: {catalog}")
         elif role == "subcatalog":
             row["preview"].setText(f"{catalog or '—'} / {subcatalog or '—'}  (subcategory)")
+        elif role == "single_app":
+            # Whole subtree becomes ONE app/variant candidate -- no
+            # separate row per exe/msi component inside it. Name shown
+            # here mirrors resolver behavior: the manual rename verbatim
+            # if set, else "(auto-named)" since the real cascade only
+            # runs at resolve time (needs the picked installer's PE data).
+            label = forced_name or "(auto-named)"
+            row["preview"].setText(
+                f"{catalog or '—'} / {subcatalog or '—'} / {label}  (single app/variant — subfolders merged)"
+            )
         else:  # app
             row["preview"].setText(f"{catalog or '—'} / {subcatalog or '—'} / {rel_parts[-1]}")
 
@@ -2274,6 +2302,49 @@ class SettingsDialog(QDialog):
             "of these is not treated as a standalone app."))
         layout.addWidget(box_cont)
 
+        # -- Preferred installer file name block --
+        box_pref = self._group("Preferred installer file names")
+        v2b = box_pref._inner_layout
+        pref_intro = self._desc(
+            "When a folder (or a Single App/Variant subtree) has several .exe/.msi "
+            "files, this decides which one IS the installer versus a component "
+            "sitting alongside it -- e.g. picking setup.exe over vcredist_x64.exe. "
+            "Checked in order: exact name match, then starts-with, then "
+            "contains-anywhere; the first tier that matches wins.")
+        v2b.addWidget(pref_intro)
+
+        self.preferred_installer_exact_names = QPlainTextEdit(
+            "\n".join(settings.get("preferred_installer_exact_names", [])))
+        self.preferred_installer_exact_names.setMaximumHeight(90)
+
+        self.preferred_installer_prefixes = QPlainTextEdit(
+            "\n".join(settings.get("preferred_installer_prefixes", [])))
+        self.preferred_installer_prefixes.setMaximumHeight(70)
+
+        self.preferred_installer_contains = QPlainTextEdit(
+            "\n".join(settings.get("preferred_installer_contains", [])))
+        self.preferred_installer_contains.setMaximumHeight(70)
+
+        v2b.addWidget(self._labeled(
+            "Tier 1 -- exact file name (strongest match)",
+            self.preferred_installer_exact_names,
+            "A file whose full name matches one of these exactly always wins, "
+            "regardless of where it sits or what else is in the folder."))
+        self._two_col(
+            v2b,
+            [self._labeled(
+                "Tier 2 -- file name starts with",
+                self.preferred_installer_prefixes,
+                "e.g. 'setup_v2.3.exe' or 'installshield.exe'. Wins over any "
+                "file that only matches tier 3 or nothing at all.")],
+            [self._labeled(
+                "Tier 3 -- file name contains anywhere",
+                self.preferred_installer_contains,
+                "Weakest signal -- still beats an unrelated component like "
+                "'dotnetfx.exe' that matches none of these.")],
+        )
+        layout.addWidget(box_pref)
+
         # -- Name-not-used block --
         box_name = self._group("Folder and file names not used as app names")
         v3 = box_name._inner_layout
@@ -2934,6 +3005,18 @@ class SettingsDialog(QDialog):
         self.db.set_setting("container_folder_keywords",
                             [l.strip() for l in
                              self.container_keywords.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("preferred_installer_exact_names",
+                            [l.strip() for l in
+                             self.preferred_installer_exact_names.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("preferred_installer_prefixes",
+                            [l.strip() for l in
+                             self.preferred_installer_prefixes.toPlainText().splitlines()
+                             if l.strip()], bump_version=False)
+        self.db.set_setting("preferred_installer_contains",
+                            [l.strip() for l in
+                             self.preferred_installer_contains.toPlainText().splitlines()
                              if l.strip()], bump_version=False)
         self.db.set_setting("ignore_folder_names",
                             [l.strip() for l in
