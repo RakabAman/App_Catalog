@@ -990,3 +990,161 @@ headers). Patterns worth continuing:
   camelCase-split, K-Lite, etc.) after any resolver/scanner change --
   they're cheap to re-run and this project has a real history of one
   fix quietly breaking an earlier one.
+  
+  ---
+
+## 15. Layout-change propagation (`app_manager.apply_layout_change`, checkpoint 29)
+
+Added to `app_manager.py`, grouped under its existing "0b. Layout-change
+propagation" heading (right after `delete_scan_root()`, before the
+duplicate-detection section). Nothing else in any module changed to
+support it -- it lives entirely inside `app_manager.py` plus one call
+site in `gui_main.py`'s `FolderLayoutDialog._on_ok()` and one status-bar
+read in `ScanRootsDialog._edit_layout()`.
+
+### Why it exists
+
+The scanner upserts `raw_candidates` and the resolver only creates/
+updates apps -- neither ever deletes. So when a user edits a scan root's
+folder layout in `FolderLayoutDialog` and changes a folder's role
+(e.g. `App` -> `Single App/Variant`, or anything else that alters which
+folders count as install units), the next re-scan correctly emits new
+candidates for the affected subtree, but the OLD layout's apps stay in
+the catalog. Live reproduction on a real ADOBE/PHOTOSHOP/CS6 subtree:
+9 apps under the old `App` role, role change to `Single App/Variant`,
+re-scan produced 10 apps instead of 1. Nothing in the pipeline removes a
+`raw_candidate` that's no longer walked under the current layout, so
+the layout editor was only usable on a fresh DB.
+
+### New public API
+
+- **`apply_layout_change(db, scan_root_id, old_layout, new_layout, *,
+  old_unconfigured_toplevel_role=None, new_unconfigured_toplevel_role=None)
+  -> LayoutChangeResult`** -- brings the catalog into agreement with an
+  edited folder layout. Called by `FolderLayoutDialog._on_ok()` right
+  after `db.save_folder_layout()` writes the new JSON;
+  `save_folder_layout()` itself stays dumb (just writes the JSON), the
+  propagation is a separate concern the caller orchestrates. Two classes
+  of change, classified per-key from the diff of old vs. new layout:
+
+  - **Label-only** (role unchanged; only the optional `name` differs):
+    `UPDATE raw_candidates.catalog/subcatalog` in place across the
+    affected subtree, computed via `scanner.resolve_scan_root_layout()`
+    (the SAME function the scanner itself uses, so labels can't drift
+    between the two). No deletion, no re-scan needed.
+  - **Role change** (effective role differs, or an entry was added/
+    removed): delete `variants` + `raw_candidates` under the affected
+    subtree, then delete any app left with zero variants. Because the
+    fingerprints go with the deleted `raw_candidates`, the next
+    incremental scan cannot skip these folders even if their mtime is
+    unchanged -- a natural re-scan of just the affected subtree is
+    automatic. Apps that still have variants from outside the affected
+    scope are left untouched (`name_locked` / `catalog_locked` /
+    `subcatalog_locked` / `status` / scraper fields all survive because
+    the app itself survives).
+
+  All steps run in one transaction, no filesystem operations, logged to
+  `audit_log` as `entity_type="scan_root", action="layout_change"` with
+  the affected folder list and removal counts. Never triggers a re-scan
+  itself; the next scan (manual, or the user's existing "Re-scan now")
+  rebuilds.
+
+- **`LayoutChangeResult`** dataclass -- `folders_affected`,
+  `raw_candidates_deleted`, `variants_deleted`, `apps_deleted`,
+  `label_updates`, `role_change_folders`, `label_only_folders`. Read by
+  `ScanRootsDialog._edit_layout()` to build the post-save status-bar
+  message.
+
+### Classification uses effective roles, not raw entries
+
+`apply_layout_change()` classifies keys via a small recursive helper,
+**`_effective_role(layout, key, unconfigured_toplevel_role)`**, that
+mirrors `scanner._resolve_role_chain()`'s forward cascade exactly
+(catalog -> subcatalog -> app -> app; a top-level key with no explicit
+entry gets the root's own `unconfigured_toplevel_role`). This matters
+because `FolderLayoutDialog._on_ok()` deliberately writes every visible
+top-level row explicitly on every save (so a future re-scan doesn't
+treat an unchanged folder as "new") -- comparing raw explicit-entry
+values would misclassify "no entry, so the default applies" against
+"explicit entry that happens to equal the default" as a role change on
+every single open-OK cycle, deleting untouched subtrees for no reason.
+`_effective_role()` treats those as identical, which is what the
+scanner does too, so a no-change save correctly returns zero changes.
+
+### Reuses existing helpers, does not reimplement
+
+- `_starts_with_root()` (existing) for the path prefix check -- same
+  case-insensitive, separator-boundary-aware ancestor check
+  `update_scan_root_path()` uses, so a path like `D:\PROGRAMS2\Foo` is
+  never treated as under root `D:\PROGRAMS`.
+- `_delete_zero_variant_apps(conn, app_ids)` -- extracted from
+  `execute_clean_library()` so `apply_layout_change()` and
+  `execute_clean_library()` share the identical "an app only exists
+  because of its variants" deletion rule. Do not reimplement it in a
+  third place.
+- `scanner.resolve_scan_root_layout()` -- imported lazily inside the
+  function so `app_manager` stays importable from `monitor.py` without
+  pulling in `scanner`'s optional PE/archive dependencies.
+
+### Caller wiring (in `gui_main.py`)
+
+- `FolderLayoutDialog.__init__` gains a `self.layout_change_result =
+  None` slot; `_on_ok()` populates it after calling
+  `db.save_folder_layout()` and before `self.accept()`.
+- `ScanRootsDialog._edit_layout()` reads it back via `getattr(dialog,
+  "layout_change_result", None)` and sets the main window's status bar
+  to "Layout saved. Removed N app(s) / M variant(s) (K folder(s)
+  affected). Re-scan to rebuild." on any counts, or "Layout saved. No
+  catalog changes needed." on a no-op. No confirmation dialog: per the
+  plan, save is already a deliberate action and this one-line status is
+  the signal to inspect before re-scanning. The previous modal "Layout
+  saved" info box is removed entirely.
+
+### `database.py` / `scanner.py` companion fix (same checkpoint)
+
+An older build had shipped `DEFAULT 'skip'` for
+`scan_roots.unconfigured_toplevel_role`, and `ALTER TABLE` cannot change
+a column default once the column exists -- so every fresh scan root on
+a DB created by that older build silently inherited `'skip'`, and
+`FolderLayoutDialog` then wrote that `'skip'` explicitly into every
+top-level layout entry on first save, silently skipping the entire root
+on every scan. Two changes close this permanently:
+
+- Every `INSERT INTO scan_roots` site (`Database.ensure_scan_root()`
+  and `scanner._upsert_scan_root()`) now writes
+  `unconfigured_toplevel_role='catalog'` and `folder_layouts_json='{}'`
+  EXPLICITLY rather than relying on the table default.
+- `Database._fix_bad_skip_roots()` (called from `init_schema()` right
+  after `_run_migrations()`) is a one-time data migration for
+  already-poisoned roots: any root whose `unconfigured_toplevel_role` is
+  `'skip'` AND whose layout contains either no entries or only `'skip'`
+  entries with no name overrides is reset to `'catalog'` with those
+  auto-written entries dropped. Any root where the user made a real
+  choice is left alone.
+  
+  | `variants` | One row per raw_candidate that got assigned to an app -- a specific version/edition/architecture/language combination. Checkpoint 30: `file_locked` (0/1) marks the user's manual installer-file override -- when set, the scanner keeps using `variants.file_name` for that folder instead of auto-picking, and `resolver._upsert_variant()` never overwrites `file_name` on a locked row. |
+  
+  - **Checkpoint 30 -- variant file lock (`locked_files`)**:
+  `walk_scan_root(root, ..., locked_files=None, ...)` accepts a dict of
+  `{folder_path: file_name}` (built once per scan in `run_scan()` from
+  `variants.file_locked = 1`, joined via `raw_candidates`), scoped to the
+  scan root. `locked` is looked up ONCE per folder, before the
+  `is_single_app` branch. For single_app folders it goes through
+  `_build_single_app_candidate(..., forced_file=locked)` which filters
+  `group_files` to the matching relpath (exact-then-basename). For
+  install_unit folders it does a case-insensitive basename match against
+  `file_names` and collapses the folder's candidates to `[[matched]]` on
+  hit, or logs a warning and falls back to `_group_installer_files()` on
+  miss. Never touched by resolver or GUI directly -- `variants.file_locked`
+  is the only storage.
+  
+    Checkpoint 30: also "Change installer file…" / "Clear installer file
+  override" (both gated on `raw_candidate_id IS NOT NULL`; see
+  `_change_variant_installer_file` / `_clear_variant_installer_file`).
+  Stored value is `os.path.relpath(chosen, source_path)` -- native
+  separators, never converted to forward slashes (Explorer's `/select,`
+  silently ignores forward slashes and opens Desktop instead).
+  `_variant_full_path()` and `_open_file_location()` both call
+  `os.path.normpath()` on the joined path as belt-and-braces for any
+  legacy DB row. `load_app()` prepends 🔒 to the File Name cell when
+  `file_locked` is set.

@@ -2349,3 +2349,416 @@ rename) against the new role vocabulary end-to-end (`run_scan()` +
 `run_resolve()` against a synthetic tree, not just `resolve_scan_root_
 layout()` in isolation) -- all four still produce the correct final
 `apps` rows.
+
+## Checkpoint 29: Layout-change propagation + two follow-up fixes
+
+Three related changes, motivated by the "editing a scan root's folder
+layout after an initial scan leaves stale apps behind" bug the user hit
+on a real ADOBE/PHOTOSHOP/CS6 subtree. Full reproduction from the user's
+own log: `PHOTOSHOP\CS6 v13.0` initially mapped as role `App`, scan 1
+produced 148 raw_candidates and 9 apps (most of them payload subfolders
+that were never intended as standalone apps). User then edited the
+layout, changing CS6 v13.0 to `Single App/Variant`, and re-scanned.
+Scan 2 correctly emitted only ONE install unit for the CS6 subtree (the
+role change worked as designed at scan time), but the 9 old apps
+remained in the catalog -- total went from 9 to 10 apps, not 9 to 1.
+Root cause: the scanner upserts `raw_candidates` and the resolver only
+creates/updates apps; nothing in the pipeline removes a raw_candidate
+that's no longer walked under the current layout. Result: the layout
+editor was only usable on a fresh database.
+
+### A. New `app_manager.apply_layout_change()` -- the propagation itself
+
+New function in `app_manager.py` plus a new `LayoutChangeResult`
+dataclass, placed under a new "0b. Layout-change propagation" heading
+between the scan-root-lifecycle group and the duplicate-detection
+group. Called by `FolderLayoutDialog._on_ok()` right after
+`db.save_folder_layout()` writes the new JSON; `save_folder_layout()`
+itself stays dumb (just writes the JSON), propagation is a separate
+concern the caller orchestrates. Two classes of change, classified
+per-key from the diff of old vs. new layout:
+
+- **Label-only** (role unchanged, only the optional `name` differs):
+  `UPDATE raw_candidates.catalog/subcatalog` in place across the
+  affected subtree, computed via `scanner.resolve_scan_root_layout()`
+  (the SAME function the scanner uses, so labels can't drift between
+  the two). No deletion, no re-scan needed.
+- **Role change** (effective role differs, or an entry was added/
+  removed): delete `variants` + `raw_candidates` under the affected
+  subtree, then delete any app left with zero variants. Because the
+  fingerprints go with the deleted `raw_candidates`, the next
+  incremental scan can't skip these folders even if their mtime is
+  unchanged -- a natural re-scan of just the affected subtree is
+  automatic, no new "force re-scan" flag needed.
+
+All steps run in one transaction, no filesystem operations, logged to
+`audit_log` as `entity_type="scan_root", action="layout_change"` with
+the affected folder list and removal counts. Never auto-triggers a
+re-scan; per the plan, re-scanning is the user's choice (the existing
+"Re-scan now" button, or the natural next scan).
+
+Reuses existing helpers throughout: `_starts_with_root()` for the path
+prefix check (same case-insensitive separator-boundary-aware ancestor
+check `update_scan_root_path()` uses), `_delete_zero_variant_apps()`
+(extracted from `execute_clean_library()` so both call sites use
+identical logic), `resolve_scan_root_layout()` for label computation
+(imported lazily so `app_manager` stays importable without pulling in
+`scanner`'s optional PE/archive deps).
+
+GUI wiring: `FolderLayoutDialog.__init__` gains a
+`self.layout_change_result = None` slot, populated by `_on_ok()` after
+`save_folder_layout()`; `ScanRootsDialog._edit_layout()` reads it back
+and sets the main window's status bar to
+"Layout saved. Removed N app(s) / M variant(s) (K folder(s) affected).
+Re-scan to rebuild." or "Layout saved. No catalog changes needed." on a
+no-op. The previous modal "Layout saved" info box is removed -- save is
+already a deliberate action, the status-bar message is the one-second
+signal to inspect before re-scanning (per the plan's section 3.5).
+
+### B. Fix 1 -- `_effective_role()` for classification
+
+First live test log from the user after the initial implementation
+showed:
+
+    Layout change propagated for scan_root_id=24: 7 role change(s),
+    0 label-only change(s) -> removed 0 raw_candidate(s) / 0 variant(s) /
+    0 app(s); 0 label update(s)
+
+"7 role changes" on a root with no prior scan and no prior saved
+layout. Root cause: `FolderLayoutDialog._on_ok()` deliberately writes
+every visible top-level row explicitly on every save (so a future
+re-scan doesn't treat an unchanged folder as "new"), and the initial
+`apply_layout_change()` compared raw explicit-entry values -- `None`
+(no entry in the old empty layout) vs. `"catalog"` (the explicit value
+in the new layout). Every top-level folder looked like an added entry,
+i.e. a role change, even though "implicit default" and "explicit value
+equal to the default" mean the same thing to the scanner.
+
+Harmless in that specific case (nothing to delete yet), but a real
+landmine the moment this root ever gets scanned and the user re-opens
+the dialog and clicks OK without changing anything -- 7 subtrees would
+get deleted for no reason.
+
+Fixed by adding `_effective_role(layout, key, unconfigured_toplevel_
+role)` -- a small recursive helper that mirrors `scanner._resolve_role_
+chain()`'s forward cascade exactly (catalog -> subcatalog -> app -> app;
+a top-level key with no entry gets the root's own
+`unconfigured_toplevel_role`). Classification now compares effective
+roles rather than raw entries:
+
+    old_eff = _effective_role(old_layout, key, old_top_default)
+    new_eff = _effective_role(new_layout, key, new_top_default)
+    if old_eff != new_eff:
+        role_change_keys.append(key)
+
+Verified: after the fix, the same open-OK-on-a-fresh-root sequence logs
+"0 role change(s), 0 label-only change(s)". The "save without changes
+is a no-op" case (open on an already-scanned root, click OK without
+touching anything) also correctly logs zero role changes now, which was
+the primary load-bearing case the initial version silently got wrong.
+
+### C. Fix 2 -- `unconfigured_toplevel_role` default is `'catalog'`,
+### explicitly
+
+Second live test log, from the SAME root 24 session:
+
+    SKIPPED (folder layout: skip mode) ...\DESKTOP UTILITIES
+    SKIPPED (folder layout: skip mode) ...\GRAPHICS
+    SKIPPED (folder layout: skip mode) ...\SYSTEM UTILITIES
+    SKIPPED (folder layout: skip mode) ...\tryout
+    Scan walk finished. 4 folders visited.
+    SCAN FINISHED: status=completed folders_seen=0 install_units_found=0
+    errors=0
+
+Four folders visited, zero folders seen -- every one skipped by layout,
+on a brand-new root that had never been configured. Root cause traced
+by querying the DB directly: `scan_roots.id=24` had
+`unconfigured_toplevel_role = 'skip'`. `FolderLayoutDialog.__init__`
+read that value and set the top-strip combo to Skip, and then
+`_populate_top_level()` defaulted every top-level row's role combo to
+Skip too (via `_default_role_for((name,))` returning
+`default_toplevel_combo.currentData()`). The user clicked OK on the
+apparently-default state, `_on_ok()` force-wrote every row explicitly,
+and the scanner then correctly skipped all four subtrees.
+
+Why was a fresh root's `unconfigured_toplevel_role` set to `'skip'`?
+`database.py`'s current migration list already declares `DEFAULT
+'catalog'`, but SQLite's `ALTER TABLE ... ADD COLUMN` cannot change a
+column default once the column exists. An older build had shipped
+`DEFAULT 'skip'` in that migration; every fresh DB created by that
+build has `'skip'` baked into the column's schema, and every subsequent
+`INSERT INTO scan_roots (path) VALUES (?)` -- including
+`db.ensure_scan_root()`, which is the exact path taken when the "Add
+new scan root…" flow answers "No" to the single-catalog prompt --
+silently inherits `'skip'`. The current code's migration attempts to
+`ALTER TABLE ... DEFAULT 'catalog'`, hits "duplicate column", catches
+it, and moves on, leaving the bad default in place.
+
+Two fixes applied:
+
+1. **Explicit values in every `scan_roots` INSERT**, rather than
+   relying on the table default at all. `Database.ensure_scan_root()`
+   in `database.py` now writes
+   `INSERT INTO scan_roots (path, unconfigured_toplevel_role,
+   folder_layouts_json) VALUES (?, 'catalog', '{}')` explicitly, with
+   a comment explaining why (the ALTER TABLE default can't be trusted
+   on an older DB). Same treatment for `scanner._upsert_scan_root()`.
+   This closes the gap permanently regardless of what default the
+   table happens to carry.
+
+2. **One-time data migration for existing rows**:
+   `Database._fix_bad_skip_roots()`, called from `init_schema()` right
+   after `_run_migrations()`. Fingerprint: a root whose
+   `unconfigured_toplevel_role` is `'skip'` AND whose layout contains
+   either no entries at all or only `'skip'` entries with no name
+   overrides -- i.e. a root nobody has deliberately configured. Any
+   such root is reset to `'catalog'` with its auto-written `'skip'`
+   entries dropped, so the next dialog open shows the correct default.
+   A root where the user made a real choice (any non-skip role, any
+   rename) is left alone. If a user genuinely wants everything
+   skipped they can re-set it from the dialog in one click; the
+   migration cannot distinguish "user wanted this skipped" from "user
+   accepted the buggy default" beyond that heuristic, which is why it
+   only fires on the exact poisoning signature.
+
+### Verified end-to-end
+
+- Same ADOBE/PHOTOSHOP/CS6 scenario from the original report: role
+  change `App` -> `Single App/Variant`, `apply_layout_change()` deletes
+  148 raw_candidates / 9 variants / 9 apps under the affected subtree,
+  re-scan produces 1 app. ADOBE case closed.
+- "Open dialog, click OK without changes" on an already-scanned root:
+  logs `0 role change(s), 0 label-only change(s)`, status bar shows
+  "Layout saved. No catalog changes needed."
+- "Open dialog, click OK without changes" on a FRESH root: same
+  zero-change log; next scan no longer skips every top-level folder.
+- Label-only rename of a catalog display name: no deletions,
+  `raw_candidates.catalog` updated in place across the affected
+  subtree, apps present. (Label updates do NOT touch `apps.catalog`/
+  `apps.subcatalog` -- those are left for the next re-resolve, per the
+  plan's "or leave that to the next resolve" allowance.)
+- Skip transition (`App` -> `Skip`): whole subtree's raw_candidates
+  deleted, all apps gone.
+- Partial preservation: an app whose variants span both in-scope and
+  out-of-scope folders survives with its out-of-scope variants intact;
+  only the in-scope variants are removed.
+- Cold start (fresh empty DB, first-ever layout save): no-op cleanly,
+  no errors, zero counts, "no catalog changes needed" message.
+- Root 24 in the user's live DB: after the migration runs on next
+  startup (or the manual `UPDATE`), the dialog opens with
+  `unconfigured_toplevel_role` = Catalog, all four top-level rows
+  showing Catalog role, saving writes them as explicit catalog
+  entries, and the next scan walks into all four subtrees.
+
+### Out of scope (per the plan, restated here so it's not
+### rediscovered as a surprise later)
+
+- Auto-triggering a re-scan after save. Manual re-scan only; the
+  status-bar message states the next action. One line to change later
+  if it turns out to be wanted.
+- Confirmation dialog on save. Rejected -- save is a deliberate action,
+  the post-save status-bar message conveys the consequence.
+- Preservation of locked / verified / scraped apps during role
+  changes. Rejected -- an app with no remaining valid variants does
+  not exist, regardless of its flags.
+- Auto-merge of new single-app into old payload apps. Rejected --
+  removal + re-scan produces the correct result without heuristics.
+- Naming-cascade fix for the `Single App/Variant` role. The user's own
+  log shows the new single app is currently named from the grandparent
+  catalog (`Adobe`) rather than from the anchor folder (`CS6 v13.0`).
+  This is a real bug in `resolver.extract_fields()` for that role, but
+  it is orthogonal to propagation -- even perfect propagation leaves
+  that naming wrong. Flagged separately, not addressed by this
+  checkpoint.
+  
+  
+## Checkpoint 30: Variant installer-file override (per-variant lock) + open-location path fix
+
+Feature request: allow a user to manually pick which file in a variant's
+source folder is the "real" installer -- overriding whatever the scanner
+auto-picked -- and have that choice survive re-scans and re-resolves.
+Kept deliberately minimal after an earlier over-engineered design (a
+separate `variant_file_overrides` table keyed on scan root + folder,
+with its own picker dialog) was scrapped in favor of a single boolean
+lock column on `variants` plus a plain file dialog.
+
+### New column
+
+`variants.file_locked INTEGER DEFAULT 0` (additive migration in
+`database.py::_run_migrations()`). Follows the exact convention already
+used by `version_locked` / `name_locked` / `catalog_locked` /
+`subcatalog_locked`: `0` = don't touch, `1` = user owns this field.
+
+### Scanner -- honor the lock on re-scan
+
+`scanner.run_scan()` now builds a `locked_files` dict scoped to the scan
+root before walking:
+
+    SELECT rc.folder_path, v.file_name
+    FROM variants v
+    JOIN raw_candidates rc ON rc.id = v.raw_candidate_id
+    WHERE rc.scan_root_id = ? AND v.file_locked = 1 AND v.file_name IS NOT NULL
+
+Keyed by `folder_path`, valued by the user's file name for that folder.
+Passed into `walk_scan_root(..., locked_files=...)`.
+
+`scanner.walk_scan_root()` now:
+- Accepts `locked_files: Optional[dict] = None`.
+- Looks up `locked = (locked_files or {}).get(display_dirpath)` **before**
+  the `is_single_app` branch (not after -- the previous draft's placement
+  inside the post-classification block was unreachable for single_app
+  folders, since that branch `continue`s earlier).
+- Passes `forced_file=locked` into `_build_single_app_candidate()`.
+- For install_unit folders, does a case-insensitive basename match of
+  `locked` against `file_names`; on hit, collapses the whole folder's
+  candidates to just `[[locked_match]]`; on miss, logs
+  `"Locked file %r not found in %s -- falling back to auto-pick"` and
+  falls through to `_group_installer_files()` as before.
+
+`scanner._build_single_app_candidate()` gained a `forced_file` kwarg:
+when set, it tries to match `forced_file` against the collected relpaths
+(exact-then-basename), and if matched, restricts `group_files` to that
+one entry before `_enrich_install_candidate()` runs. Miss -> log warning
++ auto-pick.
+
+Both paths keep the same DB row on disk (`variants.file_name`) as the
+canonical source of the override -- no separate storage, no new table,
+no scan-root-level config, no folder_layouts interaction.
+
+### Resolver -- never clobber a locked file_name
+
+`resolver._upsert_variant()` was writing `variants.file_name` on every
+update unconditionally. That silently reverted the user's pick the first
+time they ran Re-resolve without an intervening scan (raw_candidate still
+held the old auto-pick). Now guarded:
+
+    if not existing["file_locked"]:
+        updates["file_name"] = raw_row["primary_file_name"]
+
+Same pattern as the existing `version_locked` guard directly above it.
+
+### GUI
+
+**Context menu** (`DetailPanel._show_variant_context_menu`) gained two
+actions between the existing "Run / open file" and "Re-evaluate selected"
+entries:
+- **Change installer file…** -- opens a plain `QFileDialog.getOpenFileName`
+  rooted at the variant's current file location (or its source folder if
+  the stored file no longer exists). Writes `variants.file_name = <relpath>`
+  and `variants.file_locked = 1`, reloads the app.
+- **Clear installer file override** -- writes `file_locked = 0`. Only
+  enabled when the selected variant is currently locked. Auto-pick takes
+  over on the next scan; `file_name` stays as-is until then.
+
+Both menu items are disabled when `raw_candidate_id IS NULL` (monitor-
+created variants have no scan-root folder to key the override against --
+the scanner's `locked_files` query joins on `raw_candidates` and would
+never see them).
+
+**Variants table** (`load_app`) prepends a 🔒 to the File Name column
+when `file_locked` is set, with a tooltip naming the locked file and
+pointing at the Clear action.
+
+**Stored value is `relpath(chosen, source_path)`** -- not
+`os.path.basename()`, and not `.replace(os.sep, "/")`. This was the
+single most-bug-prone part of the whole feature; two distinct real bugs
+came out of getting it wrong, both fixed:
+
+1. **Basename-only store broke single_app subtrees.** For a `single_app`
+   folder whose installer lives one level down
+   (`source_path="...\cs13"`, actual file `"...\cs13\Set\setup.exe"`),
+   storing just `"setup.exe"` made `_variant_full_path` join to
+   `"...\cs13\setup.exe"` -- one folder too shallow -- and Open Location
+   popped "file no longer exists" for a file that was sitting right
+   there. Fixed by storing the relpath; `Set/setup.exe` joins correctly.
+2. **Forward-slash conversion broke Explorer `/select,`.** An
+   intermediate fix stored `"Set/setup.exe"` with `.replace(os.sep, "/")`
+   for "portability" -- but this is a Windows-only app (uses
+   `explorer`, `os.startfile`, `\\?\` prefixing, none of which are
+   cross-platform anyway), and Explorer's `/select,` argument silently
+   ignores forward slashes and mixed separators, falling back to opening
+   its default location (Desktop). The scanner's own relpaths
+   (`_collect_single_app_files` -> `os.path.relpath`) already store
+   native separators; the GUI was the odd one out for no real reason.
+   Fixed by dropping the replacement and storing `os.path.relpath()`
+   verbatim -- same convention as the scanner, same convention as the
+   DB, same convention as the OS.
+
+A refusal guard was added: if the chosen file's relpath starts with `..`
+(wrong folder) or raises `ValueError` (different Windows drive letter),
+warn and abort rather than silently store something the scanner will
+never find.
+
+**`_variant_full_path`** and **`_open_file_location`** now `normpath()`
+their input as belt-and-braces (a no-op on already-native input, cheap
+insurance for any historical DB rows still holding a forward-slash
+value from the two days the intermediate fix existed). A single
+diagnostic `print(f"[open-location] {full_path}")` was added at the top
+of `_open_file_location` -- the earlier version had four extra prints
+(lengthy `repr()`, `exists`/`isfile`/`isdir` booleans, resolved folder,
+the full subprocess command line) that were overkill; one line showing
+the resolved path is enough to see whether the normpath landed.
+
+### Bugs found during this feature's own development
+
+1. **`sqlite3.Row` has no `.get()`.** `load_app()`'s first pass at the
+   🔒 marker wrote `v.get("file_locked")`; `variants` rows come back as
+   raw `sqlite3.Row` objects (the codebase's usual convention is either
+   `row["col"]` or `dict(row)` first). Fired on every app click,
+   `AttributeError`, red traceback. Fixed to `v["file_locked"]` with a
+   `"file_locked" in v.keys()` guard for pre-migration DBs.
+2. **Dead code from an earlier draft.** `walk_scan_root` briefly had a
+   second `if is_single_app:` block AFTER the fingerprint computation,
+   holding the `locked` lookup and a duplicate `_build_single_app_candidate`
+   call. Unreachable (the first `is_single_app` branch already
+   `continue`d), but visually confusing. Removed; the `locked` lookup now
+   lives once, before both branches.
+3. **Nested redundant `if` in the install_unit branch.** An early edit
+   left `if classification.unit_type == "install_unit":` wrapping another
+   identical check inside itself -- always true, always redundant.
+   Collapsed.
+4. **The `.replace(os.sep, "/")` "fix" was itself the second bug** (see
+   above), not the first.
+
+### Verified end-to-end
+
+- Right-click a variant → Change installer file → pick a real file in a
+  nested subfolder of a single_app folder. `variants.file_name` becomes
+  the relpath (native separators), `file_locked = 1`. Variants table
+  shows `🔒 Set\setup.exe`.
+- Right-click → Open file location → Explorer opens with the file
+  selected. `[open-location] C:\...\cs13\Set\setup.exe` printed once,
+  matching the DB value joined with `source_path`.
+- Run **Re-resolve all** with no intervening scan. `file_name` unchanged;
+  `file_locked` still 1.
+- Run **Re-scan now**. `raw_candidates.primary_file_name` for that folder
+  becomes the locked file's relpath; the candidate is emitted with that
+  primary file; resolve writes `variants.file_name` = same value
+  (guarded write is a no-op because it already matches). App unchanged.
+- Right-click → Clear installer file override → `file_locked = 0`. Next
+  scan reverts `raw_candidates.primary_file_name` to the auto-pick and
+  `variants.file_name` follows.
+- Delete the locked file from disk, re-scan. Scanner logs
+  `Locked file 'Set\setup.exe' not found in ... -- falling back to
+  auto-pick`; `file_locked` stays 1 so the override re-applies if the
+  file comes back.
+- Try to pick a file from outside the app folder. Warned and refused,
+  no DB write.
+- Monitor-created variants (`raw_candidate_id IS NULL`): both menu items
+  disabled with explanatory tooltips.
+
+### Files touched
+
+- `database.py` -- one migration line.
+- `scanner.py` -- `run_scan` locked_files query + `walk_scan_root`
+  signature + both branches; `_build_single_app_candidate` gained
+  `forced_file`.
+- `resolver.py` -- one `if not existing["file_locked"]:` guard around
+  the `file_name` update in `_upsert_variant`.
+- `gui_main.py` -- context menu, two new DetailPanel methods, 🔒 marker,
+  `_variant_full_path` normpath, `_open_file_location` normpath + one-line
+  print.
+
+Nothing in `app_manager.py`, `monitor.py`, `scraper.py`, `app_organizer.py`,
+`gui_backend.py`, or `config.py` needed to change. No new settings, no
+new dialogs, no new tables.

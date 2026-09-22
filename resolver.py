@@ -940,6 +940,22 @@ def run_resolve(db: Database, scan_root_id: Optional[int] = None) -> ResolveProg
             parent_folder_name=parent_name,
             folder_depth=row["depth"],
         )
+
+        # Single App/Variant folder with a manual rename: use it verbatim,
+        # period -- bypass the file/folder/parent-folder cascade entirely
+        # rather than feeding it in as just another scored candidate. The
+        # cascade's own winner (if any) is kept as the alt-name candidate
+        # so it's still visible/one-click-overridable in the GUI, same as
+        # any other resolver decision.
+        forced_name = row["forced_name"] if "forced_name" in row.keys() else None
+        if forced_name:
+            if fields.clean_name and fields.clean_name.lower() != forced_name.lower():
+                fields.alt_name_candidate = fields.clean_name
+                fields.alt_name_source = fields.name_source
+            fields.clean_name = forced_name
+            fields.name_source = "manual"
+            fields.extraction_confidence = 1.0
+
         extracted_by_id[row["id"]] = (row, fields)
         members.append(
             ClusterMember(
@@ -1138,7 +1154,8 @@ def _upsert_variant(conn, app_id: int, raw_row, fields):
     updates["architecture"] = fields.architecture
     updates["language"] = fields.language
     updates["confidence"] = fields.extraction_confidence
-    updates["file_name"] = raw_row["primary_file_name"]
+    if not existing["file_locked"]:
+        updates["file_name"] = raw_row["primary_file_name"]
     updates["alt_name_candidate"] = fields.alt_name_candidate
     updates["name_source"] = fields.name_source
 
@@ -1158,9 +1175,12 @@ def _upsert_variant(conn, app_id: int, raw_row, fields):
 # Returns a proposal for the GUI to show as a diff before applying.
 # ---------------------------------------------------------------------------
 
-def propose_reresolve_app(db: Database, app_id: int) -> dict:
+def propose_reresolve_app(db: Database, app_id: int,
+                          settings_override: Optional[dict] = None) -> dict:
     conn = db.connect()
     settings = db.get_all_settings()
+    if settings_override:
+        settings = {**settings, **settings_override}
 
     app = conn.execute("SELECT * FROM apps WHERE id = ?", (app_id,)).fetchone()
     if app is None:

@@ -1078,18 +1078,10 @@ def _collect_single_app_files(subtree_root: str, error_sink: Optional[list],
 
 
 def _build_single_app_candidate(
-    dirpath: str, display_dirpath: str, catalog: Optional[str], subcatalog: Optional[str],
-    depth: int, forced_name: Optional[str], settings: dict, error_sink: Optional[list],
+    dirpath, display_dirpath, catalog, subcatalog,
+    depth, forced_name, settings, error_sink,
+    forced_file: Optional[str] = None,
 ) -> ScanCandidate:
-    """
-    Builds the ONE ScanCandidate for an entire single_app-role subtree.
-    Reuses _enrich_install_candidate() unchanged for the actual file-
-    picking/PE-reading/archive-inspection work -- it already accepts a
-    dirpath + a list of candidate filenames and internally calls
-    _pick_representative() over them, so handing it every installer-like
-    RELATIVE PATH found anywhere in the subtree (instead of bare filenames
-    from one folder) needs no changes there at all.
-    """
     files = _collect_single_app_files(dirpath, error_sink, display_dirpath)
 
     candidate = ScanCandidate(
@@ -1112,6 +1104,22 @@ def _build_single_app_candidate(
     candidate.fingerprint = hashlib.sha1(fp_blob).hexdigest()
 
     group_files = [f["relpath"] for f in files]
+    if forced_file:
+        needle = forced_file.lower()
+        base = needle.rsplit("/", 1)[-1]
+        matched = next(
+            (g for g in group_files
+             if g.lower() == needle or g.rsplit("/", 1)[-1].lower() == base),
+            None,
+        )
+        if matched:
+            group_files = [matched]
+        else:
+            log.warning(
+                "Locked file %r not found under %s -- using auto-pick",
+                forced_file, display_dirpath,
+            )
+
     candidate = _enrich_install_candidate(candidate, dirpath, group_files, settings)
 
     if not candidate.primary_file_name:
@@ -1132,6 +1140,7 @@ def walk_scan_root(
     follow_symlinks: bool = False,
     error_sink: Optional[list] = None,
     folder_layout: Optional[dict] = None,
+    locked_files: Optional[dict] = None,
     unconfigured_toplevel_role: str = "catalog",
 ) -> Iterator[ScanCandidate]:
     root = os.path.abspath(root)
@@ -1179,10 +1188,13 @@ def walk_scan_root(
             dirnames[:] = []
             continue
 
+        locked = (locked_files or {}).get(display_dirpath)
+
         if is_single_app:
             candidate = _build_single_app_candidate(
                 dirpath, display_dirpath, catalog, subcatalog, depth,
                 forced_name, settings, error_sink,
+                forced_file=locked,
             )
             log.info("SINGLE APP/VARIANT: [%s/%s] %s  (file: %s)",
                       candidate.catalog, candidate.subcatalog,
@@ -1221,7 +1233,17 @@ def walk_scan_root(
                 error_sink.append((display_dirpath, msg))
 
         if classification.unit_type == "install_unit":
-            groups = _group_installer_files(file_names)
+            locked_match = None
+            if locked:
+                needle = locked.lower()
+                locked_match = next((f for f in file_names if f.lower() == needle), None)
+                if not locked_match:
+                    log.warning(
+                        "Locked file %r not found in %s -- falling back to auto-pick",
+                        locked, display_dirpath,
+                    )
+
+            groups = [[locked_match]] if locked_match else _group_installer_files(file_names)
             if not groups:
                 # classify_folder said install_unit (it saw installer/archive
                 # extensions) but grouping found nothing -- shouldn't happen,
@@ -1338,6 +1360,18 @@ def run_scan(
 
     scan_root_row = db.get_scan_root_by_id(scan_root_id)
     folder_layout = db.get_folder_layout(scan_root_id)
+    locked_files = {
+        r["folder_path"]: r["file_name"]
+        for r in conn.execute(
+            """
+            SELECT rc.folder_path, v.file_name
+            FROM variants v
+            JOIN raw_candidates rc ON rc.id = v.raw_candidate_id
+            WHERE rc.scan_root_id = ? AND v.file_locked = 1 AND v.file_name IS NOT NULL
+            """,
+            (scan_root_id,),
+        ).fetchall()
+    }    
     unconfigured_toplevel_role = (
         (scan_root_row["unconfigured_toplevel_role"] or "catalog") if scan_root_row else "catalog"
     )
@@ -1359,6 +1393,7 @@ def run_scan(
             follow_symlinks=settings.get("scan_follow_symlinks", False),
             error_sink=scan_errors,
             folder_layout=folder_layout,
+            locked_files=locked_files,
             unconfigured_toplevel_role=unconfigured_toplevel_role,
         ):
             if cancel_flag and cancel_flag():

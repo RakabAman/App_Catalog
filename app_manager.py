@@ -69,6 +69,22 @@ def _starts_with_root(path: Optional[str], root_norm: str) -> bool:
     return path.lower().startswith(root_norm.lower() + os.sep) or \
         path.lower().startswith(root_norm.lower() + "/")
 
+def _delete_zero_variant_apps(conn, app_ids) -> int:
+    """
+    Deletes any app in `app_ids` whose variant count is now zero. Shared
+    by execute_clean_library() and apply_layout_change(): an app only
+    exists because of its variants, so zero variants means there is
+    nothing legitimate left to keep. Returns how many apps were deleted.
+    """
+    removed = 0
+    for app_id in app_ids:
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS n FROM variants WHERE app_id = ?", (app_id,)
+        ).fetchone()["n"]
+        if remaining == 0:
+            conn.execute("DELETE FROM apps WHERE id = ?", (app_id,))
+            removed += 1
+    return removed
 
 def _rewrite_prefix(path: Optional[str], old_root_norm: str, new_root_norm: str) -> Optional[str]:
     """
@@ -235,6 +251,286 @@ def delete_scan_root(db: Database, scan_root_id: int) -> dict:
 
     log.info("Deleted scan_root_id=%s (%r): %s", scan_root_id, path, counts)
     return counts
+
+
+
+# ======================================================================
+# 0b. Layout-change propagation (folder-role edits between scans)
+# ======================================================================
+#
+# When FolderLayoutDialog saves a change that alters which folders count
+# as install units (App <-> Single App/Variant <-> Subcatalog <-> Skip),
+# the catalog must be brought into agreement with the new layout BEFORE
+# the next scan, or every re-scan just leaves the old layout's apps
+# behind (scanner upserts, resolver only creates/updates -- nothing in
+# the pipeline removes a raw_candidate that's no longer walked under the
+# current layout). See the Layout-Change Propagation plan for the full
+# rationale and the live ADOBE/PHOTOSHOP/CS6 reproduction.
+
+@dataclass
+class LayoutChangeResult:
+    """Counts returned by apply_layout_change() for the post-save status
+    message, e.g. 'Removed 9 apps / 148 variants (12 folders affected).'"""
+    folders_affected: int = 0
+    raw_candidates_deleted: int = 0
+    variants_deleted: int = 0
+    apps_deleted: int = 0
+    label_updates: int = 0
+    role_change_folders: list = field(default_factory=list)
+    label_only_folders: list = field(default_factory=list)
+
+
+def _layout_role_of(entry) -> Optional[str]:
+    """
+    Same convention as scanner._layout_role_of(): a layout entry is
+    either a bare role string or {"role": ..., "name": ...}. Duplicated
+    here (rather than imported from scanner) so app_manager stays
+    importable without dragging in scanner's optional archive/PE
+    dependencies -- monitor.py and other consumers import app_manager
+    without needing scanner at all.
+    """
+    if entry is None:
+        return None
+    if isinstance(entry, dict):
+        return entry.get("role")
+    if entry in ("catalog", "subcatalog", "app", "single_app", "skip"):
+        return entry
+    return None
+
+
+def _layout_name_of(entry) -> Optional[str]:
+    return entry.get("name") if isinstance(entry, dict) else None
+
+
+def _effective_role(layout: dict, key: str, unconfigured_toplevel_role: str) -> Optional[str]:
+    """
+    The role a folder actually resolves to under `layout`, cascading from
+    its parent's role exactly like scanner._resolve_role_chain() does --
+    or the root's unconfigured_toplevel_role for a top-level key. None
+    if nothing in the chain gives a role at all.
+
+    Needed because "no explicit entry, so the default applies" and "an
+    explicit entry whose value happens to equal the default" mean the
+    same thing to the scanner, but look different to a naive
+    old_role != new_role comparison -- which would misclassify the
+    dialog's routine "write every top-level row explicitly" save as a
+    role change, and delete subtrees that haven't actually changed.
+    """
+    explicit = _layout_role_of(layout.get(key))
+    if explicit is not None:
+        return explicit
+    if "/" not in key:
+        return unconfigured_toplevel_role
+    parent_key = "/".join(key.split("/")[:-1])
+    parent_role = _effective_role(layout, parent_key, unconfigured_toplevel_role)
+    if parent_role is None:
+        return None
+    # Mirrors scanner.ROLE_CASCADE -- catalog -> subcatalog,
+    # subcatalog -> app, app/single_app/skip stay put.
+    return {"catalog": "subcatalog", "subcatalog": "app"}.get(parent_role, parent_role)
+
+def _raw_candidates_under(conn, scan_root_id: int, folder_abs_norm: str) -> list:
+    """
+    All raw_candidates rows whose folder_path is folder_abs_norm itself
+    or anywhere under it, using the same case-insensitive, separator-
+    boundary-aware prefix check as update_scan_root_path() -- reusing
+    _starts_with_root() rather than re-implementing it, so a path like
+    D:\\PROGRAMS\\ADOBE2 is never treated as under D:\\PROGRAMS\\ADOBE.
+    """
+    rows = conn.execute(
+        "SELECT id, folder_path, catalog, subcatalog FROM raw_candidates "
+        "WHERE scan_root_id = ?",
+        (scan_root_id,),
+    ).fetchall()
+    return [r for r in rows if _starts_with_root(r["folder_path"], folder_abs_norm)]
+
+
+def apply_layout_change(
+    db: Database, scan_root_id: int,
+    old_layout: dict, new_layout: dict,
+    *,
+    old_unconfigured_toplevel_role: Optional[str] = None,
+    new_unconfigured_toplevel_role: Optional[str] = None,
+) -> LayoutChangeResult:
+    """
+    Brings the catalog into agreement with an edited folder layout so a
+    re-scan rebuilds the affected subtrees cleanly instead of leaving
+    stale apps behind. Called by FolderLayoutDialog._on_ok() right after
+    save_folder_layout(); save_folder_layout() itself stays dumb (just
+    writes the JSON) -- propagation is the caller's concern.
+
+    Two classes of change, classified per-key from the diff of old vs
+    new layout:
+
+      LABEL-ONLY (role unchanged; only the optional `name` differs):
+        UPDATE raw_candidates.catalog/subcatalog in place across the
+        affected subtree. No deletion, no re-scan needed.
+
+      ROLE CHANGE (role value differs, or an entry was added/removed):
+        delete variants + raw_candidates under the affected subtree,
+        then delete any app left with zero variants (same rule
+        execute_clean_library() follows). Because the fingerprints go
+        with the raw_candidates, the next incremental scan cannot skip
+        these folders even if their mtime is unchanged -- a natural
+        re-scan of just the affected subtree is automatic, no new
+        'force re-scan' flag needed.
+
+    All steps run in one transaction. No filesystem operations -- this
+    is catalog cleanup, structurally identical to execute_clean_library,
+    just scoped by folder path instead of by missing files. Apps that
+    still have variants from outside the affected scope are left
+    untouched (name_locked / catalog_locked / subcatalog_locked /
+    status / scraper fields all survive because the app itself survives).
+
+    Returns a LayoutChangeResult with counts for the post-save status
+    message.
+    """
+    # Lazy import -- resolve_scan_root_layout is the same function the
+    # scanner uses, so label computation cannot drift between the two.
+    # Done inside the function so app_manager's other consumers don't
+    # pay for scanner's optional archive/PE imports.
+    from scanner import resolve_scan_root_layout
+
+    conn = db.connect()
+    result = LayoutChangeResult()
+
+    scan_root_row = conn.execute(
+        "SELECT path, unconfigured_toplevel_role FROM scan_roots WHERE id = ?",
+        (scan_root_id,),
+    ).fetchone()
+    if scan_root_row is None:
+        raise ValueError(f"No scan root with id={scan_root_id}")
+    root_path = scan_root_row["path"].rstrip("\\/")
+    old_top_default = (
+        old_unconfigured_toplevel_role
+        or scan_root_row["unconfigured_toplevel_role"]
+        or "catalog"
+    )
+    new_top_default = (
+        new_unconfigured_toplevel_role
+        or scan_root_row["unconfigured_toplevel_role"]
+        or "catalog"
+    )
+    # ---- 1. Classify each key in the union of old/new layouts ----
+    # Compares EFFECTIVE roles (with cascade defaults applied), not raw
+    # explicit-entry values -- "no entry, so the default applies" and
+    # "explicit entry that equals the default" mean the same thing to
+    # the scanner, so they must mean the same thing here too. Otherwise
+    # the dialog's routine "write every top-level row explicitly" save
+    # would misclassify as a role change and wipe untouched subtrees.
+    all_keys = set(old_layout) | set(new_layout)
+    role_change_keys: list[str] = []
+    label_only_keys: list[str] = []
+    for key in sorted(all_keys):
+        old_entry = old_layout.get(key)
+        new_entry = new_layout.get(key)
+        old_eff = _effective_role(old_layout, key, old_top_default)
+        new_eff = _effective_role(new_layout, key, new_top_default)
+        if old_eff != new_eff:
+            role_change_keys.append(key)
+        elif _layout_name_of(old_entry) != _layout_name_of(new_entry):
+            label_only_keys.append(key)
+        # else: identical -> ignored
+
+    if not role_change_keys and not label_only_keys:
+        return result
+
+    try:
+        conn.execute("BEGIN")
+
+        # ---- 2. Role changes: delete raw_candidates / variants / apps ----
+        if role_change_keys:
+            rc_ids: set = set()
+            for key in role_change_keys:
+                abs_norm = os.path.join(root_path, *key.split("/")).rstrip("\\/")
+                for r in _raw_candidates_under(conn, scan_root_id, abs_norm):
+                    rc_ids.add(r["id"])
+
+            app_ids_touched: set = set()
+            if rc_ids:
+                id_list = list(rc_ids)
+                ph = ",".join("?" * len(id_list))
+                v_rows = conn.execute(
+                    f"SELECT id, app_id FROM variants WHERE raw_candidate_id IN ({ph})",
+                    id_list,
+                ).fetchall()
+                variant_ids = [v["id"] for v in v_rows]
+                for v in v_rows:
+                    app_ids_touched.add(v["app_id"])
+
+                if variant_ids:
+                    vph = ",".join("?" * len(variant_ids))
+                    conn.execute(
+                        f"DELETE FROM variants WHERE id IN ({vph})", variant_ids
+                    )
+                    result.variants_deleted = len(variant_ids)
+
+                conn.execute(
+                    f"DELETE FROM raw_candidates WHERE id IN ({ph})", id_list
+                )
+                result.raw_candidates_deleted = len(id_list)
+
+            if app_ids_touched:
+                result.apps_deleted = _delete_zero_variant_apps(conn, app_ids_touched)
+
+            result.role_change_folders = list(role_change_keys)
+
+        # ---- 3. Label-only changes: in-place UPDATE of catalog/subcatalog ----
+        for key in label_only_keys:
+            abs_norm = os.path.join(root_path, *key.split("/")).rstrip("\\/")
+            old_cat, old_sub, _, skip_old, _, _ = resolve_scan_root_layout(
+                root_path, abs_norm, old_layout,
+                unconfigured_toplevel_role=old_top_default,
+            )
+            if skip_old:
+                continue
+            new_cat, new_sub, _, skip_new, _, _ = resolve_scan_root_layout(
+                root_path, abs_norm, new_layout,
+                unconfigured_toplevel_role=new_top_default,
+            )
+            if skip_new or (old_cat, old_sub) == (new_cat, new_sub):
+                continue
+            for r in _raw_candidates_under(conn, scan_root_id, abs_norm):
+                conn.execute(
+                    "UPDATE raw_candidates SET catalog = ?, subcatalog = ? WHERE id = ?",
+                    (new_cat, new_sub, r["id"]),
+                )
+                result.label_updates += 1
+            result.label_only_folders.append(key)
+
+        # ---- 4. Audit log (same pattern as update_scan_root_path/delete_scan_root) ----
+        conn.execute(
+            "INSERT INTO audit_log (entity_type, entity_id, action, detail_json) "
+            "VALUES (?,?,?,?)",
+            ("scan_root", scan_root_id, "layout_change", json.dumps({
+                "role_change_folders": result.role_change_folders,
+                "label_only_folders": result.label_only_folders,
+                "raw_candidates_deleted": result.raw_candidates_deleted,
+                "variants_deleted": result.variants_deleted,
+                "apps_deleted": result.apps_deleted,
+                "label_updates": result.label_updates,
+            })),
+        )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        log.exception(
+            "Layout-change propagation FAILED for scan_root_id=%s; rolled back.",
+            scan_root_id,
+        )
+        raise
+
+    result.folders_affected = len(set(role_change_keys) | set(label_only_keys))
+    log.info(
+        "Layout change propagated for scan_root_id=%s: %d role change(s), "
+        "%d label-only change(s) -> removed %d raw_candidate(s) / %d variant(s) / "
+        "%d app(s); %d label update(s)",
+        scan_root_id, len(role_change_keys), len(label_only_keys),
+        result.raw_candidates_deleted, result.variants_deleted,
+        result.apps_deleted, result.label_updates,
+    )
+    return result
 
 
 # ======================================================================
@@ -1973,13 +2269,7 @@ def execute_clean_library(
         })
     conn.commit()
 
-    for app_id in touched_app_ids:
-        remaining = conn.execute(
-            "SELECT COUNT(*) AS n FROM variants WHERE app_id = ?", (app_id,)
-        ).fetchone()["n"]
-        if remaining == 0:
-            conn.execute("DELETE FROM apps WHERE id = ?", (app_id,))
-            result.removed_apps += 1
+    result.removed_apps = _delete_zero_variant_apps(conn, touched_app_ids)
     conn.commit()
 
     log_path.write_text(json.dumps(entries, indent=2), encoding="utf-8")

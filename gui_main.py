@@ -9,8 +9,8 @@ import subprocess
 import webbrowser
 from pathlib import Path
 from typing import Optional
-
-from PySide6.QtCore import Qt, Signal, QItemSelectionModel
+import re
+from PySide6.QtCore import Qt, Signal, QItemSelectionModel, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QTableView,
@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QMenu, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QStackedWidget,
     QToolButton,
 )
-from PySide6.QtWidgets import QGridLayout, QSizePolicy
+from PySide6.QtWidgets import QGridLayout, QSizePolicy 
 from database import Database
 from resolver import (
     propose_reresolve_app, apply_reresolve_app, set_app_status,
@@ -33,7 +33,10 @@ from scraper import apply_choco_candidate, apply_manifest_candidate, ScrapeProgr
 from app_organizer import OrganizeDialog
 
 from monitor import MonitorJob
-from app_manager import execute_clean_library, update_scan_root_path, delete_scan_root
+from app_manager import (
+    execute_clean_library, update_scan_root_path, delete_scan_root,
+    apply_layout_change,
+)
 from scanner import resolve_scan_root_layout, list_top_level_folders, list_child_folders
 
 from gui_backend import (
@@ -509,13 +512,23 @@ class DetailPanel(QWidget):
         self.variants_table.setRowCount(len(variants))
         for i, v in enumerate(variants):
             scanned = (v["scanned_at"] or "")[:10]
-            values = [v["version"], v["file_name"], v["edition"], v["file_type"],
+            forced = bool(v["file_locked"]) if "file_locked" in v.keys() else False
+            file_display = v["file_name"] or ""
+            if forced:
+                file_display = f"🔒 {file_display}"
+            values = [v["version"], file_display, v["edition"], v["file_type"],
                       v["name_source"], scanned, v["source_path"]]
             for j, val in enumerate(values):
                 item = QTableWidgetItem(val or "")
                 item.setData(Qt.UserRole, v["id"])
                 if VARIANT_COLUMNS[j][0] == "scanned_at" and v["scanned_at"]:
                     item.setToolTip(v["scanned_at"])
+                if VARIANT_COLUMNS[j][0] == "file_name" and forced:
+                    item.setToolTip(
+                        f"Installer file manually locked (survives re-scans)\n"
+                        f"Locked file: {v['file_name'] or '(none)'}\n"
+                        f"Right-click → Clear installer file override to go back to auto."
+                    )
                 if v["is_ignored"]:
                     item.setForeground(Qt.gray)
                 self.variants_table.setItem(i, j, item)
@@ -840,10 +853,88 @@ class DetailPanel(QWidget):
                 rows.append(dict(row))
         return rows
 
-    def _variant_full_path(self, variant: dict) -> str:
-        if variant.get("file_name"):
-            return os.path.join(variant["source_path"], variant["file_name"])
-        return variant["source_path"]
+
+    def _change_variant_installer_file(self, variant: dict):
+        """
+        Let the user pick a different installer file for this variant.
+        Opens a normal file dialog rooted at the variant's source folder.
+        The chosen file's path RELATIVE to source_path (e.g. "setup.exe"
+        for a flat install unit, "Set/setup.exe" for a file inside a
+        single_app subtree) is stored on variants.file_name, and
+        variants.file_locked is set to 1, so the scanner keeps using this
+        file instead of auto-picking on future re-scans.
+
+        If the user picks a file OUTSIDE source_path, the override can't
+        be honored on a re-scan (the scanner only ever sees files under
+        source_path), so this is refused with a warning rather than
+        silently storing something the scanner will never find.
+        """
+        source_path = variant["source_path"]
+        if not os.path.isdir(source_path):
+            QMessageBox.warning(
+                self, "Folder not found",
+                f"The variant's source folder no longer exists:\n\n{source_path}",
+            )
+            return
+
+        current_full = self._variant_full_path(variant)
+        start_dir = os.path.dirname(current_full) if os.path.isfile(current_full) else source_path
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "Choose installer file", start_dir,
+            "Installer files (*.exe *.msi *.msix *.msixbundle *.zip *.rar *.7z *.iso)"
+            ";;All files (*)",
+        )
+        if not chosen:
+            return
+
+        # Compute the path of the chosen file RELATIVE to the variant's
+        # source folder -- this is exactly what the scanner needs to match
+        # it back on a re-scan (source_path + "/" + file_name must resolve
+        # to the chosen file). Works identically for a flat install unit
+        # (relpath is just the basename) and a single_app subtree (relpath
+        # may include subfolders like "Set/setup.exe").
+        try:
+            rel = os.path.relpath(chosen, source_path)
+        except ValueError:
+            # Windows: different drive letters -- relpath raises. Treat as
+            # "outside source_path" below.
+            rel = ""
+
+        if not rel or rel.startswith(".."):
+            QMessageBox.warning(
+                self, "Outside the app folder",
+                "The file you picked is not inside this variant's app folder:\n\n"
+                f"App folder: {source_path}\n"
+                f"Chosen file: {chosen}\n\n"
+                "The installer file must be somewhere inside the app folder "
+                "(including any of its subfolders). Please pick a file that "
+                "lives under that folder.",
+            )
+            return
+
+        conn = self.db.connect()
+        conn.execute(
+            "UPDATE variants SET file_name = ?, file_locked = 1, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (rel, variant["id"]),
+        )
+        conn.commit()
+        self.load_app(self.current_app_id)
+        self.app_changed.emit()
+        
+        
+    def _clear_variant_installer_file(self, variant: dict):
+        """Drop the override. Auto-pick takes over on the next re-scan;
+        the stored file_name stays as-is until then."""
+        conn = self.db.connect()
+        conn.execute(
+            "UPDATE variants SET file_locked = 0, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (variant["id"],),
+        )
+        conn.commit()
+        self.load_app(self.current_app_id)
+        self.app_changed.emit()
 
     def _show_variant_context_menu(self, pos):
         rows = self._selected_variant_rows()
@@ -852,6 +943,9 @@ class DetailPanel(QWidget):
         menu = QMenu(self)
         open_location_action = menu.addAction("Open file location")
         run_action = menu.addAction("Run / open file")
+        menu.addSeparator()
+        change_file_action = menu.addAction("Change installer file…")
+        clear_file_action = menu.addAction("Clear installer file override")
         menu.addSeparator()
         reeval_action = menu.addAction("Re-evaluate selected")
         scrape_action = menu.addAction("Scrape app metadata (Winget)")
@@ -862,6 +956,16 @@ class DetailPanel(QWidget):
         single = rows[0] if len(rows) == 1 else None
         open_location_action.setEnabled(single is not None)
         run_action.setEnabled(single is not None)
+        change_file_action.setEnabled(single is not None)
+        has_override = bool(single and single.get("file_locked"))
+        clear_file_action.setEnabled(has_override)
+        if single is not None and single.get("raw_candidate_id") is None:
+            # Monitor-created variants have no scan-root folder to key an
+            # override against -- the scan wouldn't know where to look.
+            change_file_action.setEnabled(False)
+            change_file_action.setToolTip(
+                "Not available for monitored files (no scan-root folder to attach to)"
+            )
 
         chosen = menu.exec(self.variants_table.viewport().mapToGlobal(pos))
         if chosen is None:
@@ -870,6 +974,10 @@ class DetailPanel(QWidget):
             self._open_file_location(self._variant_full_path(single))
         elif chosen == run_action and single:
             self._run_file(self._variant_full_path(single))
+        elif chosen == change_file_action and single:
+            self._change_variant_installer_file(single)
+        elif chosen == clear_file_action and single:
+            self._clear_variant_installer_file(single)
         elif chosen == reeval_action:
             self._reresolve()
         elif chosen == scrape_action:
@@ -880,7 +988,7 @@ class DetailPanel(QWidget):
                 self._open_search_match()
         elif chosen == ignore_action:
             self._ignore_selected_variant()
-
+            
     def _open_search_match(self):
         settings = self.db.get_all_settings()
         dialog = SearchMatchDialog(
@@ -889,8 +997,18 @@ class DetailPanel(QWidget):
         if dialog.exec():
             self.load_app(self.current_app_id)
             self.app_changed.emit()
+            
+    def _variant_full_path(self, variant: dict) -> str:
+        if variant.get("file_name"):
+            return os.path.normpath(
+                os.path.join(variant["source_path"], variant["file_name"])
+            )
+        return variant["source_path"]
 
     def _open_file_location(self, full_path: str):
+        full_path = os.path.normpath(full_path)
+        print(f"[open-location] {full_path}")
+
         folder = full_path if os.path.isdir(full_path) else os.path.dirname(full_path)
         if not os.path.exists(full_path):
             if os.path.isdir(folder):
@@ -922,7 +1040,8 @@ class DetailPanel(QWidget):
                 subprocess.run(["xdg-open", folder])
         except Exception as e:
             QMessageBox.warning(self, "Could not open location", str(e))
-
+            
+            
     def _run_file(self, full_path: str):
         if not os.path.exists(full_path):
             QMessageBox.warning(self, "File not found", f"{full_path}\n\ndoes not exist on disk.")
@@ -1203,6 +1322,11 @@ class FolderLayoutDialog(QDialog):
         # Working copy the dialog edits live; only written back on OK.
         self._working_layout = dict(self._saved_layout)
         self._rows = {}  # rel_key -> {"item", "combo", "rename", "preview", "rel_parts"}
+        # Populated by _on_ok() with the LayoutChangeResult from
+        # apply_layout_change() -- read by ScanRootsDialog to build the
+        # post-save status-bar message. None if the dialog was cancelled
+        # or nothing needed propagating.
+        self.layout_change_result = None
 
         title = "Folder layout — " + self.root_path
         if self.new_folder_names:
@@ -1489,9 +1613,30 @@ class FolderLayoutDialog(QDialog):
         # cheap to do on every save.
         pruned = _prune_orphaned_layout_keys(self.root_path, self._working_layout)
 
+        # Capture the pre-save top-level default so we can diff old vs
+        # new meaningfully below; save_folder_layout() writes the new
+        # one, so we must read the old value first.
+        old_toplevel_role = (
+            self.scan_root_row.get("unconfigured_toplevel_role") or "catalog"
+        )
+        new_toplevel_role = self.default_toplevel_combo.currentData()
+
+        # Save the layout first (that's what "save" means); then bring
+        # the catalog into agreement with it. Role changes delete the
+        # affected subtree's catalog entries so the next re-scan can
+        # rebuild them cleanly; label-only changes just update
+        # raw_candidates.catalog/subcatalog in place. See
+        # app_manager.apply_layout_change() and the Layout-Change
+        # Propagation plan for the full rationale.
         self.db.save_folder_layout(
             self.scan_root_row["id"], pruned,
-            unconfigured_toplevel_role=self.default_toplevel_combo.currentData(),
+            unconfigured_toplevel_role=new_toplevel_role,
+        )
+        self.layout_change_result = apply_layout_change(
+            self.db, self.scan_root_row["id"],
+            self._saved_layout, pruned,
+            old_unconfigured_toplevel_role=old_toplevel_role,
+            new_unconfigured_toplevel_role=new_toplevel_role,
         )
         self.accept()
 
@@ -1677,13 +1822,28 @@ class ScanRootsDialog(QDialog):
         if row is None:
             return
         dialog = FolderLayoutDialog(self.db, row, parent=self)
-        if dialog.exec() == QDialog.Accepted:
-            QMessageBox.information(
-                self, "Layout saved",
-                "Folder layout saved. Run \"Re-scan now\" to apply it -- existing "
-                "raw_candidates rows aren't changed until then.",
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._load_rows()
+
+        # No modal "saved" dialog: save is already a deliberate action,
+        # and the post-save status-bar message is the one-second signal
+        # to inspect before re-scanning. See the Layout-Change
+        # Propagation plan section 3.5.
+        result = getattr(dialog, "layout_change_result", None)
+        mw = self.parent()
+        if result is None or mw is None or not hasattr(mw, "status_label"):
+            return
+        if (result.raw_candidates_deleted or result.variants_deleted
+                or result.apps_deleted or result.label_updates):
+            mw.status_label.setText(
+                f"Layout saved. Removed {result.apps_deleted} app(s) / "
+                f"{result.variants_deleted} variant(s) "
+                f"({result.folders_affected} folder(s) affected). "
+                f"Re-scan to rebuild."
             )
-            self._load_rows()
+        else:
+            mw.status_label.setText("Layout saved. No catalog changes needed.")
 
     def _rescan(self, path: str):
         main_window = self.parent()
@@ -3231,6 +3391,383 @@ class CsvExportDialog(QDialog):
     def batch_size_value(self) -> int:
         return self.batch_size.value() if self.batch_toggle.isChecked() else 0
 
+class RefineNamesDialog(QDialog):
+    """
+    One-time name refinement for a selection of apps. The user points at a
+    token ("Ultimate", "Lite", "Repack") and says what it is. By default
+    the rules apply ONLY to this run, only to the selected apps -- the
+    settings DB is never written to, so the change can't leak into other
+    apps or into future scans/re-resolves. Ticking "Also save permanently"
+    writes the rules into the corresponding settings lists.
+
+    Release-tag rules are always one-time (they need a regex under the
+    hood, and there's no user-facing regex helper yet) -- the permanent
+    checkbox is disabled when any such rule is present.
+    """
+
+    KIND_OPTIONS = [
+        ("edition",     "Edition — moves the token to the Edition field"),
+        ("language",    "Language — moves the token to the Language field"),
+        ("arch_x64",    "Architecture: x64"),
+        ("arch_x86",    "Architecture: x86"),
+        ("arch_arm64",  "Architecture: arm64"),
+        ("release",     "Release tag — removes the token entirely (one-time only)"),
+        ("ignore_word", "Ignore word — removes the token from file names"),
+    ]
+
+    def __init__(self, db: Database, app_ids: list, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.app_ids = list(app_ids)
+        self.applied_count = 0
+        self.saved_permanently = False
+
+        self.setWindowTitle(f"Refine names — {len(self.app_ids)} app(s)")
+        self.resize(780, 640)
+        outer = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Add a rule per token you want the resolver to treat differently. "
+            "By default each rule applies <b>only to this run</b>, only to the "
+            "selected apps — nothing is saved and future scans/re-resolves are "
+            "unaffected. Tick the box at the bottom to also save the rules "
+            "permanently."
+        )
+        intro.setWordWrap(True)
+        outer.addWidget(intro)
+
+        outer.addWidget(QLabel("<b>Rules</b>"))
+        self.rules_table = QTableWidget(0, 3)
+        self.rules_table.setHorizontalHeaderLabels(["Token", "Treat as", ""])
+        self.rules_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.rules_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.rules_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        outer.addWidget(self.rules_table)
+
+        add_row = QHBoxLayout()
+        add_btn = QPushButton("+ Add rule")
+        add_btn.clicked.connect(self._add_rule_row)
+        add_row.addWidget(add_btn)
+        add_row.addStretch()
+        outer.addLayout(add_row)
+
+        outer.addWidget(QLabel("<b>Preview</b> — apps whose name will change"))
+        self.preview_table = QTableWidget(0, 3)
+        self.preview_table.setHorizontalHeaderLabels(
+            ["Current name", "New name", "Rule effect"]
+        )
+        self.preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.preview_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        outer.addWidget(self.preview_table)
+
+        self.preview_note = QLabel("")
+        self.preview_note.setWordWrap(True)
+        outer.addWidget(self.preview_note)
+
+        self.save_permanent_check = QCheckBox(
+            "Also save these rules permanently "
+            "(future scans/re-resolves will apply them everywhere)"
+        )
+        outer.addWidget(self.save_permanent_check)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        self.apply_btn = QPushButton("Apply")
+        self.apply_btn.clicked.connect(self._apply)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(self.apply_btn)
+        outer.addLayout(btn_row)
+
+        # Debounced live preview -- rules change faster than we want to
+        # run re-resolve proposals, so wait 250ms after the last edit.
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(250)
+        self._preview_timer.timeout.connect(self._refresh_preview)
+
+        self._add_rule_row()   # start with one empty row
+        self._refresh_preview()
+
+    # -- rules table ---------------------------------------------------
+
+    def _add_rule_row(self):
+        row = self.rules_table.rowCount()
+        self.rules_table.insertRow(row)
+
+        token_edit = QLineEdit()
+        token_edit.setPlaceholderText("e.g. Lite")
+        token_edit.textChanged.connect(self._on_rules_changed)
+        self.rules_table.setCellWidget(row, 0, token_edit)
+
+        kind_combo = QComboBox()
+        for value, label in self.KIND_OPTIONS:
+            kind_combo.addItem(label, value)
+        kind_combo.currentIndexChanged.connect(self._on_rules_changed)
+        self.rules_table.setCellWidget(row, 1, kind_combo)
+
+        remove_btn = QPushButton("✕")
+        remove_btn.setFixedWidth(30)
+        remove_btn.clicked.connect(
+            lambda _checked=False, b=remove_btn: self._remove_rule_row(b)
+        )
+        self.rules_table.setCellWidget(row, 2, remove_btn)
+
+    def _remove_rule_row(self, button):
+        for row in range(self.rules_table.rowCount()):
+            if self.rules_table.cellWidget(row, 2) is button:
+                self.rules_table.removeRow(row)
+                break
+        self._on_rules_changed()
+
+    def _collect_rules(self) -> list:
+        rules = []
+        for row in range(self.rules_table.rowCount()):
+            token_edit = self.rules_table.cellWidget(row, 0)
+            kind_combo = self.rules_table.cellWidget(row, 1)
+            if token_edit is None or kind_combo is None:
+                continue
+            token = token_edit.text().strip()
+            if token:
+                rules.append((token, kind_combo.currentData()))
+        return rules
+
+    def _on_rules_changed(self):
+        self._update_permanent_availability()
+        self._preview_timer.start()
+
+    def _update_permanent_availability(self):
+        has_release = any(kind == "release" for _, kind in self._collect_rules())
+        self.save_permanent_check.setEnabled(not has_release)
+        if has_release:
+            self.save_permanent_check.setChecked(False)
+            self.save_permanent_check.setToolTip(
+                "Release-tag rules are regex-based. Saving them permanently "
+                "needs a regex helper (coming later) — this run still applies "
+                "them one-time."
+            )
+        else:
+            self.save_permanent_check.setToolTip("")
+
+    # -- override / preview --------------------------------------------
+
+    def _build_override(self, rules: list, settings: dict) -> dict:
+        """Build a settings dict that supersedes the DB's settings for one run.
+        Multiple rules of the same kind accumulate (list entries are appended,
+        dict entries merged) rather than the later rule overwriting the earlier."""
+        override = {}
+        for token, kind in rules:
+            if kind == "edition":
+                key = "edition_keywords"
+                current = override.get(key)
+                if current is None:
+                    current = list(settings.get(key, []))
+                if token.lower() not in {w.lower() for w in current}:
+                    current.append(token)
+                override[key] = current
+
+            elif kind == "language":
+                key = "language_keywords"
+                current = override.get(key)
+                if current is None:
+                    current = dict(settings.get(key, {}))
+                current[token.lower()] = token.title()
+                override[key] = current
+
+            elif kind in ("arch_x64", "arch_x86", "arch_arm64"):
+                key = "architecture_keywords"
+                arch = kind.split("_", 1)[1]
+                current = override.get(key)
+                if current is None:
+                    current = {k: list(v) for k, v in settings.get(key, {}).items()}
+                current.setdefault(arch, [])
+                if token not in current[arch]:
+                    current[arch].append(token)
+                override[key] = current
+
+            elif kind == "release":
+                key = "release_tag_patterns"
+                current = override.get(key)
+                if current is None:
+                    current = list(settings.get(key, []))
+                current.append(r"\b" + re.escape(token) + r"\b")
+                override[key] = current
+
+            elif kind == "ignore_word":
+                key = "ignore_filename_words"
+                current = override.get(key)
+                if current is None:
+                    current = list(settings.get(key, []))
+                if token.lower() not in {w.lower() for w in current}:
+                    current.append(token)
+                override[key] = current
+
+        return override
+    
+    def _refresh_preview(self):
+        rules = self._collect_rules()
+        self.preview_table.setRowCount(0)
+
+        settings = self.db.get_all_settings()
+        override = self._build_override(rules, settings)
+        conn = self.db.connect()
+
+        n_changed = 0
+        for app_id in self.app_ids:
+            row = conn.execute(
+                "SELECT name FROM apps WHERE id = ?", (app_id,)
+            ).fetchone()
+            if row is None:
+                continue
+            current_name = row["name"] or ""
+            try:
+                proposal = propose_reresolve_app(
+                    self.db, app_id, settings_override=override
+                )
+                proposed_name = proposal.get("proposed_name") or current_name
+            except Exception as exc:
+                print(f"[refine-names] proposal failed for app {app_id}: {exc!r}")
+                proposed_name = current_name
+
+            effects = self._describe_effects(rules, current_name, proposed_name)
+
+            i = self.preview_table.rowCount()
+            self.preview_table.insertRow(i)
+            self.preview_table.setItem(i, 0, QTableWidgetItem(current_name))
+            self.preview_table.setItem(i, 1, QTableWidgetItem(proposed_name))
+            self.preview_table.setItem(i, 2, QTableWidgetItem(effects))
+            if proposed_name != current_name:
+                n_changed += 1
+
+        n_total = len(self.app_ids)
+        if not rules:
+            self.preview_note.setText(
+                f"Add at least one rule above to see what changes. "
+                f"Previewing {n_total} selected app(s)."
+            )
+            self.apply_btn.setEnabled(False)
+        elif n_changed == 0:
+            self.preview_note.setText(
+                f"None of the {n_total} selected app(s) would change with these rules."
+            )
+            self.apply_btn.setEnabled(False)
+        else:
+            self.preview_note.setText(
+                f"{n_changed} of {n_total} selected app(s) would change name."
+            )
+            self.apply_btn.setEnabled(True)
+
+    def _describe_effects(self, rules, current_name, proposed_name) -> str:
+        """
+        For each rule, check whether its token was actually consumed by the
+        resolver for THIS app -- i.e. it appeared in the current name and no
+        longer appears in the proposed name. If so, describe where it went:
+          - Edition / Language / Architecture -> moved into that metadata field
+          - Release tag / Ignore word         -> stripped entirely, no field
+        Uses a whole-word boundary match, mirroring how the resolver itself
+        matches edition/language tokens (so 'en' matches the standalone "EN"
+        in "Smart Pack1 5 EN" but not the "en" inside "Extended").
+        """
+        if not rules:
+            return ""
+        curr = current_name.lower()
+        prop = proposed_name.lower()
+        parts = []
+        for token, kind in rules:
+            pattern = r"\b" + re.escape(token.lower()) + r"\b"
+            if re.search(pattern, curr) and not re.search(pattern, prop):
+                label = {
+                    "edition":     "moved to Edition",
+                    "language":    "moved to Language",
+                    "arch_x64":    "moved to Architecture (x64)",
+                    "arch_x86":    "moved to Architecture (x86)",
+                    "arch_arm64":  "moved to Architecture (arm64)",
+                    "release":     "stripped (release tag)",
+                    "ignore_word": "stripped (filename word)",
+                }.get(kind, f"applied as {kind}")
+                parts.append(f"'{token}' \u2192 {label}")
+        return "; ".join(parts)
+
+
+    # -- apply ---------------------------------------------------------
+
+    def _apply(self):
+        rules = self._collect_rules()
+        if not rules:
+            return
+        settings = self.db.get_all_settings()
+        override = self._build_override(rules, settings)
+
+        if self.save_permanent_check.isChecked():
+            self._save_rules_permanently(rules, settings)
+            self.saved_permanently = True
+
+        applied = 0
+        for app_id in self.app_ids:
+            try:
+                proposal = propose_reresolve_app(
+                    self.db, app_id, settings_override=override
+                )
+                accepted_app_fields = {
+                    f for f in ("name", "catalog", "subcatalog")
+                    if not proposal[f"{f}_locked"]
+                }
+                accepted_variant_ids = {
+                    vp["variant_id"] for vp in proposal["variants"]
+                    if not vp["version_locked"]
+                }
+                apply_reresolve_app(
+                    self.db, proposal, accepted_app_fields, accepted_variant_ids
+                )
+                applied += 1
+            except Exception:
+                pass
+        self.applied_count = applied
+        self.accept()
+
+    def _save_rules_permanently(self, rules, settings):
+        # Work on a mutable copy that accumulates across rules, so two
+        # "edition" rules don't clobber each other on the second write.
+        working = {
+            k: (list(v) if isinstance(v, list)
+                else dict(v) if isinstance(v, dict) else v)
+            for k, v in settings.items()
+        }
+        dirty = set()
+        for token, kind in rules:
+            if kind == "edition":
+                key = "edition_keywords"
+                if token.lower() not in {w.lower() for w in working.get(key, [])}:
+                    working.setdefault(key, []).append(token)
+                    dirty.add(key)
+            elif kind == "language":
+                key = "language_keywords"
+                d = working.setdefault(key, {})
+                if token.lower() not in d:
+                    d[token.lower()] = token.title()
+                    dirty.add(key)
+            elif kind in ("arch_x64", "arch_x86", "arch_arm64"):
+                key = "architecture_keywords"
+                arch = kind.split("_", 1)[1]
+                d = working.setdefault(key, {})
+                d.setdefault(arch, [])
+                if token not in d[arch]:
+                    d[arch].append(token)
+                    dirty.add(key)
+            elif kind == "ignore_word":
+                key = "ignore_filename_words"
+                if token.lower() not in {w.lower() for w in working.get(key, [])}:
+                    working.setdefault(key, []).append(token)
+                    dirty.add(key)
+        for key in dirty:
+            self.db.set_setting(
+                key, working[key], bump_version=True,
+                note=f"refine-names: added rules to {key}",
+            )
+
 
 # =============================================================
 # Main window
@@ -3621,9 +4158,20 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
 
+        refine_action = menu.addAction(
+            f"Refine names (one-time)… — {len(app_ids)} apps"
+            if len(app_ids) > 1 else "Refine names (one-time)…"
+        )
+        refine_action.setToolTip(
+            "Point at a token ('Lite', 'Ultimate', 'Repack') and say what it is. "
+            "Rules apply ONLY to this run and to the selected apps — nothing is "
+            "saved unless you tick the box in the dialog."
+        )
+
+        menu.addSeparator()
+
         delete_action = menu.addAction("Delete selected")
         delete_action.triggered.connect(self.delete_selected_apps)
-
         open_loc_action = menu.addAction("Open file location")
         open_loc_action.triggered.connect(self.open_selected_location)
 
@@ -3641,6 +4189,22 @@ class MainWindow(QMainWindow):
                 self.refresh_all()
                 if self.detail_panel.current_app_id == app_ids[0]:
                     self.detail_panel.load_app(app_ids[0])
+        elif chosen == refine_action:
+            self._open_refine_names_dialog(app_ids)
+
+    def _open_refine_names_dialog(self, app_ids):
+        dialog = RefineNamesDialog(self.db, app_ids, parent=self)
+        if not dialog.exec():
+            return
+        if dialog.saved_permanently:
+            self.status_label.setText(
+                f"Refined {dialog.applied_count} app(s). Rules saved permanently."
+            )
+        else:
+            self.status_label.setText(
+                f"Refined {dialog.applied_count} app(s) (one-time rules — not saved)."
+            )
+        self.refresh_all()
 
     def delete_selected_apps(self):
         app_ids = self._selected_app_ids()

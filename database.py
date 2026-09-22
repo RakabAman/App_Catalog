@@ -48,7 +48,9 @@ CREATE TABLE IF NOT EXISTS scan_roots (
     path            TEXT NOT NULL UNIQUE,
     last_scan_started_at   TEXT,
     last_scan_finished_at  TEXT,
-    last_scan_status        TEXT      -- running | completed | failed | cancelled
+    last_scan_status        TEXT,      -- running | completed | failed | cancelled
+    unconfigured_toplevel_role TEXT NOT NULL DEFAULT 'catalog',
+    folder_layouts_json     TEXT NOT NULL DEFAULT '{}'
 );
 
 -- ---------------------------------------------------------------------
@@ -89,6 +91,14 @@ CREATE TABLE IF NOT EXISTS raw_candidates (
     -- classification of the folder itself
     unit_type              TEXT,                   -- install_unit | container | noise | unresolved
     unit_type_reason        TEXT,
+
+    -- Single App/Variant folder layout role (see scanner.resolve_scan_root_
+    -- layout()): an explicit manual rename on a "single_app" folder is used
+    -- verbatim as the app/variant name, bypassing extract_fields()'s normal
+    -- file/folder/parent-folder cascade entirely. NULL for every ordinary
+    -- candidate; only ever set when the user typed a rename on a
+    -- single_app-role folder in FolderLayoutDialog.
+    forced_name             TEXT,
 
     -- fingerprint for incremental re-scan (skip unchanged folders)
     fingerprint             TEXT,                  -- hash of (path, mtime, size, file list)
@@ -300,6 +310,7 @@ class Database:
         conn.executescript(DDL)
         conn.commit()
         self._run_migrations()
+        self._fix_bad_skip_roots()   # <-- add this
         self._ensure_defaults()
 
     def _run_migrations(self):
@@ -361,6 +372,17 @@ class Database:
             # promoted parent that was never explicitly added doesn't
             # silently start getting scanned too.
             ("scan_roots", "unconfigured_toplevel_role", "TEXT DEFAULT 'catalog'"),
+            # Single App/Variant folder role: a manual rename on such a
+            # folder is stored here and used verbatim as the app/variant
+            # name (see scanner.walk_scan_root()'s single_app branch and
+            # resolver.run_resolve()). NULL means "resolve normally".
+            ("raw_candidates", "forced_name", "TEXT"),
+            # Variant file override: the user picked a specific file to
+            # represent this variant's install unit (via the variant
+            # table's "Change installer file…" action). When set, the
+            # scanner uses this file instead of auto-picking, so the
+            # choice survives re-scans. NULL = auto-pick as usual.
+            ("variants", "file_locked", "INTEGER DEFAULT 0"),           
         ]
         for table, column, coldef in migrations:
             try:
@@ -369,6 +391,61 @@ class Database:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+
+    def _fix_bad_skip_roots(self):
+        """
+        One-time data fix. An older build shipped DEFAULT 'skip' for
+        scan_roots.unconfigured_toplevel_role, and because ALTER TABLE
+        can't change a default once the column exists, that value
+        persisted into every fresh scan root. FolderLayoutDialog then
+        wrote it explicitly into every top-level layout entry on first
+        save, so the root silently skipped everything on every scan.
+
+        Fingerprint: unconfigured_toplevel_role = 'skip' AND the layout
+        contains ONLY 'skip' entries with no name overrides (or is
+        empty). If the user ever deliberately configured anything (a
+        rename, a non-skip role anywhere), leave the root alone. Reset
+        role to 'catalog' and drop the auto-written 'skip' entries so
+        the next dialog open shows them at the new default. Anybody who
+        genuinely wants everything skipped can re-set it from the
+        dialog in one click.
+        """
+        conn = self.connect()
+
+        def _only_skip(entry) -> bool:
+            if entry == "skip":
+                return True
+            if isinstance(entry, dict):
+                return entry.get("role") == "skip" and not entry.get("name")
+            return False
+
+        rows = conn.execute(
+            "SELECT id, folder_layouts_json FROM scan_roots "
+            "WHERE unconfigured_toplevel_role = 'skip'"
+        ).fetchall()
+        fixed = 0
+        for r in rows:
+            try:
+                layout = json.loads(r["folder_layouts_json"] or "{}")
+            except (TypeError, ValueError):
+                layout = {}
+            if not isinstance(layout, dict):
+                layout = {}
+            # Empty layout -> suspicious (dialog hasn't written any yet),
+            # or every entry is 'skip' with no overrides -> suspicious.
+            if layout and not all(_only_skip(v) for v in layout.values()):
+                continue  # user configured something real; leave it alone
+            # Reset: drop the auto-written 'skip' entries and flip the
+            # root's role back to the normal default.
+            layout = {k: v for k, v in layout.items() if not _only_skip(v)}
+            conn.execute(
+                "UPDATE scan_roots SET unconfigured_toplevel_role = 'catalog', "
+                "folder_layouts_json = ? WHERE id = ?",
+                (json.dumps(layout), r["id"]),
+            )
+            fixed += 1
+        if fixed:
+            conn.commit()
 
     def _ensure_defaults(self):
         # Only seed defaults for keys that don't already exist, so
@@ -499,18 +576,20 @@ class Database:
         return dict(row) if row else None
 
     def ensure_scan_root(self, path: str) -> int:
-        """
-        Returns the id of the scan_roots row for `path`, inserting a bare
-        placeholder row if one doesn't exist yet. Used by the GUI to open
-        FolderLayoutDialog *before* a scan job runs (scan_roots rows are
-        normally created/updated by scanner._upsert_scan_root at scan
-        time) -- safe to call unconditionally since it's insert-if-missing.
-        """
         conn = self.connect()
         row = conn.execute("SELECT id FROM scan_roots WHERE path = ?", (path,)).fetchone()
         if row:
             return row["id"]
-        cur = conn.execute("INSERT INTO scan_roots (path) VALUES (?)", (path,))
+        # Explicit values here so this never inherits whatever default
+        # the table happens to carry -- an older build shipped with
+        # DEFAULT 'skip' on this column, and ALTER TABLE can't change a
+        # default once the column exists, so a bare INSERT would silently
+        # skip every top-level folder under a fresh root.
+        cur = conn.execute(
+            "INSERT INTO scan_roots (path, unconfigured_toplevel_role, folder_layouts_json) "
+            "VALUES (?, 'catalog', '{}')",
+            (path,),
+        )
         conn.commit()
         return cur.lastrowid
 
