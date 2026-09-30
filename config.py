@@ -481,6 +481,20 @@ DEFAULT_SETTINGS = {
     # in the report if it isn't present.
     "monitor_archive_format": "7z",
 
+    # Optional password protection for archives THIS APP CREATES (both
+    # Organize > Reorganize Files and Monitor). When enabled, every new
+    # archive is encrypted with `archive_password` and the password is
+    # appended to the archive's filename in parentheses, e.g.
+    # "Setup.exe" -> "Setup(mypass).7z". Because the password is right
+    # there in the name this is NOT confidentiality -- it's the common
+    # "password-in-filename" convention (stops antivirus/scanners and
+    # casual previewers from opening the installer inside). The
+    # password therefore may not contain characters that are illegal in
+    # Windows filenames or parentheses; see app_manager.
+    # validate_archive_password().
+    "archive_password_enabled": False,
+    "archive_password": "",
+
     # Move (default) vs copy -- chosen per-run in the start dialog, this
     # is just the default the dialog pre-selects.
     "monitor_move_mode": "move",

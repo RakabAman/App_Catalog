@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QPlainTextEdit, QTabWidget, QScrollArea, QGroupBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit, QInputDialog,
     QMenu, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QStackedWidget,
-    QToolButton,
+    QToolButton, QWidgetAction,
 )
 from PySide6.QtWidgets import QGridLayout, QSizePolicy 
 from database import Database
@@ -34,6 +34,7 @@ from app_organizer import OrganizeDialog
 
 from monitor import MonitorJob
 from app_manager import (
+    validate_archive_password,
     execute_clean_library, update_scan_root_path, delete_scan_root,
     apply_layout_change,
 )
@@ -93,6 +94,11 @@ VARIANT_COLUMNS = [
     ("path", "Path"),
 ]
 
+# Variant columns the user may edit in place. Editing sets
+# variants.version_locked = 1 so a later Re-resolve won't overwrite
+# the manual edit (same lock convention as app name/catalog/subcatalog).
+EDITABLE_VARIANT_COLUMNS = {"version", "edition"}
+
 
 class DetailPanel(QWidget):
     app_changed = Signal()
@@ -112,6 +118,7 @@ class DetailPanel(QWidget):
         # also fires editingFinished and would otherwise cause spurious
         # DB writes every time the user tabs through a field).
         self._baseline: dict = {}
+        self._loading_variants = False
         self._build_ui()
         self.clear()
 
@@ -314,7 +321,10 @@ class DetailPanel(QWidget):
         self.variants_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.variants_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.variants_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.variants_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.variants_table.setEditTriggers(
+            QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed
+        )
+        self.variants_table.itemChanged.connect(self._on_variant_item_changed)
         self.variants_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.variants_table.customContextMenuRequested.connect(self._show_variant_context_menu)
         vbox.addWidget(self.variants_table)
@@ -508,32 +518,41 @@ class DetailPanel(QWidget):
                WHERE v.app_id = ? ORDER BY v.version""",
             (app_id,),
         ).fetchall()
-        self.variants_table.setSortingEnabled(False)
-        self.variants_table.setRowCount(len(variants))
-        for i, v in enumerate(variants):
-            scanned = (v["scanned_at"] or "")[:10]
-            forced = bool(v["file_locked"]) if "file_locked" in v.keys() else False
-            file_display = v["file_name"] or ""
-            if forced:
-                file_display = f"🔒 {file_display}"
-            values = [v["version"], file_display, v["edition"], v["file_type"],
-                      v["name_source"], scanned, v["source_path"]]
-            for j, val in enumerate(values):
-                item = QTableWidgetItem(val or "")
-                item.setData(Qt.UserRole, v["id"])
-                if VARIANT_COLUMNS[j][0] == "scanned_at" and v["scanned_at"]:
-                    item.setToolTip(v["scanned_at"])
-                if VARIANT_COLUMNS[j][0] == "file_name" and forced:
-                    item.setToolTip(
-                        f"Installer file manually locked (survives re-scans)\n"
-                        f"Locked file: {v['file_name'] or '(none)'}\n"
-                        f"Right-click → Clear installer file override to go back to auto."
-                    )
-                if v["is_ignored"]:
-                    item.setForeground(Qt.gray)
-                self.variants_table.setItem(i, j, item)
-        self.variants_table.setSortingEnabled(True)
-        self.variants_table.resizeColumnsToContents()
+        self._loading_variants = True
+        try:
+            self.variants_table.setSortingEnabled(False)
+            self.variants_table.setRowCount(len(variants))
+            for i, v in enumerate(variants):
+                scanned = (v["scanned_at"] or "")[:10]
+                forced = bool(v["file_locked"]) if "file_locked" in v.keys() else False
+                file_display = v["file_name"] or ""
+                if forced:
+                    file_display = f"🔒 {file_display}"
+                values = [v["version"], file_display, v["edition"], v["file_type"],
+                          v["name_source"], scanned, v["source_path"]]
+                for j, val in enumerate(values):
+                    item = QTableWidgetItem(val or "")
+                    item.setData(Qt.UserRole, v["id"])
+                    col_key = VARIANT_COLUMNS[j][0]
+                    if col_key in EDITABLE_VARIANT_COLUMNS:
+                        item.setFlags(item.flags() | Qt.ItemIsEditable)
+                    else:
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    if col_key == "scanned_at" and v["scanned_at"]:
+                        item.setToolTip(v["scanned_at"])
+                    if col_key == "file_name" and forced:
+                        item.setToolTip(
+                            f"Installer file manually locked (survives re-scans)\n"
+                            f"Locked file: {v['file_name'] or '(none)'}\n"
+                            f"Right-click → Clear installer file override to go back to auto."
+                        )
+                    if v["is_ignored"]:
+                        item.setForeground(Qt.gray)
+                    self.variants_table.setItem(i, j, item)
+            self.variants_table.setSortingEnabled(True)
+            self.variants_table.resizeColumnsToContents()
+        finally:
+            self._loading_variants = False
 
         # Snapshot the editable-field values now that everything's
         # populated, so _commit_* knows the "no change" baseline.
@@ -814,6 +833,59 @@ class DetailPanel(QWidget):
         self.load_app(self.current_app_id)
         self.app_changed.emit()
 
+    def _on_variant_item_changed(self, item):
+        """Commit an in-place edit of a variant's version or edition.
+        Sets version_locked so a later Re-resolve won't clobber it."""
+        if self._loading_variants:
+            return
+        col = item.column()
+        if not (0 <= col < len(VARIANT_COLUMNS)):
+            return
+        key = VARIANT_COLUMNS[col][0]
+        if key not in EDITABLE_VARIANT_COLUMNS:
+            return
+        vid = item.data(Qt.UserRole)
+        if vid is None:
+            return
+        new_value = item.text().strip()
+        conn = self.db.connect()
+        row = conn.execute("SELECT * FROM variants WHERE id = ?", (vid,)).fetchone()
+        if row is None:
+            return
+        old_value = (row[key] or "")
+        if new_value == old_value:
+            return
+        conn.execute(
+            f"UPDATE variants SET {key} = ?, version_locked = 1, "
+            f"updated_at = datetime('now') WHERE id = ?",
+            (new_value or None, vid),
+        )
+        conn.commit()
+        # Defer the refresh so we don't tear down the table mid-edit.
+        QTimer.singleShot(0, self.app_changed.emit)
+
+    def _delete_selected_variants(self):
+        vids = {item.data(Qt.UserRole)
+                for item in self.variants_table.selectedItems()}
+        vids = [v for v in vids if v is not None]
+        if not vids:
+            QMessageBox.information(self, "No selection", "Select a variant row first.")
+            return
+        confirm = QMessageBox.question(
+            self, "Delete variant(s)",
+            f"Delete {len(vids)} variant(s) from this app?\n\n"
+            "This removes the catalog record only — no files are touched on disk. "
+            "A future re-scan can re-add any file that is still present.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        for vid in vids:
+            delete_variant(self.db, vid)
+        if self.current_app_id is not None:
+            self.load_app(self.current_app_id)
+        self.app_changed.emit()
+
     def _move_selected_variant(self):
         vid = self._selected_variant_id()
         if vid is None:
@@ -952,6 +1024,7 @@ class DetailPanel(QWidget):
         choco_action = menu.addAction("Search & match…")
         menu.addSeparator()
         ignore_action = menu.addAction("Ignore selected")
+        delete_variants_action = menu.addAction("Delete selected variant(s)")
 
         single = rows[0] if len(rows) == 1 else None
         open_location_action.setEnabled(single is not None)
@@ -988,6 +1061,8 @@ class DetailPanel(QWidget):
                 self._open_search_match()
         elif chosen == ignore_action:
             self._ignore_selected_variant()
+        elif chosen == delete_variants_action:
+            self._delete_selected_variants()
             
     def _open_search_match(self):
         settings = self.db.get_all_settings()
@@ -2377,6 +2452,37 @@ class SettingsDialog(QDialog):
         )
 
         layout.addWidget(box2)
+
+        # -- password protection for archives this app CREATES --
+        box3 = self._group("Creating archives -- password protection")
+        v3 = box3._inner_layout
+
+        self.archive_pw_enabled = QCheckBox(
+            "Password-protect archives created by Reorganize and Monitor")
+        self.archive_pw_enabled.setChecked(
+            bool(settings.get("archive_password_enabled", False)))
+
+        self.archive_pw_edit = QLineEdit(settings.get("archive_password") or "")
+        self.archive_pw_edit.setPlaceholderText("password")
+        self.archive_pw_edit.setEnabled(self.archive_pw_enabled.isChecked())
+        self.archive_pw_enabled.toggled.connect(self.archive_pw_edit.setEnabled)
+
+        v3.addWidget(self.archive_pw_enabled)
+        v3.addWidget(self._labeled(
+            "Password",
+            self.archive_pw_edit,
+            "The password is also written into each archive's filename in "
+            "brackets, e.g. Setup.exe becomes Setup(password).7z -- so it is "
+            "never lost, but it is NOT secret. Avoid \\ / : * ? \" < > | ( ) "
+            "since they can't appear in a filename. This is the default; "
+            "the Reorganize tab and the Monitor start dialog can override it "
+            "for a single run."))
+        v3.addWidget(self._desc(
+            "Encryption backends: 7z needs py7zr (or a 7z binary for the "
+            "monitor); zip needs pyzipper or a 7z binary on PATH; RAR needs "
+            "rar/WinRAR on PATH. If the password can't be applied, the file is "
+            "left uncompressed -- it is never archived unprotected."))
+        layout.addWidget(box3)
         layout.addStretch()
 
     def _pick_archive_scratch_dir(self):
@@ -3123,6 +3229,12 @@ class SettingsDialog(QDialog):
     # =====================================================================
 
     def _save(self):
+        # -- Archive password: validate first so a bad one never gets saved --
+        if self.archive_pw_enabled.isChecked():
+            pw_err = validate_archive_password(self.archive_pw_edit.text())
+            if pw_err:
+                QMessageBox.warning(self, "Archive password", pw_err)
+                return
         # -- Variant Matching --
         self.db.set_setting("confidence_auto_accept", self.auto_accept.value(),
                             bump_version=True, note="settings dialog save")
@@ -3338,6 +3450,12 @@ class SettingsDialog(QDialog):
                             self.monitor_move_mode.currentText(), bump_version=False)
         self.db.set_setting("monitor_auto_scrape_on_attach",
                             self.monitor_auto_scrape.isChecked(), bump_version=False)
+
+        # -- Archive password protection --
+        self.db.set_setting("archive_password_enabled",
+                            self.archive_pw_enabled.isChecked(), bump_version=False)
+        self.db.set_setting("archive_password", self.archive_pw_edit.text(),
+                            bump_version=False)
 
         self.accept()
 
@@ -3911,9 +4029,10 @@ class MainWindow(QMainWindow):
 
         self.catalog_tree = QTreeWidget()
         self.catalog_tree.setHeaderHidden(True)
+        self.catalog_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.catalog_tree.addTopLevelItem(self._make_catalog_node("(all catalogs)"))
         self.catalog_tree.setCurrentItem(self.catalog_tree.topLevelItem(0))
-        self.catalog_tree.currentItemChanged.connect(lambda *_: self._apply_filters())
+        self.catalog_tree.itemSelectionChanged.connect(lambda *_: self._apply_filters())
         self.catalog_tree.setMaximumWidth(240)
         splitter.addWidget(self.catalog_tree)
 
@@ -4027,11 +4146,14 @@ class MainWindow(QMainWindow):
         # A filter (search text / catalog / status) could be hiding the
         # row entirely -- clear it so "jump to app" always works, not just
         # when the current filter happens to include it.
-        if getattr(self.model, "search_text", "") or self.model.catalog_filter or \
-           getattr(self.model, "subcatalog_filter", None) or self.model.status_filter or \
-           getattr(self.model, "scrape_status_filter", None):
+        if getattr(self.model, "search_text", "") or self.model.catalog_filter_spec or \
+           self.model.status_filter or getattr(self.model, "scrape_status_filter", None):
             self.search_box.clear()
-            self.catalog_tree.setCurrentItem(self.catalog_tree.topLevelItem(0))  # "(all catalogs)"
+            self.catalog_tree.clearSelection()
+            all_item = self.catalog_tree.topLevelItem(0)
+            if all_item is not None:
+                all_item.setSelected(True)
+                self.catalog_tree.setCurrentItem(all_item)
             if hasattr(self, "status_combo"):
                 self.status_combo.setCurrentIndex(0)
             if hasattr(self, "scrape_status_combo"):
@@ -4055,15 +4177,21 @@ class MainWindow(QMainWindow):
         item.setData(0, Qt.UserRole, {"catalog": catalog, "subcatalog": subcatalog})
         return item
 
-    def _current_catalog_selection(self) -> tuple[Optional[str], Optional[str]]:
-        """(catalog, subcatalog) for whatever's selected in the left tree --
-        both None for "(all catalogs)", subcatalog None for a catalog-level
-        node, both set for a subcatalog leaf."""
-        item = self.catalog_tree.currentItem()
-        if item is None:
-            return None, None
-        data = item.data(0, Qt.UserRole) or {}
-        return data.get("catalog"), data.get("subcatalog")
+    def _current_catalog_selections(self) -> list[tuple[Optional[str], Optional[str]]]:
+        """Every selected (catalog, subcatalog) pair. (None, None) means
+        '(all catalogs)' is picked; if nothing is selected we default to it."""
+        items = self.catalog_tree.selectedItems()
+        if not items:
+            return [(None, None)]
+        seen = set()
+        out: list[tuple[Optional[str], Optional[str]]] = []
+        for item in items:
+            data = item.data(0, Qt.UserRole) or {}
+            pair = (data.get("catalog"), data.get("subcatalog"))
+            if pair not in seen:
+                seen.add(pair)
+                out.append(pair)
+        return out
 
     def refresh_all(self, preserve_state: bool = True):
         """
@@ -4076,27 +4204,32 @@ class MainWindow(QMainWindow):
         # Update column visibility
         self._apply_column_visibility()
 
-        # Update catalog/subcatalog tree, preserving the selected
+        # Update catalog/subcatalog tree, preserving every selected
         # (catalog, subcatalog) pair rather than raw text -- a subcatalog
         # name could otherwise collide with an unrelated catalog's name.
-        prev_catalog, prev_subcatalog = self._current_catalog_selection()
+        prev_selections = set(self._current_catalog_selections())
         self.catalog_tree.blockSignals(True)
         self.catalog_tree.clear()
         all_item = self._make_catalog_node("(all catalogs)")
         self.catalog_tree.addTopLevelItem(all_item)
-        selected_item = all_item if prev_catalog is None else None
+        if (None, None) in prev_selections:
+            all_item.setSelected(True)
         for cat, subs in self.model.catalog_subcatalog_tree().items():
             cat_item = self._make_catalog_node(cat, catalog=cat)
             self.catalog_tree.addTopLevelItem(cat_item)
-            if prev_catalog == cat and prev_subcatalog is None:
-                selected_item = cat_item
+            if (cat, None) in prev_selections:
+                cat_item.setSelected(True)
             for sub in sorted(set(subs)):
                 sub_item = self._make_catalog_node(sub, catalog=cat, subcatalog=sub)
                 cat_item.addChild(sub_item)
-                if prev_catalog == cat and prev_subcatalog == sub:
-                    selected_item = sub_item
+                if (cat, sub) in prev_selections:
+                    sub_item.setSelected(True)
             cat_item.setExpanded(True)
-        self.catalog_tree.setCurrentItem(selected_item or all_item)
+        # If nothing ended up selected (e.g. the old selection disappeared),
+        # fall back to "(all catalogs)".
+        if not self.catalog_tree.selectedItems():
+            all_item.setSelected(True)
+            self.catalog_tree.setCurrentItem(all_item)
         self.catalog_tree.blockSignals(False)
 
         # Apply filters – this will refresh the model
@@ -4108,9 +4241,14 @@ class MainWindow(QMainWindow):
 
     def _apply_filters(self):
         self.model.search_text = self.search_box.text().strip()
-        catalog, subcatalog = self._current_catalog_selection()
-        self.model.catalog_filter = catalog
-        self.model.subcatalog_filter = subcatalog
+        selections = self._current_catalog_selections()
+        # "(all catalogs)" anywhere in the selection wins — clear the filter.
+        if (None, None) in selections:
+            self.model.catalog_filter_spec = []
+        else:
+            self.model.catalog_filter_spec = [
+                (c, s) for (c, s) in selections if c is not None
+            ]
         status = self.status_combo.currentText()
         self.model.status_filter = None if status == "(all)" else status
         scrape_status = self.scrape_status_combo.currentText()
@@ -4234,28 +4372,34 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _show_column_picker(self):
+        """Non-closing column visibility picker. Uses a QMenu of
+        QWidgetActions holding QCheckBox widgets — clicking a checkbox
+        toggles the column without triggering the menu's close-on-pick
+        behaviour, so the menu stays open until the user clicks outside."""
         visible = set(self.db.get_setting("visible_columns", [k for k, _ in COLUMNS]))
         menu = QMenu(self)
-        menu.setTitle("Columns")
-        actions = {}
         for key, label in COLUMNS:
-            act = menu.addAction(label)
-            act.setCheckable(True)
-            act.setChecked(key in visible)
-            actions[act] = key
-        for act, key in actions.items():
+            action = QWidgetAction(menu)
+            cb = QCheckBox(label)
+            cb.setChecked(key in visible)
             if key == "name":
-                act.setEnabled(False)
-        chosen = menu.exec(self.table.viewport().mapToGlobal(self.table.rect().topLeft()))
-        if chosen is None:
-            return
-        key = actions[chosen]
-        if key == "name":
-            return
-        if key in visible:
-            visible.discard(key)
-        else:
+                cb.setEnabled(False)
+                cb.setToolTip("App Name cannot be hidden")
+            else:
+                cb.toggled.connect(
+                    lambda checked, k=key: self._toggle_column(k, checked)
+                )
+            action.setDefaultWidget(cb)
+            menu.addAction(action)
+        menu.exec(self.table.viewport().mapToGlobal(self.table.rect().topLeft()))
+
+    def _toggle_column(self, key: str, checked: bool):
+        visible = set(self.db.get_setting("visible_columns", [k for k, _ in COLUMNS]))
+        if checked:
             visible.add(key)
+        else:
+            visible.discard(key)
+        visible.add("name")   # App Name can't be hidden
         self.db.set_setting("visible_columns", sorted(visible), bump_version=False)
         self._apply_column_visibility()
 

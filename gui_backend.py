@@ -200,8 +200,9 @@ class AppsTableModel(QAbstractTableModel):
         self.db = db
         self._rows: list[dict] = []
         self.search_text = ""
-        self.catalog_filter: str | None = None
-        self.subcatalog_filter: str | None = None
+        # List of (catalog, subcatalog|None) pairs. Empty = no filter.
+        # subcatalog=None means "all subcatalogs of that catalog".
+        self.catalog_filter_spec: list[tuple[Optional[str], Optional[str]]] = []
         self.status_filter: str | None = None
         self.scrape_status_filter: str | None = None
 
@@ -232,12 +233,17 @@ class AppsTableModel(QAbstractTableModel):
             query += " AND (a.name LIKE ? OR a.catalog LIKE ? OR a.subcatalog LIKE ?)"
             like = f"%{self.search_text}%"
             params += [like, like, like]
-        if self.catalog_filter:
-            query += " AND a.catalog = ?"
-            params.append(self.catalog_filter)
-        if self.subcatalog_filter:
-            query += " AND a.subcatalog = ?"
-            params.append(self.subcatalog_filter)
+        if self.catalog_filter_spec:
+            clauses = []
+            for cat, sub in self.catalog_filter_spec:
+                if sub is not None:
+                    clauses.append("(a.catalog = ? AND a.subcatalog = ?)")
+                    params.extend([cat, sub])
+                elif cat is not None:
+                    clauses.append("a.catalog = ?")
+                    params.append(cat)
+            if clauses:
+                query += " AND (" + " OR ".join(clauses) + ")"
         if self.status_filter:
             query += " AND a.status = ?"
             params.append(self.status_filter)

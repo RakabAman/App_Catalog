@@ -1440,6 +1440,101 @@ def report_to_csv_rows(report: CatalogReport) -> list[list[str]]:
 VALID_ARCHIVE_FORMATS = ("7z", "zip", "rar", "none")
 VALID_COPY_MODES = ("move", "copy")
 
+# ----------------------------------------------------------------------
+# Archive password protection ("password in the filename")
+# ----------------------------------------------------------------------
+# When enabled, archives this module (and monitor.py) create are encrypted
+# and the password is appended to the archive's base name in parentheses:
+#     Setup.exe  ->  Setup(mypass).7z
+# The password lives in the filename ON PURPOSE (so it's never forgotten
+# and travels with the file), which means this is not real secrecy -- it
+# keeps antivirus engines / previewers from opening the installer, that's
+# all. Consequently the password must be usable as part of a filename:
+# no characters Windows forbids in names, and no parentheses (they'd make
+# "(...)" ambiguous to read back out of the name).
+_PASSWORD_FORBIDDEN_CHARS = set('\\/:*?"<>|()')
+MAX_ARCHIVE_PASSWORD_LEN = 64
+
+
+def validate_archive_password(password: Optional[str]) -> Optional[str]:
+    """Returns None if `password` can be used (and embedded in a filename),
+    otherwise a short human-readable reason."""
+    if password is None or password == "":
+        return "The password is empty."
+    if password != password.strip():
+        return "The password can't start or end with a space."
+    if len(password) > MAX_ARCHIVE_PASSWORD_LEN:
+        return f"The password is longer than {MAX_ARCHIVE_PASSWORD_LEN} characters."
+    bad = sorted({c for c in password if c in _PASSWORD_FORBIDDEN_CHARS or ord(c) < 32})
+    if bad:
+        shown = " ".join(c for c in bad if ord(c) >= 32) or "control characters"
+        return (
+            f"The password contains characters that can't appear in a filename "
+            f"({shown}). It is stored in the archive's filename, so avoid "
+            f"\\ / : * ? \" < > | ( )"
+        )
+    return None
+
+
+def get_archive_password(settings: dict) -> Optional[str]:
+    """The password to apply to newly created archives, or None when
+    protection is off. Raises ValueError if protection is switched ON but
+    the stored password is unusable -- callers must NOT quietly fall back
+    to an unprotected archive in that case."""
+    if not settings.get("archive_password_enabled", False):
+        return None
+    pw = settings.get("archive_password") or ""
+    err = validate_archive_password(pw)
+    if err:
+        raise ValueError(f"Archive password protection is on but {err[0].lower() + err[1:]}")
+    return pw
+
+
+def with_password_in_name(stem: str, password: Optional[str]) -> str:
+    """'Setup' + 'pw' -> 'Setup(pw)'. No-op without a password."""
+    return f"{stem}({password})" if password else stem
+
+
+def find_7z_executable() -> Optional[str]:
+    for candidate in ("7z", "7za", "7z.exe"):
+        exe = shutil.which(candidate)
+        if exe:
+            return exe
+    return None
+
+
+def write_zip_archive(src: str, dest: str, password: Optional[str] = None) -> None:
+    """Writes `src` (one file) into a new zip at `dest`. Without a password
+    this is the stdlib. With one, the stdlib can't encrypt, so it uses
+    pyzipper (AES-256) if installed, else a 7z binary on PATH (also
+    AES-256). Raises RuntimeError if neither exists -- deliberately never
+    producing an UNENCRYPTED zip when a password was asked for."""
+    arcname = os.path.basename(src)
+    if not password:
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(src, arcname)
+        return
+    try:
+        import pyzipper
+    except ImportError:
+        pyzipper = None
+    if pyzipper is not None:
+        with pyzipper.AESZipFile(dest, "w", compression=pyzipper.ZIP_DEFLATED,
+                                 encryption=pyzipper.WZ_AES) as zf:
+            zf.setpassword(password.encode("utf-8"))
+            zf.setencryption(pyzipper.WZ_AES, nbits=256)
+            zf.write(src, arcname)
+        return
+    exe = find_7z_executable()
+    if exe:
+        subprocess.run([exe, "a", "-tzip", "-mem=AES256", f"-p{password}", dest, src],
+                       check=True, capture_output=True, timeout=1800)
+        return
+    raise RuntimeError(
+        "Password-protected zip needs the 'pyzipper' package (pip install pyzipper) "
+        "or a 7z binary on PATH. Use 7z format instead, or install one of those."
+    )
+
 # Filenames never worth carrying into a reorganized destination even when
 # found alongside a shared-folder installer (OS/filesystem bookkeeping
 # files, not anything the app or its extras actually need).
@@ -1598,7 +1693,8 @@ def preview_reorganize(
     return plans
 
 
-def _archive_single_file(file_path: str, archive_format: str) -> Optional[str]:
+def _archive_single_file(file_path: str, archive_format: str,
+                         password: Optional[str] = None) -> Optional[str]:
     """
     Compresses ONE file into an archive of the same base name next to it
     (e.g. Setup.exe -> Setup.7z), then removes the original file --
@@ -1608,10 +1704,16 @@ def _archive_single_file(file_path: str, archive_format: str) -> Optional[str]:
     destination folder, so a version's extras stay as ordinary loose
     files/folders rather than getting swept into the archive too.
 
+    If `password` is given the archive is encrypted with it and the
+    password is appended to the archive's name in parentheses
+    (Setup.exe -> Setup(password).7z). See validate_archive_password().
+
     Returns the archive's path on success, or None if archive_format is
     'none' or archiving failed -- on failure the original file is left
-    exactly as it was (nothing partially deleted), and the caller decides
-    how to report it.
+    exactly as it was (nothing partially deleted, no half-written archive
+    left behind), and the caller decides how to report it. A requested
+    password is never silently dropped: if it can't be applied the file
+    is left uncompressed rather than archived unprotected.
     """
     if archive_format == "none":
         return None
@@ -1619,7 +1721,14 @@ def _archive_single_file(file_path: str, archive_format: str) -> Optional[str]:
         log.warning("Unknown archive_format %r -- leaving %s as-is", archive_format, file_path)
         return None
 
+    if password:
+        err = validate_archive_password(password)
+        if err:
+            log.error("Not archiving %s: %s", file_path, err)
+            return None
+
     base, _ext = os.path.splitext(file_path)
+    base = with_password_in_name(base, password)
     target = f"{base}.{archive_format}"
     if os.path.exists(target):
         log.warning("Archive target %s already exists -- leaving %s uncompressed", target, file_path)
@@ -1631,18 +1740,21 @@ def _archive_single_file(file_path: str, archive_format: str) -> Optional[str]:
                 import py7zr
             except ImportError:
                 log.warning("py7zr is not installed -- falling back to zip for %s", file_path)
-                return _archive_single_file(file_path, "zip")
-            with py7zr.SevenZipFile(target, "w") as archive:
+                return _archive_single_file(file_path, "zip", password)
+            with py7zr.SevenZipFile(target, "w", password=password or None) as archive:
                 archive.write(file_path, arcname=os.path.basename(file_path))
 
         elif archive_format == "zip":
-            with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.write(file_path, os.path.basename(file_path))
+            write_zip_archive(file_path, target, password)
 
         elif archive_format == "rar":
+            cmd = ["rar", "a", "-ep1"]
+            if password:
+                cmd.append(f"-p{password}")
+            cmd += [target, file_path]
             try:
                 proc = subprocess.run(
-                    ["rar", "a", "-ep1", target, file_path],
+                    cmd,
                     capture_output=True, text=True,
                     # checkpoint 23: see scraper.py's fetch_winget_show()
                     # for why this needs an explicit encoding -- WinRAR's
@@ -1661,9 +1773,12 @@ def _archive_single_file(file_path: str, archive_format: str) -> Optional[str]:
                 return None
             if proc.returncode != 0:
                 log.error("RAR archiving failed for %s: %s", file_path, proc.stderr)
+                _remove_partial(target)
                 return None
-    except OSError as e:
-        log.error("Archiving %s to %s failed: %s", file_path, archive_format, e)
+    except Exception as e:  # OSError, RuntimeError (no zip-encrypt backend), py7zr/7z errors
+        log.error("Archiving %s to %s%s failed: %s", file_path, archive_format,
+                  " (password-protected)" if password else "", e)
+        _remove_partial(target)
         return None
 
     try:
@@ -1671,6 +1786,16 @@ def _archive_single_file(file_path: str, archive_format: str) -> Optional[str]:
     except OSError as e:
         log.warning("Archived %s to %s but could not remove the original file: %s", file_path, target, e)
     return target
+
+
+def _remove_partial(path: str) -> None:
+    """Best-effort cleanup of a half-written archive (only ever called on a
+    target that did not exist before this attempt)."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
 
 
 def _transfer_item(item: str, dest_dir: str, copy_mode: str) -> tuple:
@@ -1732,6 +1857,7 @@ def execute_reorganize(
     db: Database, planned_moves: list[PlannedMove], *,
     copy_mode: str = "move",
     archive_format: str = "none",
+    archive_password: Optional[str] = None,
     move_log_dir: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int, "PlannedMove", str], None]] = None,
 ) -> ReorganizeResult:
@@ -1818,6 +1944,14 @@ def execute_reorganize(
         raise ValueError(f"copy_mode must be one of {VALID_COPY_MODES}, got {copy_mode!r}")
     if archive_format not in VALID_ARCHIVE_FORMATS:
         raise ValueError(f"archive_format must be one of {VALID_ARCHIVE_FORMATS}, got {archive_format!r}")
+    # A password only means something when archiving is on. Fail up front
+    # (before any file is touched) rather than half-way through a run.
+    if archive_format == "none":
+        archive_password = None
+    elif archive_password:
+        _pw_err = validate_archive_password(archive_password)
+        if _pw_err:
+            raise ValueError(f"Invalid archive password: {_pw_err}")
 
     conn = db.connect()
     result = ReorganizeResult()
@@ -1967,11 +2101,14 @@ def execute_reorganize(
                     if os.path.exists(installer_path):
                         log_job.info("[%d/%d] Archiving installer as .%s: %s",
                                      i, total, archive_format, installer_path)
-                        archived_path = _archive_single_file(installer_path, archive_format)
+                        archived_path = _archive_single_file(
+                            installer_path, archive_format, archive_password)
                         if archived_path:
                             new_file_name = os.path.basename(archived_path)
                             result.archived += 1
                             entry["archive_path"] = archived_path
+                            if archive_password:
+                                entry["archive_password_protected"] = True
                     else:
                         log_job.warning(
                             "[%d/%d] Could not find installer file to archive at %s -- left uncompressed",
@@ -2072,7 +2209,8 @@ def generate_reorganize_html_report(
         if e.get("partial_collisions"):
             bits.append(f"{len(e['partial_collisions'])} item(s) at the destination were left as-is (already there)")
         if e.get("archive_path"):
-            bits.append(f"compressed to {os.path.basename(e['archive_path'])}")
+            bits.append(f"compressed to {os.path.basename(e['archive_path'])}"
+                        + (" (password-protected)" if e.get("archive_password_protected") else ""))
         elif e.get("archive_skipped_already_compressed"):
             bits.append("already compressed, not re-archived")
         return "; ".join(bits)

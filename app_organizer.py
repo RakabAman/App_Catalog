@@ -48,6 +48,7 @@ from app_manager import (
     demote_catalog_to_subcatalog, merge_subcatalogs,
     generate_catalog_report, report_to_markdown, report_to_csv_rows,
     preview_reorganize, execute_reorganize, ReorganizeResult,
+    validate_archive_password,
 )
 
 class _ReorganizeWorker(QThread):
@@ -69,12 +70,14 @@ class _ReorganizeWorker(QThread):
     finished_ok = Signal(object)            # ReorganizeResult
     failed = Signal(str)                    # message, if something unexpected blew up the whole run
 
-    def __init__(self, db: Database, plans: list, copy_mode: str, archive_format: str, parent=None):
+    def __init__(self, db: Database, plans: list, copy_mode: str, archive_format: str,
+                 archive_password: Optional[str] = None, parent=None):
         super().__init__(parent)
         self.db = db
         self.plans = plans
         self.copy_mode = copy_mode
         self.archive_format = archive_format
+        self.archive_password = archive_password
 
     def run(self):
         def _on_progress(index, total, plan, status):
@@ -83,6 +86,7 @@ class _ReorganizeWorker(QThread):
             result = execute_reorganize(
                 self.db, self.plans,
                 copy_mode=self.copy_mode, archive_format=self.archive_format,
+                archive_password=self.archive_password,
                 progress_callback=_on_progress,
             )
             self.finished_ok.emit(result)
@@ -771,6 +775,31 @@ class OrganizeDialog(QDialog):
         opts_row.addStretch()
         v.addLayout(opts_row)
 
+        # Optional password protection -- defaults come from Settings >
+        # Archive Handling, but can be overridden for just this run here.
+        _s = self.db.get_all_settings()
+        pw_row = QHBoxLayout()
+        self.reorg_pw_check = QCheckBox("Password-protect archives")
+        self.reorg_pw_check.setChecked(bool(_s.get("archive_password_enabled", False)))
+        self.reorg_pw_edit = QLineEdit(_s.get("archive_password") or "")
+        self.reorg_pw_edit.setPlaceholderText("password")
+        self.reorg_pw_edit.setToolTip(
+            "The password is also added to each archive's filename in brackets,\n"
+            "e.g. Setup.exe -> Setup(password).7z. Avoid \\ / : * ? \" < > | ( )\n"
+            "-- they can't be used in a filename. Zip encryption needs pyzipper\n"
+            "or a 7z binary on PATH; 7z needs py7zr; RAR needs rar on PATH.")
+        pw_row.addWidget(self.reorg_pw_check)
+        pw_row.addWidget(self.reorg_pw_edit, 1)
+        v.addLayout(pw_row)
+
+        def _sync_pw_enabled(*_):
+            archiving = self.reorg_archive_combo.currentData() != "none"
+            self.reorg_pw_check.setEnabled(archiving)
+            self.reorg_pw_edit.setEnabled(archiving and self.reorg_pw_check.isChecked())
+        self.reorg_archive_combo.currentIndexChanged.connect(_sync_pw_enabled)
+        self.reorg_pw_check.toggled.connect(_sync_pw_enabled)
+        _sync_pw_enabled()
+
         self.reorg_portable_check = QCheckBox(
             "Route Portable-tagged apps into a dedicated \"Portable\" category "
             "(original catalog becomes the subcategory)"
@@ -875,6 +904,13 @@ class OrganizeDialog(QDialog):
             return
         copy_mode = self.reorg_copy_mode_combo.currentData()
         archive_format = self.reorg_archive_combo.currentData()
+        archive_password = None
+        if archive_format != "none" and self.reorg_pw_check.isChecked():
+            archive_password = self.reorg_pw_edit.text()
+            pw_err = validate_archive_password(archive_password)
+            if pw_err:
+                QMessageBox.warning(self, "Archive password", pw_err)
+                return
         verb = "copy" if copy_mode == "copy" else "move"
         archive_note = (
             f" Each bare installer file will then be compressed to .{archive_format} "
@@ -882,6 +918,12 @@ class OrganizeDialog(QDialog):
             f"compressed installers are skipped)."
             if archive_format != "none" else ""
         )
+        if archive_password:
+            archive_note += (
+                " Archives will be password-protected, and the password is added "
+                "to each archive's filename in brackets, e.g. Setup(password)."
+                + archive_format + "."
+            )
         reply = QMessageBox.question(
             self, "Confirm reorganize",
             f"This will physically {verb} {len(self._reorg_plans)} item(s) on disk."
@@ -903,11 +945,13 @@ class OrganizeDialog(QDialog):
         self.reorg_progress_bar.setValue(0)
         self.reorg_status_label.setText("Starting…")
         self.reorg_activity_log.appendPlainText(
-            f"Starting: {len(self._reorg_plans)} item(s), mode={copy_mode}, archive={archive_format} …"
+            f"Starting: {len(self._reorg_plans)} item(s), mode={copy_mode}, archive={archive_format}"
+            f"{' (password-protected)' if archive_password else ''} …"
         )
 
         self._reorg_worker = _ReorganizeWorker(
-            self.db, self._reorg_plans, copy_mode, archive_format, parent=self
+            self.db, self._reorg_plans, copy_mode, archive_format,
+            archive_password=archive_password, parent=self
         )
         self._reorg_worker.progress.connect(self._on_reorg_progress)
         self._reorg_worker.finished_ok.connect(self._on_reorg_finished)
