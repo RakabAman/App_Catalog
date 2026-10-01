@@ -29,12 +29,15 @@ GUI) is one consumer of this module, not the only one.
 from __future__ import annotations
 
 import csv
+import errno
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -1573,14 +1576,33 @@ class PlannedMove:
     collision: bool = False      # dest_path folder already existed at preview time (informational --
                                   # final collision handling happens per-item at execute time)
     is_portable: bool = False
-    shared_folder: bool = False  # True if another variant also uses this exact source_path
-                                  # (two distinct install units shipped in one folder) -- see
-                                  # execute_reorganize()'s docstring for how this changes handling
-    shared_extra_paths: list = field(default_factory=list)  # only for shared_folder plans: other
-                                  # items in the folder unclaimed by any sibling variant's file
-    app_name: str = ""           # display-only, for logs/reports (checkpoint 21) -- never used
-                                  # for path-building logic, that's already baked into dest_path
+    shared_folder: bool = False  # True if the folder is used by several variants OR contains other
+                                  # install units (see container_folder) -- per-file handling, never
+                                  # a whole-folder move
+    shared_extra_paths: list = field(default_factory=list)  # shared_folder plans only: files AND
+                                  # folders (patch, crack, keygen, skins, tutorial, ...) not claimed
+                                  # by any variant, copied along as sidecars. Never a folder that
+                                  # is, or contains, ANOTHER variant's install unit.
+    app_name: str = ""           # display-only, for logs/reports
     version: str = ""            # display-only, ditto
+    # ---- size / risk information, computed at preview time -------------
+    container_folder: bool = False   # source_path CONTAINS other variants' folders (e.g. the scan
+                                     # root holding loose installers + app subfolders)
+    own_bytes: int = 0           # size of this variant's own file (shared plans) or of the whole
+                                 # folder (ordinary plans)
+    extras_bytes: int = 0        # size of shared_extra_paths -- these are always COPIED
+    cross_volume: bool = False   # source and destination are on different volumes, so a "move"
+                                 # is a real copy + delete, not an instant rename
+    skipped_items: list = field(default_factory=list)  # [(path, reason)] left in place on purpose:
+                                 # another variant's install unit, or larger than the sidecar cap
+
+
+def plan_bytes_to_write(plan: "PlannedMove", copy_mode: str) -> int:
+    """How many bytes execute_reorganize() will physically WRITE for this plan.
+    A same-volume move is a rename (0 bytes); extras are always copied."""
+    if copy_mode == "copy" or plan.cross_volume:
+        return plan.own_bytes + plan.extras_bytes
+    return plan.extras_bytes
 
 
 @dataclass
@@ -1590,14 +1612,35 @@ class ReorganizeResult:
     skipped_collisions: int = 0
     failed: list[dict] = field(default_factory=list)
     move_log_path: Optional[str] = None
-    # checkpoint 21: every plan's outcome (not just failures), in the
-    # order processed -- app_name/version included for a readable
-    # report. This is the SAME data written incrementally to
-    # move_log_path as the run progresses; kept here too so a caller
-    # doesn't need to re-read and re-parse that JSON file just to build
-    # a human-facing report of what happened.
     entries: list[dict] = field(default_factory=list)
     html_report_path: Optional[str] = None
+    cancelled: bool = False
+    not_started: int = 0
+    bytes_copied: int = 0
+    elapsed_seconds: float = 0.0
+
+
+@dataclass
+class ReorgEvent:
+    """One progress notification from execute_reorganize(). `final` is True
+    exactly once per plan (its outcome is in `status`); every other event is
+    a live update about what is happening RIGHT NOW."""
+    index: int
+    total: int
+    plan: "PlannedMove"
+    phase: str                  # start | measure | move | copy | archive | cleanup | finish
+    message: str = ""           # one human sentence: "Copying extra file: setup.zip"
+    detail: str = ""            # numbers: "3.2 GB / 18.4 GB - 17% - 45 MB/s - ETA 5m 10s"
+    bytes_done: int = 0
+    bytes_total: int = 0        # 0 = unknown -> show a busy indicator, not a percentage
+    speed: float = 0.0          # bytes/second for the current operation
+    bytes_copied_total: int = 0 # whole run so far
+    final: bool = False
+    status: str = ""            # moved | copied | failed | skipped_collision | cancelled
+
+
+class ReorganizeCancelled(Exception):
+    """Raised inside a running copy when the user pressed Cancel."""
 
 
 def _safe_path_component(name: str) -> str:
@@ -1606,19 +1649,231 @@ def _safe_path_component(name: str) -> str:
     return cleaned or "Unnamed"
 
 
+# ---------------------------------------------------------------------
+# Progress plumbing (shared by move / copy / archive)
+# ---------------------------------------------------------------------
+
+_COPY_CHUNK = 4 * 1024 * 1024      # 4 MB read/write blocks -> progress + cancel granularity
+_UI_INTERVAL = 0.2                 # seconds between GUI updates for one running operation
+_LOG_INTERVAL = 5.0                # seconds between console heartbeat lines
+
+# Only BARE installer files are ever archived. Everything else (docs, isos,
+# scripts, already-packaged .zip/.rar/.7z, ...) is left exactly as it is.
+DEFAULT_BARE_INSTALLER_EXTENSIONS = [
+    ".exe", ".msi", ".msix", ".msixbundle", ".appx", ".appxbundle", ".msp",
+]
+
+
+def _fmt_bytes(n: float) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(max(seconds, 0))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+def _path_size(path: str) -> int:
+    """Total size in bytes of a file or a whole folder tree (symlinks not followed)."""
+    try:
+        if os.path.islink(path) or os.path.isfile(path):
+            return os.lstat(path).st_size
+        total = 0
+        for root, _dirs, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.lstat(os.path.join(root, f)).st_size
+                except OSError:
+                    pass
+        return total
+    except OSError:
+        return 0
+
+
+def _norm(p: str) -> str:
+    return os.path.normcase(os.path.normpath(p))
+
+
+def _nearest_existing(path: str) -> str:
+    cur = os.path.abspath(path)
+    while cur and not os.path.exists(cur):
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return cur
+
+
+def _same_volume(a: str, b: str) -> bool:
+    try:
+        return os.stat(_nearest_existing(a)).st_dev == os.stat(_nearest_existing(b)).st_dev
+    except OSError:
+        return True   # can't tell -> don't cry wolf
+
+
+fmt_bytes = _fmt_bytes          # public aliases for the GUI
+fmt_duration = _fmt_duration
+
+
+class _Progress:
+    """Turns low-level byte counts into ReorgEvent callbacks (throttled) and
+    console heartbeat lines, and carries the cancel flag."""
+
+    def __init__(self, callback, total, cancel_event):
+        self.callback = callback
+        self.total = total
+        self.cancel_event = cancel_event
+        self.index = 0
+        self.plan = None
+        self.bytes_copied_total = 0
+
+    def begin(self, index, plan):
+        self.index, self.plan = index, plan
+
+    def cancelled(self) -> bool:
+        return bool(self.cancel_event is not None and self.cancel_event.is_set())
+
+    def check_cancel(self):
+        if self.cancelled():
+            raise ReorganizeCancelled()
+
+    def emit(self, phase, message="", detail="", done=0, total=0, speed=0.0,
+             final=False, status=""):
+        if self.callback is None:
+            return
+        ev = ReorgEvent(
+            index=self.index, total=self.total, plan=self.plan, phase=phase,
+            message=message, detail=detail, bytes_done=int(done), bytes_total=int(total),
+            speed=speed, bytes_copied_total=self.bytes_copied_total,
+            final=final, status=status,
+        )
+        try:
+            self.callback(ev)
+        except Exception:   # a misbehaving GUI callback must never abort file operations
+            log.exception("progress callback raised -- ignoring")
+
+    def op(self, phase, message, total_bytes, counts_as_copy, detail_extra=""):
+        return _Op(self, phase, message, total_bytes, counts_as_copy, detail_extra)
+
+
+class _Op:
+    """One long-running operation (copying one file/folder, compressing one file)."""
+
+    def __init__(self, prog, phase, message, total_bytes, counts_as_copy, detail_extra=""):
+        self.prog, self.phase, self.message = prog, phase, message
+        self.total = int(total_bytes or 0)
+        self.counts = counts_as_copy
+        self.detail_extra = detail_extra
+        self.done = 0
+        self.start = time.monotonic()
+        self._last_ui = 0.0
+        self._last_log = self.start
+        prog.emit(phase, message, self._detail(0.0), 0, self.total)
+        log_job.info("[%d/%d] %s%s", prog.index, prog.total, message,
+                     f" ({_fmt_bytes(self.total)})" if self.total else "")
+
+    def _detail(self, speed):
+        parts = []
+        if self.total:
+            pct = 100.0 * self.done / self.total if self.total else 0
+            parts.append(f"{_fmt_bytes(self.done)} / {_fmt_bytes(self.total)} - {pct:.0f}%")
+        else:
+            parts.append(f"{_fmt_bytes(self.done)} written so far")
+        if speed > 0:
+            parts.append(f"{_fmt_bytes(speed)}/s")
+            if self.total and self.done < self.total:
+                parts.append(f"ETA {_fmt_duration((self.total - self.done) / speed)}")
+        if self.detail_extra:
+            parts.append(self.detail_extra)
+        return " - ".join(parts)
+
+    def add(self, n):
+        self.done += n
+        if self.counts:
+            self.prog.bytes_copied_total += n
+        self.tick()
+        self.prog.check_cancel()
+
+    def set_done(self, n):          # used by the archive size poller (another thread)
+        self.done = n
+        self.tick()
+
+    def tick(self, force=False):
+        now = time.monotonic()
+        if not force and now - self._last_ui < _UI_INTERVAL:
+            return
+        self._last_ui = now
+        elapsed = max(now - self.start, 1e-6)
+        speed = self.done / elapsed
+        detail = self._detail(speed)
+        self.prog.emit(self.phase, self.message, detail, self.done, self.total, speed)
+        if now - self._last_log >= _LOG_INTERVAL:
+            self._last_log = now
+            log_job.info("[%d/%d] %s: %s", self.prog.index, self.prog.total, self.message, detail)
+
+    def finish(self):
+        self.tick(force=True)
+        elapsed = time.monotonic() - self.start
+        rate = f" ({_fmt_bytes(self.done / elapsed)}/s)" if elapsed > 1 and self.done else ""
+        log_job.info("[%d/%d] finished: %s -- %s in %s%s", self.prog.index, self.prog.total,
+                     self.message, _fmt_bytes(self.done), _fmt_duration(elapsed), rate)
+
+
+# ---------------------------------------------------------------------
+# Preview
+# ---------------------------------------------------------------------
+
+DEFAULT_MAX_SIDECAR_GB = 5.0     # setting "reorganize_max_sidecar_gb"; 0 = no limit
+
+
 def preview_reorganize(
     db: Database, dest_root: str, *,
     portable_to_dedicated_category: bool = True,
     portable_category_name: str = "Portable",
+    max_sidecar_gb: Optional[float] = None,
 ) -> list[PlannedMove]:
     """
-    DRY RUN ONLY -- computes where every variant's install-unit folder
-    WOULD move to under dest_root/Catalog/Subcatalog/AppName/Version/ (or
-    dest_root/Portable/OriginalCatalog/AppName/Version/ for a
-    portable-tagged app), and flags any destination folder that already
-    exists as a heads-up, but moves nothing. This is the ONLY way to get
-    a move plan; execute_reorganize() requires being handed the exact
-    list this returns (see its docstring for why).
+    DRY RUN ONLY -- computes where every variant's install unit WOULD go under
+    dest_root/Catalog/Subcatalog/AppName/Version/ (or
+    dest_root/Portable/OriginalCatalog/AppName/Version/ for portable-tagged
+    apps) and how much data each row will really write, but moves nothing.
+
+    Two kinds of source folder:
+
+      ORDINARY   used by exactly one variant and containing no other install
+                 unit: the WHOLE folder moves as one unit, so everything next
+                 to the installer (readme, crack, keygen, serial, skins,
+                 tutorials, plugins ...) travels with it.
+
+      SHARED     several variants point at the same folder, OR the folder
+                 CONTAINS other variants' folders (typically the scan root with
+                 loose installers beside app sub-folders). Handled per file:
+                 the variant's own file moves and everything else there that
+                 belongs to nobody -- files AND folders such as Patch/, Crack/,
+                 Keygen/, Skins/ -- is COPIED alongside it as a sidecar.
+
+    What is never a sidecar (it is left where it is and listed in
+    PlannedMove.skipped_items):
+      * a folder that IS, or CONTAINS, any variant's install unit -- that is
+        another app, moved by its own plan. Copying it into every sibling
+        was the bug that turned 40 GB into 70+ GB. Ignored variants count too.
+      * a file that any variant (ignored or not) claims as its own installer.
+      * anything bigger than the sidecar cap (default 5 GB per item, setting
+        "reorganize_max_sidecar_gb", 0 = unlimited): an unattributed
+        multi-GB item is far more likely to be an uncatalogued app than a
+        patch, and it would be duplicated once per sibling. Raise the cap if
+        that is really an extras folder.
     """
     conn = db.connect()
     rows = conn.execute(
@@ -1630,13 +1885,40 @@ def preview_reorganize(
         ORDER BY a.catalog, a.subcatalog, a.name, v.version
         """
     ).fetchall()
+    # EVERY variant, ignored or not: they are all "somebody's" install unit/file.
+    everyone = conn.execute("SELECT source_path, file_name FROM variants").fetchall()
 
-    # Folders used by more than one variant -- the rare multi-installer-
-    # in-one-folder case that needs per-file handling instead of a
-    # whole-folder move (see module docstring above).
+    if max_sidecar_gb is None:
+        try:
+            max_sidecar_gb = float(db.get_all_settings().get("reorganize_max_sidecar_gb",
+                                                             DEFAULT_MAX_SIDECAR_GB))
+        except (TypeError, ValueError):
+            max_sidecar_gb = DEFAULT_MAX_SIDECAR_GB
+    cap_bytes = int(max_sidecar_gb * 1024 ** 3) if max_sidecar_gb and max_sidecar_gb > 0 else 0
+
     folder_counts: dict = {}
     for r in rows:
         folder_counts[r["source_path"]] = folder_counts.get(r["source_path"], 0) + 1
+
+    all_unit_paths = {_norm(r["source_path"]) for r in everyone if r["source_path"]}
+    claimed_names: dict = {}      # folder -> file names claimed by ANY variant
+    for r in everyone:
+        if r["source_path"] and r["file_name"]:
+            claimed_names.setdefault(_norm(r["source_path"]), set()).add(r["file_name"].lower())
+
+    _contains_cache: dict = {}
+
+    def _contains_unit(path: str) -> bool:
+        """True if any variant's folder is `path` itself or lives inside it."""
+        if path not in _contains_cache:
+            n = _norm(path).rstrip(os.sep)
+            prefix = n + os.sep
+            _contains_cache[path] = n in all_unit_paths or any(p.startswith(prefix) for p in all_unit_paths)
+        return _contains_cache[path]
+
+    def _is_container(path: str) -> bool:
+        n = _norm(path).rstrip(os.sep) + os.sep
+        return any(p.startswith(n) for p in all_unit_paths)
 
     portable_app_ids = set()
     if portable_to_dedicated_category:
@@ -1646,81 +1928,207 @@ def preview_reorganize(
         ).fetchall()
         portable_app_ids = {r["app_id"] for r in tag_rows}
 
-    # For shared folders: every sibling variant's claimed filename, so we
-    # can work out what's left over ("shared extras") by elimination.
-    # Keyed by source_path -> set of claimed file_names.
-    claimed_by_folder: dict = {}
-    for r in rows:
-        if folder_counts[r["source_path"]] > 1 and r["file_name"]:
-            claimed_by_folder.setdefault(r["source_path"], set()).add(r["file_name"])
+    _size_cache: dict = {}
+
+    def _size(path: str) -> int:
+        if path not in _size_cache:
+            _size_cache[path] = _path_size(path)
+        return _size_cache[path]
 
     plans = []
     for r in rows:
+        sp = r["source_path"]
         is_portable = r["app_id"] in portable_app_ids
         catalog_raw = r["catalog"] or "Uncategorized"
         subcatalog_raw = r["subcatalog"] or "Misc"
         if is_portable and catalog_raw != portable_category_name:
-            # Original catalog (e.g. "Graphics", "Desktop Utilities") becomes
-            # the subcatalog under the dedicated Portable category.
             catalog_raw, subcatalog_raw = portable_category_name, catalog_raw
 
-        catalog = _safe_path_component(catalog_raw)
-        subcatalog = _safe_path_component(subcatalog_raw)
-        app_name = _safe_path_component(r["app_name"])
-        version = _safe_path_component(r["version"] or "unknown-version")
-        dest = os.path.join(dest_root, catalog, subcatalog, app_name, version)
+        dest = os.path.join(
+            dest_root, _safe_path_component(catalog_raw), _safe_path_component(subcatalog_raw),
+            _safe_path_component(r["app_name"]), _safe_path_component(r["version"] or "unknown-version"),
+        )
 
-        shared = folder_counts[r["source_path"]] > 1
-        shared_extras = []
+        container = _is_container(sp)
+        shared = folder_counts[sp] > 1 or container
+        extras, skipped, extras_bytes, own_bytes = [], [], 0, 0
+
         if shared:
-            claimed = claimed_by_folder.get(r["source_path"], set())
+            claimed = claimed_names.get(_norm(sp), set())
             try:
-                for name in os.listdir(r["source_path"]):
-                    if name in claimed or name.lower() in _JUNK_FILENAMES:
-                        continue
-                    shared_extras.append(os.path.join(r["source_path"], name))
+                names = os.listdir(sp)
             except OSError:
-                pass  # folder unreadable/gone -- execute_reorganize will catch this per-plan
+                names = []
+            for name in names:
+                full = os.path.join(sp, name)
+                if name.lower() in claimed or name.lower() in _JUNK_FILENAMES:
+                    continue
+                if os.path.isdir(full) and not os.path.islink(full) and _contains_unit(full):
+                    skipped.append((full, "another app's install folder (moved by its own entry)"))
+                    continue
+                size = _size(full)
+                if cap_bytes and size > cap_bytes:
+                    skipped.append((full, f"{_fmt_bytes(size)} is over the {max_sidecar_gb:g} GB sidecar limit"))
+                    continue
+                extras.append(full)
+                extras_bytes += size
+            if r["file_name"]:
+                own_bytes = _size(os.path.join(sp, r["file_name"]))
+        else:
+            own_bytes = _size(sp)
 
         plans.append(PlannedMove(
             app_id=r["app_id"], variant_id=r["variant_id"],
-            source_path=r["source_path"], primary_file_name=r["file_name"],
+            source_path=sp, primary_file_name=r["file_name"],
             dest_path=dest, collision=os.path.exists(dest),
             is_portable=is_portable, shared_folder=shared,
-            shared_extra_paths=shared_extras,
+            shared_extra_paths=extras,
             app_name=r["app_name"] or "", version=r["version"] or "",
+            container_folder=container, own_bytes=own_bytes, extras_bytes=extras_bytes,
+            cross_volume=not _same_volume(sp, dest), skipped_items=skipped,
         ))
     return plans
 
 
+# ---------------------------------------------------------------------
+# Chunked copy (progress + cancel) and transfer
+# ---------------------------------------------------------------------
+
+def _copy_file_chunked(src: str, dst: str, op: _Op) -> None:
+    if os.path.islink(src):
+        os.symlink(os.readlink(src), dst)
+        return
+    with open(src, "rb") as fin, open(dst, "xb") as fout:   # "x": never overwrite
+        while True:
+            buf = fin.read(_COPY_CHUNK)
+            if not buf:
+                break
+            fout.write(buf)
+            op.add(len(buf))
+    try:
+        shutil.copystat(src, dst)
+    except OSError:
+        pass
+
+
+def _copy_tree_chunked(src: str, dst: str, op: _Op) -> None:
+    os.makedirs(dst)
+    for root, dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        target_root = dst if rel == "." else os.path.join(dst, rel)
+        for d in dirs:
+            os.makedirs(os.path.join(target_root, d), exist_ok=True)
+        for f in files:
+            _copy_file_chunked(os.path.join(root, f), os.path.join(target_root, f), op)
+
+
+def _remove_partial(path: str) -> None:
+    """Delete something WE were in the middle of creating (it did not exist before)."""
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.lexists(path):
+            os.remove(path)
+    except OSError as e:
+        log.warning("Could not remove partial copy %s: %s", path, e)
+
+
+def _transfer_item(item: str, dest_dir: str, copy_mode: str, prog: _Progress) -> tuple:
+    """
+    Moves or copies one file/folder into dest_dir. Returns (transferred, collided).
+    Never overwrites. A same-volume move is an instant rename; a copy (or a
+    cross-volume move) is chunked with live progress and is cancellable --
+    a half-written copy is deleted again, the original is never touched until
+    the copy is complete.
+    """
+    if not os.path.lexists(item):
+        return False, False
+    name = os.path.basename(item)
+    dest_item = os.path.join(dest_dir, name)
+    if os.path.lexists(dest_item):
+        return False, True
+
+    if copy_mode == "move":
+        try:
+            prog.emit("move", f"Moving (rename): {name}")
+            os.rename(item, dest_item)
+            log_job.info("[%d/%d] renamed %s", prog.index, prog.total, name)
+            return True, False
+        except OSError as e:
+            cross = getattr(e, "errno", None) == errno.EXDEV or getattr(e, "winerror", None) == 17
+            if not cross:
+                raise      # locked file / permission problem: report it, don't silently duplicate
+            log_job.info("[%d/%d] %s is on another volume -> copy, then delete original",
+                         prog.index, prog.total, name)
+
+    verb = "Copying" if copy_mode == "copy" else "Moving across volumes"
+    prog.emit("measure", f"Measuring {name} ...")
+    total = _path_size(item)
+    op = prog.op("copy", f"{verb}: {name}", total, counts_as_copy=True)
+    try:
+        if os.path.isdir(item) and not os.path.islink(item):
+            _copy_tree_chunked(item, dest_item, op)
+        else:
+            _copy_file_chunked(item, dest_item, op)
+    except BaseException:
+        _remove_partial(dest_item)      # ReorganizeCancelled, OSError, KeyboardInterrupt...
+        raise
+    op.finish()
+
+    if copy_mode == "move":             # only after a COMPLETE copy
+        prog.emit("cleanup", f"Removing original: {name}")
+        if os.path.isdir(item) and not os.path.islink(item):
+            shutil.rmtree(item)
+        else:
+            os.remove(item)
+    return True, False
+
+
+# ---------------------------------------------------------------------
+# Archiving (one bare installer file only)
+# ---------------------------------------------------------------------
+
+class _SizePoller:
+    """Reports the growing size of an archive being written by a library that has
+    no progress hook of its own (py7zr, rar.exe)."""
+
+    def __init__(self, path, op, interval=0.5):
+        self.path, self.op, self.interval = path, op, interval
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self.op.set_done(os.path.getsize(self.path))
+            except OSError:
+                pass
+
+    def __enter__(self):
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._t.join(timeout=2)
+
+
 def _archive_single_file(file_path: str, archive_format: str,
-                         password: Optional[str] = None) -> Optional[str]:
+                         password: Optional[str] = None,
+                         prog: Optional[_Progress] = None) -> Optional[str]:
     """
     Compresses ONE file into an archive of the same base name next to it
-    (e.g. Setup.exe -> Setup.7z), then removes the original file --
-    everything else in that file's folder (readme, crack, keygen, theme,
-    serial, ...) is left completely untouched. Archiving here is
-    deliberately scoped to just the installer file, not the whole
-    destination folder, so a version's extras stay as ordinary loose
-    files/folders rather than getting swept into the archive too.
-
-    If `password` is given the archive is encrypted with it and the
-    password is appended to the archive's name in parentheses
-    (Setup.exe -> Setup(password).7z). See validate_archive_password().
-
-    Returns the archive's path on success, or None if archive_format is
-    'none' or archiving failed -- on failure the original file is left
-    exactly as it was (nothing partially deleted, no half-written archive
-    left behind), and the caller decides how to report it. A requested
-    password is never silently dropped: if it can't be applied the file
-    is left uncompressed rather than archived unprotected.
+    (Setup.exe -> Setup.7z, or Setup(password).7z when `password` is given),
+    then removes the original. Nothing else in the folder is touched.
+    Returns the archive path, or None if nothing was archived -- on ANY failure
+    (or cancel) the partial archive is deleted and the original is left exactly
+    as it was. A requested password is never silently dropped.
     """
     if archive_format == "none":
         return None
     if archive_format not in VALID_ARCHIVE_FORMATS:
         log.warning("Unknown archive_format %r -- leaving %s as-is", archive_format, file_path)
         return None
-
     if password:
         err = validate_archive_password(password)
         if err:
@@ -1734,90 +2142,78 @@ def _archive_single_file(file_path: str, archive_format: str,
         log.warning("Archive target %s already exists -- leaving %s uncompressed", target, file_path)
         return None
 
+    name = os.path.basename(file_path)
+    size_in = os.path.getsize(file_path)
+    prog = prog or _Progress(None, 0, None)
+    pw_note = ", password-protected" if password else ""
+    ok = False
     try:
         if archive_format == "7z":
             try:
                 import py7zr
             except ImportError:
                 log.warning("py7zr is not installed -- falling back to zip for %s", file_path)
-                return _archive_single_file(file_path, "zip", password)
-            with py7zr.SevenZipFile(target, "w", password=password or None) as archive:
-                archive.write(file_path, arcname=os.path.basename(file_path))
+                return _archive_single_file(file_path, "zip", password, prog)
+            op = prog.op("archive", f"Compressing to 7z{pw_note}: {name}", 0, False,
+                         detail_extra=f"input {_fmt_bytes(size_in)}; 7z reports no % -- watching output size")
+            with _SizePoller(target, op):
+                with py7zr.SevenZipFile(target, "w", password=password or None) as archive:
+                    archive.write(file_path, arcname=name)
+            op.finish()
 
         elif archive_format == "zip":
-            write_zip_archive(file_path, target, password)
+            if not password:      # plain zip: chunked, real percentage, cancellable
+                op = prog.op("archive", f"Compressing to zip: {name}", size_in, False)
+                info = zipfile.ZipInfo.from_file(file_path, name)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf, \
+                        open(file_path, "rb") as src, zf.open(info, "w", force_zip64=True) as dst:
+                    while True:
+                        buf = src.read(_COPY_CHUNK)
+                        if not buf:
+                            break
+                        dst.write(buf)
+                        op.add(len(buf))
+            else:                 # encrypted zip is written by pyzipper / 7z: no progress hook
+                op = prog.op("archive", f"Compressing to zip{pw_note}: {name}", 0, False,
+                             detail_extra=f"input {_fmt_bytes(size_in)}")
+                with _SizePoller(target, op):
+                    write_zip_archive(file_path, target, password)
+            op.finish()
 
         elif archive_format == "rar":
             cmd = ["rar", "a", "-ep1"]
             if password:
                 cmd.append(f"-p{password}")
             cmd += [target, file_path]
+            op = prog.op("archive", f"Compressing to rar{pw_note}: {name}", 0, False,
+                         detail_extra=f"input {_fmt_bytes(size_in)}")
             try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True, text=True,
-                    # checkpoint 23: see scraper.py's fetch_winget_show()
-                    # for why this needs an explicit encoding -- WinRAR's
-                    # own console output isn't guaranteed to be the
-                    # platform's default codepage (cp1252 on typical
-                    # Windows), and a decode crash here would take down
-                    # the whole reorganize run over one archiving message.
-                    encoding="utf-8", errors="replace",
-                )
+                with _SizePoller(target, op):
+                    proc = subprocess.run(cmd, capture_output=True, text=True,
+                                          encoding="utf-8", errors="replace")
             except FileNotFoundError:
-                log.warning(
-                    "No 'rar' executable found on PATH -- RAR archiving requires "
-                    "WinRAR/rar installed separately (Python can't write .rar itself). "
-                    "Leaving %s uncompressed.", file_path,
-                )
+                log.warning("No 'rar' executable found on PATH -- leaving %s uncompressed.", file_path)
                 return None
             if proc.returncode != 0:
                 log.error("RAR archiving failed for %s: %s", file_path, proc.stderr)
-                _remove_partial(target)
                 return None
-    except Exception as e:  # OSError, RuntimeError (no zip-encrypt backend), py7zr/7z errors
-        log.error("Archiving %s to %s%s failed: %s", file_path, archive_format,
-                  " (password-protected)" if password else "", e)
-        _remove_partial(target)
+            op.finish()
+        ok = True
+    except ReorganizeCancelled:
+        raise
+    except Exception as e:      # OSError, RuntimeError (no zip-encrypt backend), py7zr/7z errors
+        log.error("Archiving %s to %s%s failed: %s", file_path, archive_format, pw_note, e)
         return None
+    finally:
+        if not ok:
+            _remove_partial(target)
 
     try:
         os.remove(file_path)
     except OSError as e:
         log.warning("Archived %s to %s but could not remove the original file: %s", file_path, target, e)
     return target
-
-
-def _remove_partial(path: str) -> None:
-    """Best-effort cleanup of a half-written archive (only ever called on a
-    target that did not exist before this attempt)."""
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except OSError:
-        pass
-
-
-def _transfer_item(item: str, dest_dir: str, copy_mode: str) -> tuple:
-    """
-    Moves or copies one file/folder into dest_dir. Returns
-    (transferred: bool, collided: bool). Never overwrites: if
-    dest_dir/basename(item) already exists, it's reported as a collision
-    and left untouched.
-    """
-    if not os.path.exists(item):
-        return False, False  # vanished between preview and execute -- not fatal
-    dest_item = os.path.join(dest_dir, os.path.basename(item))
-    if os.path.exists(dest_item):
-        return False, True
-    if copy_mode == "copy":
-        if os.path.isdir(item):
-            shutil.copytree(item, dest_item)
-        else:
-            shutil.copy2(item, dest_item)
-    else:
-        shutil.move(item, dest_item)
-    return True, False
 
 
 def _cleanup_empty_ancestors(start_dir: str, max_levels: int = 8) -> None:
@@ -1859,95 +2255,43 @@ def execute_reorganize(
     archive_format: str = "none",
     archive_password: Optional[str] = None,
     move_log_dir: Optional[str] = None,
-    progress_callback: Optional[Callable[[int, int, "PlannedMove", str], None]] = None,
+    progress_callback: Optional[Callable[[ReorgEvent], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> ReorganizeResult:
     """
-    Executes EXACTLY the plan handed in (the caller is expected to have
-    gotten this from preview_reorganize(), reviewed it, and dropped/kept
-    whichever rows it wants) -- deliberately does NOT recompute the plan
-    itself, so a caller can't accidentally execute a plan that's gone
-    stale relative to what a user actually reviewed.
+    Executes EXACTLY the plan handed in (from preview_reorganize()).
 
-    progress_callback(index, total, plan, status), if given, is invoked
-    after EVERY plan (index is 1-based) regardless of outcome -- lets a
-    GUI drive a progress bar/live log without this function knowing
-    anything about Qt. A callback that raises is logged and ignored
-    rather than allowed to abort the actual file operation underway.
-    Every plan is also always logged to the "appcatalog.organizer.job"
-    logger (one line each: OK/SKIPPED/FAILED) regardless of whether a
-    callback is given, so a console/log file always has a record even
-    with no GUI attached -- see the module's existing scanner.job/
-    resolver.job loggers for the established convention this follows.
+    progress_callback(ReorgEvent) is called continuously -- when an item starts,
+    at every phase change (move / copy / archive / cleanup) and about five times
+    a second while bytes are being copied -- and once more with final=True when
+    the item is done. It may be called from a helper thread (archive size
+    polling), so a GUI must marshal it onto its own thread (Qt signals do).
 
-    copy_mode: "move" (default) removes items from source_path as they're
-    transferred and repoints variants.source_path at the new location.
-    "copy" leaves the originals in place and does NOT repoint
-    variants.source_path -- the original is still the live, valid
-    location, so the catalog keeps referencing it rather than the new
-    duplicate.
+    cancel_event: set it to stop. A running copy stops within a few MB and its
+    half-written copy is deleted; the original is never touched until a copy is
+    complete. A running 7z/rar compression can't be interrupted mid-file, so a
+    cancel takes effect when that one file is finished.
 
-    archive_format: "none" (default) leaves every transferred file as-is.
-    "7z"/"zip"/"rar" compresses ONLY the variant's own installer file in
-    place inside the destination folder (e.g. Setup.exe -> Setup.7z) once
-    the transfer completes, and updates the catalog's file_name (move
-    mode only) to match -- everything else in that folder (readme, crack,
-    keygen, theme, serial, ...) is left exactly as it was, never swept
-    into the archive. Skipped entirely when the variant's own file is
-    already a packaged/compressed format (.zip/.rar/.7z/.tar/.gz/.iso/...
-    -- see DEFAULT_ALREADY_COMPRESSED_EXTENSIONS, overridable via the
-    "monitor_already_compressed_extensions" setting shared with
-    monitor.py): compressing an already-compressed installer again wastes
-    time/CPU for no space savings. See _archive_single_file()'s docstring
-    for format-specific caveats (7z needs py7zr, rar needs an external
-    rar/WinRAR binary).
-
-    Two transfer strategies, chosen per plan:
-      - ORDINARY plan (source_path folder used by only this variant,
-        the vast majority of cases): the WHOLE folder's contents move/
-        copy into dest_path in one pass. Anything sitting alongside the
-        installer inside that folder -- readme, crack, keygen, theme,
-        serial, whatever -- travels with it automatically, since it was
-        never a separate item to track.
-      - SHARED-FOLDER plan (plan.shared_folder is True -- another variant
-        in THIS SAME planned_moves batch also has this source_path,
-        e.g. a portable build and a regular installer shipped in one
-        folder): only this variant's own file (primary_file_name) is
-        MOVED/COPIED per copy_mode. Anything else left in that folder
-        that no sibling variant claims (plan.shared_extra_paths) is
-        always COPIED (never moved), regardless of copy_mode, into every
-        sibling's destination -- since deleting it would risk breaking a
-        sibling plan not-yet-processed in the same run. This means a
-        shared folder's unclaimed extras end up duplicated across every
-        variant that shared the folder, and the original folder is left
-        in place afterward rather than auto-deleted, so nothing is ever
-        silently lost; it can be cleaned up by hand once confirmed.
-
-    Safety choices (see this module's docstring for why, vs. the
-    DeepSeek build this was adapted from):
-      - Collision handling is per-ITEM, not per-plan: dest_path is always
-        created and each item is checked against its own destination
-        filename individually, so a version folder that already has SOME
-        of its files from an earlier partial run doesn't block the rest
-        from completing, and nothing is EVER overwritten. A plan only
-        counts as fully "skipped_collision" if every one of its items
-        already exists at the destination.
-      - Every plan is wrapped individually; one failure is recorded and
-        skipped rather than aborting the whole batch.
-      - A JSON move log (source, dest, timestamp, per-item detail) is
-        written to move_log_dir (defaults to next to catalog.db) both
-        before starting (the full plan, so a crash mid-run still leaves a
-        record of intent) and updated with each result, for manual
-        audit/undo -- there's no automatic "undo" button, but the log has
-        everything needed to reverse it by hand.
+    Handling per plan:
+      ORDINARY plan   every item of the folder is moved (same-volume: instant
+                      rename; cross-volume or copy mode: chunked copy).
+      SHARED / CONTAINER plan (shared_folder=True)
+                      only this variant's own file moves; its loose sidecar FILES
+                      are copied. Sub-folders are never touched (see
+                      preview_reorganize()).
+    Only a bare installer (.exe/.msi/... -- setting
+    "reorganize_bare_installer_extensions") is ever archived, and only that one
+    file, never the folder.
+    Every plan is isolated: one failure is recorded, the batch continues.
+    A JSON move log is flushed before and after every plan.
     """
     if copy_mode not in VALID_COPY_MODES:
         raise ValueError(f"copy_mode must be one of {VALID_COPY_MODES}, got {copy_mode!r}")
     if archive_format not in VALID_ARCHIVE_FORMATS:
         raise ValueError(f"archive_format must be one of {VALID_ARCHIVE_FORMATS}, got {archive_format!r}")
-    # A password only means something when archiving is on. Fail up front
-    # (before any file is touched) rather than half-way through a run.
+
     if archive_format == "none":
-        archive_password = None
+        archive_password = None       # a password only means something when archiving
     elif archive_password:
         _pw_err = validate_archive_password(archive_password)
         if _pw_err:
@@ -1956,21 +2300,15 @@ def execute_reorganize(
     conn = db.connect()
     result = ReorganizeResult()
     total = len(planned_moves)
+    t_run = time.monotonic()
+    prog = _Progress(progress_callback, total, cancel_event)
 
-    # Shared with monitor.py's own "already compressed" handling (see
-    # gui_main.py's Monitor tab setting of the same name) so both features
-    # agree on what counts as "already packaged" without two separate
-    # places to configure it. Falls back to a sensible built-in list if
-    # the setting has never been touched (it defaults to an empty list).
     settings = db.get_all_settings()
-    already_compressed_exts = {
+    bare_exts = {
         e.lower() if e.startswith(".") else f".{e.lower()}"
-        for e in (settings.get("monitor_already_compressed_extensions") or DEFAULT_ALREADY_COMPRESSED_EXTENSIONS)
+        for e in (settings.get("reorganize_bare_installer_extensions") or DEFAULT_BARE_INSTALLER_EXTENSIONS)
     }
 
-    # checkpoint 21: logs live in logs/ next to catalog.db (see
-    # app_paths.py), not bare next to it -- keeps the catalog's own
-    # folder from filling up with timestamped JSON/HTML files over time.
     log_dir = Path(move_log_dir) if move_log_dir else get_logs_dir(db.path)
     run_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_path = log_dir / f"reorganize_log_{run_stamp}.json"
@@ -1983,104 +2321,87 @@ def execute_reorganize(
         except OSError as e:
             log.warning("Could not write reorganize move log to %s: %s", log_path, e)
 
-    log.info(
-        "REORGANIZE STARTING: %d item(s) to process (mode=%s, archive=%s)",
-        total, copy_mode, archive_format,
-    )
+    to_write = sum(plan_bytes_to_write(p, copy_mode) for p in planned_moves)
+    log.info("REORGANIZE STARTING: %d item(s) (mode=%s, archive=%s) -- about %s will be physically written",
+             total, copy_mode, archive_format, _fmt_bytes(to_write))
 
-    def _report(index: int, plan: "PlannedMove", status: str):
-        if progress_callback is not None:
-            try:
-                progress_callback(index, total, plan, status)
-            except Exception:  # a GUI callback misbehaving must never abort the file operation
-                log.exception("progress_callback raised -- ignoring and continuing")
+    def _finish(entry, plan, status, message):
+        entry["status"] = status
+        prog.emit("finish", message, final=True, status=status)
+        _flush_log()
 
     for i, plan in enumerate(planned_moves, start=1):
+        if prog.cancelled():
+            break
+        prog.begin(i, plan)
         entry = {
             "variant_id": plan.variant_id, "app_id": plan.app_id,
             "app_name": plan.app_name, "version": plan.version,
             "source": plan.source_path, "dest": plan.dest_path,
-            "shared_folder": plan.shared_folder, "copy_mode": copy_mode,
-            "archive_format": archive_format,
+            "shared_folder": plan.shared_folder, "container_folder": plan.container_folder,
+            "sidecars_copied": len(plan.shared_extra_paths),
+            "copy_mode": copy_mode, "archive_format": archive_format,
             "timestamp": datetime.now().isoformat(), "status": "pending",
         }
         log_entries.append(entry)
         _flush_log()
 
-        # Reported/logged BEFORE any file work starts on this item, not
-        # just after it finishes -- a large folder or a slow archive step
-        # can take a real amount of time with nothing else to show for it
-        # in between, and without this the console/activity log can look
-        # stalled between one item's completion and the next.
-        log_job.info("[%d/%d] STARTING: %s", i, total, plan.source_path)
-        _report(i, plan, "starting")
+        label = f"{plan.app_name} {plan.version}".strip() or os.path.basename(plan.source_path)
+        log_job.info("[%d/%d] STARTING: %s  (%s)%s", i, total, label, plan.source_path,
+                     "  [shared/container folder: own file only]" if plan.shared_folder else "")
+        prog.emit("start", f"Starting: {label}", detail=f"{plan.source_path}  ->  {plan.dest_path}")
 
         if not os.path.exists(plan.source_path):
-            entry["status"] = "failed"
             entry["error"] = "source folder no longer exists"
             result.failed.append({
-                "variant_id": plan.variant_id, "app_name": plan.app_name,
-                "version": plan.version, "source": plan.source_path,
-                "dest": plan.dest_path, "error": entry["error"],
+                "variant_id": plan.variant_id, "app_name": plan.app_name, "version": plan.version,
+                "source": plan.source_path, "dest": plan.dest_path, "error": entry["error"],
             })
             log_job.error("[%d/%d] FAILED: %s -- source folder no longer exists", i, total, plan.source_path)
-            _report(i, plan, entry["status"])
-            _flush_log()
+            _finish(entry, plan, "failed", entry["error"])
             continue
 
         try:
             os.makedirs(plan.dest_path, exist_ok=True)
-
             item_collisions = []
             moved_any = False
 
             if plan.shared_folder:
-                # Only this variant's own file, plus a copy of whatever's
-                # unclaimed in the shared folder (see docstring above).
-                own_items = []
                 if plan.primary_file_name:
-                    own_items.append(os.path.join(plan.source_path, plan.primary_file_name))
-                for item in own_items:
-                    transferred, collided = _transfer_item(item, plan.dest_path, copy_mode)
+                    own = os.path.join(plan.source_path, plan.primary_file_name)
+                    transferred, collided = _transfer_item(own, plan.dest_path, copy_mode, prog)
                     moved_any = moved_any or transferred
                     if collided:
-                        item_collisions.append(item)
+                        item_collisions.append(own)
                 for item in plan.shared_extra_paths:
-                    transferred, collided = _transfer_item(item, plan.dest_path, "copy")
+                    transferred, collided = _transfer_item(item, plan.dest_path, "copy", prog)
                     moved_any = moved_any or transferred
                     if collided:
                         item_collisions.append(item)
-                # Shared folders are never auto-cleaned -- see docstring.
+                if plan.skipped_items:
+                    entry["left_in_place"] = [{"path": p, "reason": why} for p, why in plan.skipped_items]
+                    for p_, why in plan.skipped_items:
+                        log_job.info("[%d/%d] left in place: %s -- %s", i, total, p_, why)
             else:
-                items = [os.path.join(plan.source_path, n) for n in os.listdir(plan.source_path)]
-                for item in items:
-                    transferred, collided = _transfer_item(item, plan.dest_path, copy_mode)
+                names = os.listdir(plan.source_path)
+                for n_idx, n in enumerate(names, start=1):
+                    prog.emit("move", f"Item {n_idx}/{len(names)}: {n}")
+                    transferred, collided = _transfer_item(
+                        os.path.join(plan.source_path, n), plan.dest_path, copy_mode, prog)
                     moved_any = moved_any or transferred
                     if collided:
-                        item_collisions.append(item)
+                        item_collisions.append(os.path.join(plan.source_path, n))
 
             if item_collisions and not moved_any:
-                entry["status"] = "skipped_collision"
                 entry["colliding_items"] = item_collisions
                 result.skipped_collisions += 1
                 log_job.warning("[%d/%d] SKIPPED (destination already has this content): %s",
-                                 i, total, plan.source_path)
-                _report(i, plan, entry["status"])
-                _flush_log()
+                                i, total, plan.source_path)
+                _finish(entry, plan, "skipped_collision", "Skipped: destination already has this content")
                 continue
             if item_collisions:
                 entry["partial_collisions"] = item_collisions
 
-            # Move mode: clean up a now-empty ORDINARY source folder, then
-            # keep climbing and removing now-empty parent folders too (an
-            # app's version folder disappearing often leaves an empty
-            # AppName/ folder behind, and sometimes an empty Subcatalog/
-            # or Catalog/ folder above that) -- a plain os.rmdir() only
-            # ever removes the one directory that's actually empty, so it
-            # naturally stops the moment it hits a folder still holding
-            # something else. (Shared folders are deliberately left in
-            # place -- see docstring. A bare-file transfer has nothing
-            # left to clean up, shutil.move already removed the file.)
             if copy_mode == "move" and not plan.shared_folder:
                 try:
                     if os.path.exists(plan.source_path) and not os.listdir(plan.source_path):
@@ -2089,79 +2410,79 @@ def execute_reorganize(
                 except OSError as e:
                     log.warning("Could not remove empty source folder %s: %s", plan.source_path, e)
 
-            # dest_path (the version folder) never changes because of
-            # archiving now -- only the specific installer file inside it
-            # gets replaced with a compressed version; every sidecar next
-            # to it (readme, crack, theme, ...) stays exactly as it was.
             new_file_name = plan.primary_file_name
-            already_compressed = _is_already_compressed(plan.primary_file_name, already_compressed_exts)
-            if archive_format != "none" and not already_compressed:
-                if plan.primary_file_name:
+            is_bare = bool(plan.primary_file_name) and \
+                os.path.splitext(plan.primary_file_name)[1].lower() in bare_exts
+            if archive_format != "none":
+                if is_bare:
                     installer_path = os.path.join(plan.dest_path, plan.primary_file_name)
                     if os.path.exists(installer_path):
-                        log_job.info("[%d/%d] Archiving installer as .%s: %s",
-                                     i, total, archive_format, installer_path)
-                        archived_path = _archive_single_file(
-                            installer_path, archive_format, archive_password)
+                        archived_path = _archive_single_file(installer_path, archive_format,
+                                                             archive_password, prog)
                         if archived_path:
                             new_file_name = os.path.basename(archived_path)
                             result.archived += 1
                             entry["archive_path"] = archived_path
                             if archive_password:
                                 entry["archive_password_protected"] = True
+                        else:
+                            entry["archive_failed"] = True
                     else:
-                        log_job.warning(
-                            "[%d/%d] Could not find installer file to archive at %s -- left uncompressed",
-                            i, total, installer_path,
-                        )
+                        log_job.warning("[%d/%d] installer not found at %s -- left as-is",
+                                        i, total, installer_path)
                 else:
-                    log_job.warning(
-                        "[%d/%d] No known installer filename for this variant -- left uncompressed",
-                        i, total,
-                    )
-            elif archive_format != "none" and already_compressed:
-                log_job.info(
-                    "[%d/%d] Not archiving -- %s is already a compressed/packaged file",
-                    i, total, plan.primary_file_name,
-                )
-                entry["archive_skipped_already_compressed"] = True
+                    log_job.info("[%d/%d] Not archiving -- %s is not a bare installer (%s)",
+                                 i, total, plan.primary_file_name or "(no file name)",
+                                 "/".join(sorted(bare_exts)))
+                    entry["archive_skipped_already_compressed"] = True
 
-            # Only a MOVE repoints the catalog's live pointer -- a COPY
-            # leaves the original untouched and still valid, so the catalog
-            # keeps referencing it rather than the new duplicate. file_name
-            # is updated alongside source_path when archiving renamed the
-            # installer (e.g. Setup.exe -> Setup.7z).
             if copy_mode == "move":
                 conn.execute(
                     "UPDATE variants SET source_path = ?, file_name = ?, updated_at = datetime('now') "
-                    "WHERE id = ?",
-                    (plan.dest_path, new_file_name, plan.variant_id),
-                )
+                    "WHERE id = ?", (plan.dest_path, new_file_name, plan.variant_id))
                 conn.commit()
 
-            entry["status"] = "moved" if copy_mode == "move" else "copied"
             result.moved += 1
-            log_job.info("[%d/%d] %s OK: %s -> %s",
-                          i, total, copy_mode.upper(), plan.source_path, plan.dest_path)
-        except OSError as e:
-            entry["status"] = "failed"
-            entry["error"] = str(e)
+            log_job.info("[%d/%d] %s OK: %s -> %s", i, total, copy_mode.upper(),
+                         plan.source_path, plan.dest_path)
+            _finish(entry, plan, "moved" if copy_mode == "move" else "copied",
+                    "Done" + (" (archived)" if entry.get("archive_path") else ""))
+
+        except ReorganizeCancelled:
+            entry["error"] = "cancelled by user"
+            result.cancelled = True
+            log_job.warning("[%d/%d] CANCELLED while processing %s (partial copy removed)",
+                            i, total, plan.source_path)
+            _finish(entry, plan, "cancelled", "Cancelled -- partial copy removed, original untouched")
+            break
+        except Exception as e:      # OSError and anything unexpected: isolate to this plan
+            log_job.exception("[%d/%d] %s FAILED: %s -> %s", i, total, copy_mode.upper(),
+                              plan.source_path, plan.dest_path)
+            entry["error"] = f"{type(e).__name__}: {e}"
             result.failed.append({
-                "variant_id": plan.variant_id, "app_name": plan.app_name,
-                "version": plan.version, "source": plan.source_path,
-                "dest": plan.dest_path, "error": str(e),
+                "variant_id": plan.variant_id, "app_name": plan.app_name, "version": plan.version,
+                "source": plan.source_path, "dest": plan.dest_path, "error": entry["error"],
             })
-            log_job.error("[%d/%d] %s FAILED: %s -> %s: %s",
-                           i, total, copy_mode.upper(), plan.source_path, plan.dest_path, e)
-        _report(i, plan, entry["status"])
+            _finish(entry, plan, "failed", entry["error"])
+
+    if result.cancelled or prog.cancelled():
+        result.cancelled = True
+        for plan in planned_moves[len(log_entries):]:
+            log_entries.append({
+                "variant_id": plan.variant_id, "app_id": plan.app_id, "app_name": plan.app_name,
+                "version": plan.version, "source": plan.source_path, "dest": plan.dest_path,
+                "status": "not_started",
+            })
+            result.not_started += 1
         _flush_log()
 
     result.entries = log_entries
-
-    log.info(
-        "REORGANIZE FINISHED: moved=%d archived=%d skipped=%d failed=%d",
-        result.moved, result.archived, result.skipped_collisions, len(result.failed),
-    )
+    result.bytes_copied = prog.bytes_copied_total
+    result.elapsed_seconds = time.monotonic() - t_run
+    log.info("REORGANIZE %s: moved=%d archived=%d skipped=%d failed=%d not_started=%d copied=%s in %s",
+             "CANCELLED" if result.cancelled else "FINISHED", result.moved, result.archived,
+             result.skipped_collisions, len(result.failed), result.not_started,
+             _fmt_bytes(result.bytes_copied), _fmt_duration(result.elapsed_seconds))
 
     try:
         result.html_report_path = generate_reorganize_html_report(
@@ -2211,14 +2532,21 @@ def generate_reorganize_html_report(
         if e.get("archive_path"):
             bits.append(f"compressed to {os.path.basename(e['archive_path'])}"
                         + (" (password-protected)" if e.get("archive_password_protected") else ""))
+        elif e.get("archive_failed"):
+            bits.append("archiving failed -- installer left uncompressed (see log)")
         elif e.get("archive_skipped_already_compressed"):
-            bits.append("already compressed, not re-archived")
+            bits.append("not a bare installer (.exe/.msi/...), left uncompressed")
+        if e.get("sidecars_copied"):
+            bits.append(f"{e['sidecars_copied']} sidecar item(s) copied along")
+        for it in e.get("left_in_place") or []:
+            bits.append(f"LEFT IN PLACE {os.path.basename(it['path'])}: {it['reason']}")
         return "; ".join(bits)
 
     _STATUS_MAP = {
         "moved": ("Moved", "good"), "copied": ("Copied", "good"),
         "failed": ("Failed", "bad"), "skipped_collision": ("Skipped", "warn"),
         "pending": ("Interrupted", "bad"),  # never flushed past "pending" -- the run crashed/was killed
+        "cancelled": ("Cancelled", "warn"), "not_started": ("Not started", "neutral"),
     }
     rows = [
         ReportRow(
@@ -2240,6 +2568,7 @@ def generate_reorganize_html_report(
             ("Archived", result.archived, "neutral"),
             ("Skipped (collision)", result.skipped_collisions, "warn" if result.skipped_collisions else "good"),
             ("Failed", len(result.failed), "bad" if result.failed else "good"),
+            *([("Cancelled / not started", 1 + result.not_started, "warn")] if result.cancelled else []),
         ],
         rows=rows,
         json_log_path=result.move_log_path,

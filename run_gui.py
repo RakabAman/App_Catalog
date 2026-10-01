@@ -18,14 +18,28 @@ no visible console window. See app_paths.py's module docstring for why
 paths are resolved the way they are (checkpoint 21).
 """
 
+import ctypes
 import logging
 import logging.handlers
 import os
 import sys
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from app_paths import get_app_log_path, get_default_db_path, resolve_db_path
+
+
+def _resource(relative_path: str) -> str:
+    """
+    Resolve a bundled resource path for both dev and PyInstaller-frozen
+    runs. PyInstaller unpacks data files to sys._MEIPASS at runtime (a
+    temp folder), NOT next to the .exe -- so a bare open("ico.ico") that
+    works in dev silently fails after packaging. This helper is the one
+    place that knows about that difference.
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative_path)
 
 
 def _setup_logging(db_path: str):
@@ -92,6 +106,25 @@ def _apply_ui_scale(db_path: str):
         pass  # never block startup over a cosmetic setting
 
 
+def _set_windows_taskbar_identity():
+    """
+    Without an explicit AppUserModelID, Windows groups a frozen app's
+    taskbar button under the launcher process (python.exe / the PyInstaller
+    bootloader), and shows the default Python icon instead of the app's own
+    .ico -- even when setWindowIcon() has been called and the window's
+    title bar shows the right icon. Must run BEFORE QApplication is
+    constructed, and is a no-op on non-Windows platforms.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "AppCatalog.Main.1.0"
+        )
+    except Exception:
+        pass  # cosmetic only -- never block startup
+
+
 def main():
     raw_db_path = sys.argv[1] if len(sys.argv) > 1 else get_default_db_path()
     db_path = resolve_db_path(raw_db_path)
@@ -101,8 +134,16 @@ def main():
 
     _apply_ui_scale(db_path)
 
+    # Must run BEFORE QApplication exists -- see docstring.
+    _set_windows_taskbar_identity()
+
     app = QApplication(sys.argv)
     app.setApplicationName("App Catalog")
+    # Window / title-bar icon, and the icon Windows uses for the taskbar
+    # button once the AppUserModelID above is set. Uses the frozen-aware
+    # resolver, NOT a bare "ico.ico" (which only exists at runtime if the
+    # spec file bundles it -- see app_manager.spec's `datas=` line).
+    app.setWindowIcon(QIcon(_resource("ico.ico")))
 
     from gui_main import MainWindow
     window = MainWindow(db_path)
