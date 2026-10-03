@@ -310,6 +310,15 @@ class Database:
         conn.executescript(DDL)
         conn.commit()
         self._run_migrations()
+        # Variant manifests (appcatalog.json): additive columns + uid/dirty
+        # triggers. Safe on any existing catalog.db -- see app_manifest.py.
+        from app_manifest import ensure_manifest_schema
+        # Protection against re-resolve duplicates (aliases, pinned variants):
+        # additive too -- see app_curation.py. Must run before the manifest
+        # triggers are (re)built.
+        from app_curation import ensure_curation_schema
+        ensure_curation_schema(conn)
+        ensure_manifest_schema(conn)
         self._fix_bad_skip_roots()   # <-- add this
         self._ensure_defaults()
 

@@ -10,6 +10,9 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 import re
+import app_manifest
+import app_curation
+from curation_dialogs import AddAppDialog, RepairEmptyAppsDialog
 from PySide6.QtCore import Qt, Signal, QItemSelectionModel, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
@@ -45,6 +48,7 @@ from gui_backend import (
     export_apps_csv, import_apps_csv,
     ScanWorker, ScanAndResolveWorker, ResolveWorker, ScrapeWorker,
     ChocoSearchWorker, WingetSearchWorker, CleanLibraryScanWorker,
+    ManifestWorker, ManifestFlushWorker,
 )
 
 
@@ -907,11 +911,19 @@ class DetailPanel(QWidget):
         if vid is None:
             QMessageBox.information(self, "No selection", "Select a variant row first.")
             return
-        name, ok = QInputDialog.getText(self, "Split into new app", "New app name:")
-        if ok and name.strip():
-            split_variant_to_new_app(self.db, vid, name.strip())
-            self.load_app(self.current_app_id)
-            self.app_changed.emit()
+        # The same dialog as "Add app", prefilled from the variant (installer file,
+        # app folder, version, edition, ... all editable).
+        conn = self.db.connect()
+        v = conn.execute("SELECT * FROM variants WHERE id = ?", (vid,)).fetchone()
+        a = conn.execute("SELECT * FROM apps WHERE id = ?", (v["app_id"],)).fetchone()
+        dlg = AddAppDialog(self.db, parent=self, split_variant=dict(v), split_app=dict(a))
+        if dlg.exec() != QDialog.Accepted or not dlg.result_info:
+            return
+        if conn.execute("SELECT 1 FROM apps WHERE id = ?", (self.current_app_id,)).fetchone():
+            self.load_app(self.current_app_id)       # (the old app is deleted if this was its only variant)
+        self.app_changed.emit()
+        if dlg.scrape_after:
+            self.scrape_requested.emit([dlg.result_info["app_id"]])
 
     def _selected_variant_rows(self) -> list[dict]:
         vids = {item.data(Qt.UserRole) for item in self.variants_table.selectedItems()}
@@ -936,10 +948,12 @@ class DetailPanel(QWidget):
         variants.file_locked is set to 1, so the scanner keeps using this
         file instead of auto-picking on future re-scans.
 
-        If the user picks a file OUTSIDE source_path, the override can't
-        be honored on a re-scan (the scanner only ever sees files under
-        source_path), so this is refused with a warning rather than
-        silently storing something the scanner will never find.
+        If the user picks a file OUTSIDE source_path, the scanner could never
+        find it again (it only sees files under source_path). The user is told
+        so and can OVERRIDE: the variant's folder is widened to the common
+        parent folder of both, that folder becomes one single-app unit with
+        the chosen file as its locked entry (see _offer_installer_override and
+        app_curation.apply_installer_override).
         """
         source_path = variant["source_path"]
         if not os.path.isdir(source_path):
@@ -973,15 +987,7 @@ class DetailPanel(QWidget):
             rel = ""
 
         if not rel or rel.startswith(".."):
-            QMessageBox.warning(
-                self, "Outside the app folder",
-                "The file you picked is not inside this variant's app folder:\n\n"
-                f"App folder: {source_path}\n"
-                f"Chosen file: {chosen}\n\n"
-                "The installer file must be somewhere inside the app folder "
-                "(including any of its subfolders). Please pick a file that "
-                "lives under that folder.",
-            )
+            self._offer_installer_override(variant, chosen)
             return
 
         conn = self.db.connect()
@@ -995,6 +1001,56 @@ class DetailPanel(QWidget):
         self.app_changed.emit()
         
         
+    def _offer_installer_override(self, variant: dict, chosen: str):
+        """The chosen installer is outside the variant's folder (e.g. one level
+        up, in a sibling sub-folder): explain, and offer to use it anyway."""
+        source_path = variant["source_path"]
+        plan = app_curation.plan_installer_override(self.db, variant["id"], chosen)
+        if not plan["ok"]:
+            QMessageBox.warning(self, "Can't use that file", plan["reason"])
+            return
+        sw = plan["swallowed"]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Outside the app folder")
+        box.setText("The file you picked is not inside this variant's app folder.")
+        info = (
+            f"App folder:\n  {source_path}\n\nChosen file:\n  {chosen}\n\n"
+            "The scanner only looks inside a variant's own folder, so to use this file the "
+            "variant would be widened to the folder that contains both:\n"
+            f"  {plan['new_root']}\n\n"
+            f"That whole folder ({plan['sub_folders']} sub-folders, {plan['installer_like_files']} "
+            f"installer-like files) becomes ONE app/variant with “{plan['rel']}” as its installer. "
+            "The installer choice is locked, so re-scans keep it.")
+        if sw:
+            listing = "\n".join(f"  • {s['app']}  —  {s['file'] or ''}" for s in sw[:8])
+            more = f"\n  … and {len(sw) - 8} more" if len(sw) > 8 else ""
+            info += (f"\n\n{len(sw)} variant(s) already catalogued inside that folder become part "
+                     f"of this one and will be REMOVED from the catalog:\n{listing}{more}\n"
+                     "(typically leftovers the scanner made from the unit's own sub-folders).")
+        box.setInformativeText(info)
+        use = box.addButton(
+            f"Use it and remove the {len(sw)} other variant(s)" if sw else "Use it anyway",
+            QMessageBox.AcceptRole)
+        cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        if box.clickedButton() is not use:
+            return
+        try:
+            app_curation.create_backup(self.db.path, "before-override", keep=10)
+            app_curation.apply_installer_override(
+                self.db, variant["id"], chosen, remove_swallowed=True)
+        except Exception as e:
+            QMessageBox.warning(self, "Override failed", str(e))
+            return
+        QMessageBox.information(
+            self, "Installer overridden",
+            "Done. Re-scan this scan root once so the scanner picks up the widened folder.")
+        self.load_app(self.current_app_id)
+        self.app_changed.emit()
+
     def _clear_variant_installer_file(self, variant: dict):
         """Drop the override. Auto-pick takes over on the next re-scan;
         the stored file_name stays as-is until then."""
@@ -1018,6 +1074,8 @@ class DetailPanel(QWidget):
         menu.addSeparator()
         change_file_action = menu.addAction("Change installer file…")
         clear_file_action = menu.addAction("Clear installer file override")
+        menu.addSeparator()
+        manifest_action = menu.addAction("Create/update manifest")
         menu.addSeparator()
         reeval_action = menu.addAction("Re-evaluate selected")
         scrape_action = menu.addAction("Scrape app metadata (Winget)")
@@ -1051,6 +1109,9 @@ class DetailPanel(QWidget):
             self._change_variant_installer_file(single)
         elif chosen == clear_file_action and single:
             self._clear_variant_installer_file(single)
+        elif chosen == manifest_action:
+            res = app_manifest.write_manifests(self.db, [r["id"] for r in rows])
+            QMessageBox.information(self, "Manifest", f"{res.summary()}.")
         elif chosen == reeval_action:
             self._reresolve()
         elif chosen == scrape_action:
@@ -2662,6 +2723,35 @@ class SettingsDialog(QDialog):
         self._two_col(v4, [self.incremental], [self.follow_symlinks])
         layout.addWidget(box_behav)
 
+        # -- Variant manifests --
+        box_mf = self._group("Variant manifests (<app> <version>.appcatalog.json)")
+        vm = box_mf._inner_layout
+        vm.addWidget(self._desc(
+            "A small file written next to each variant: app name, the setup file and its "
+            "dependent files, scraped details (description, Winget / Choco ids). Rescanning "
+            "a re-organized library — or a brand-new database — recognises your manual work "
+            "from these. Category / subcategory are deliberately NOT stored."))
+        self.manifest_auto = QCheckBox(
+            "Keep manifests up to date automatically (when a variant is edited, scraped, "
+            "re-organized or monitored)")
+        self.manifest_auto.setChecked(settings.get("manifest_auto_enabled", True))
+        self.manifest_only_valuable = QCheckBox(
+            "…but only for variants with manual or scraped work "
+            "(untick to also write untouched auto-resolved ones)")
+        self.manifest_only_valuable.setChecked(settings.get("manifest_auto_only_valuable", True))
+        vm.addWidget(self.manifest_auto)
+        vm.addWidget(self.manifest_only_valuable)
+        try:
+            st = app_manifest.manifest_stats(self.db)
+            vm.addWidget(self._desc(
+                f"{st['with_manifest']} of {st['variants']} variants have a manifest · "
+                f"{st['pending']} pending · {st['errors']} with a write error. "
+                "Use the toolbar's “Write manifests…” (or right-click apps) to create them "
+                "manually, e.g. for your existing catalog."))
+        except Exception:
+            pass
+        layout.addWidget(box_mf)
+
         layout.addStretch()
 
     # =====================================================================
@@ -3306,6 +3396,10 @@ class SettingsDialog(QDialog):
                             self.incremental.isChecked(), bump_version=False)
         self.db.set_setting("scan_follow_symlinks",
                             self.follow_symlinks.isChecked(), bump_version=False)
+        self.db.set_setting("manifest_auto_enabled",
+                            self.manifest_auto.isChecked(), bump_version=False)
+        self.db.set_setting("manifest_auto_only_valuable",
+                            self.manifest_only_valuable.isChecked(), bump_version=False)
 
         # -- Naming & Renaming --
         self.db.set_setting("bracket_content_patterns",
@@ -3915,6 +4009,15 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
         self.refresh_all()
 
+        # Variant manifests (appcatalog.json): auto mode flushes changed
+        # variants in the background every few seconds (setting
+        # "manifest_auto_enabled", on by default).
+        self._manifest_flush_worker = None
+        self._manifest_timer = QTimer(self)
+        self._manifest_timer.setInterval(4000)
+        self._manifest_timer.timeout.connect(self._manifest_tick)
+        self._manifest_timer.start()
+
     def _release_worker(self):
         """
         Clears self._active_worker safely. The custom finished_ok/failed
@@ -3944,6 +4047,13 @@ class MainWindow(QMainWindow):
         scan_roots_action.triggered.connect(self._show_scan_roots)
         toolbar.addAction(scan_roots_action)
 
+        add_app_action = QAction("Add app…", self)
+        add_app_action.setToolTip(
+            "Add an app (or another variant of an existing app) straight from its installer "
+            "file -- no scan root needed.")
+        add_app_action.triggered.connect(self._add_app_dialog)
+        toolbar.addAction(add_app_action)
+
         resolve_action = QAction("Re-resolve all", self)
         resolve_action.setToolTip("Re-run resolution on all scanned data with current settings")
         resolve_action.triggered.connect(self._run_resolve_all)
@@ -3966,6 +4076,17 @@ class MainWindow(QMainWindow):
         )
         organize_action.triggered.connect(self._open_organize_dialog)
         toolbar.addAction(organize_action)
+
+        manifests_action = QAction("Write manifests…", self)
+        manifests_action.setToolTip(
+            "Create / refresh a manifest (<app> <version>.appcatalog.json) next to every variant: app name, "
+            "setup file + dependent files, scraped details. A fresh database (or a "
+            "re-organized library) recognises your manual work again from these. "
+            "Select apps first and use the right-click menu to do just those."
+        )
+        manifests_action.triggered.connect(lambda: self._write_manifests_for(None))
+        toolbar.addAction(manifests_action)
+
 
         toolbar.addSeparator()
 
@@ -4296,6 +4417,18 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
 
+        manifest_action = menu.addAction(
+            f"Create/update manifests ({len(app_ids)} apps)"
+            if len(app_ids) > 1 else "Create/update manifest")
+        manifest_action.setToolTip(
+            "Write the .appcatalog.json manifest next to each variant of the selected app(s)")
+        repair_action = menu.addAction("Repair empty apps… (whole library)")
+        repair_action.setToolTip(
+            "Find apps with no variants (left behind by an old rescan bug that duplicated "
+            "renamed/scraped apps) and merge the duplicates back / remove the leftovers.")
+
+        menu.addSeparator()
+
         refine_action = menu.addAction(
             f"Refine names (one-time)… — {len(app_ids)} apps"
             if len(app_ids) > 1 else "Refine names (one-time)…"
@@ -4329,6 +4462,10 @@ class MainWindow(QMainWindow):
                     self.detail_panel.load_app(app_ids[0])
         elif chosen == refine_action:
             self._open_refine_names_dialog(app_ids)
+        elif chosen == manifest_action:
+            self._write_manifests_for(app_ids)
+        elif chosen == repair_action:
+            self._repair_empty_apps()
 
     def _open_refine_names_dialog(self, app_ids):
         dialog = RefineNamesDialog(self.db, app_ids, parent=self)
@@ -4557,6 +4694,27 @@ class MainWindow(QMainWindow):
         if self._active_worker is not None:
             QMessageBox.information(self, "Busy", "A scan/resolve job is already running.")
             return
+        n_apps = self.db.connect().execute("SELECT COUNT(*) FROM apps").fetchone()[0]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Re-resolve ALL apps?")
+        box.setText(f"Re-resolve all {n_apps} apps against the current settings?")
+        box.setInformativeText(
+            "This re-derives names, versions, editions, architectures and categories for every app "
+            "that has no lock, using the current settings and the folder / file names.\n\n"
+            "Protected from this: apps with a locked name / catalog / subcatalog, verified apps, and "
+            "variants you moved, merged or split by hand. Edition / architecture / language you typed "
+            "into a variant are NOT locked and will be recalculated.\n\n"
+            "A backup copy of the catalog is saved first (backups folder next to the database).\n\n"
+            "Usually a normal Scan roots → Rescan is what you want; this is only needed after "
+            "changing naming / filter settings.")
+        yes = box.addButton("Re-resolve all", QMessageBox.DestructiveRole)
+        cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)      # Enter / Space must never trigger the destructive action
+        box.setEscapeButton(cancel)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
         worker = ResolveWorker(self.db_path)
         worker.finished_ok.connect(self._on_resolve_only_finished)
         worker.failed.connect(self._on_job_failed)
@@ -4564,6 +4722,145 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.status_label.setText("Re-resolving all apps with current settings…")
         worker.start()
+
+    # ---------------------------------------------------------------
+    # Manual curation: add an app directly / repair empty apps (app_curation.py)
+    # ---------------------------------------------------------------
+    def _add_app_dialog(self):
+        dlg = AddAppDialog(self.db, parent=self)
+        if dlg.exec() != QDialog.Accepted or not dlg.result_info:
+            return
+        info = dlg.result_info
+        self.refresh_all()
+        self.select_app_by_id(info["app_id"])
+        self.status_label.setText("App added." if info["created_app"] else "Variant added to the existing app.")
+        if dlg.scrape_after:
+            self._run_scrape([info["app_id"]])
+
+    def _repair_empty_apps(self):
+        items = app_curation.find_empty_app_repairs(self.db)
+        if not items:
+            QMessageBox.information(self, "Repair empty apps", "No empty apps found — nothing to repair.")
+            return
+        dlg = RepairEmptyAppsDialog(self.db, items, parent=self)
+        if dlg.exec() == QDialog.Accepted and dlg.applied is not None:
+            a = dlg.applied
+            self.refresh_all()
+            QMessageBox.information(
+                self, "Repair empty apps",
+                f"Merged {a['merged']}, deleted {a['deleted']}, skipped {a['skipped']}.")
+
+    # ---------------------------------------------------------------
+    # Variant manifests (appcatalog.json) -- see app_manifest.py
+    # ---------------------------------------------------------------
+    def _manifest_tick(self):
+        """Auto mode: every few seconds, write manifests for variants whose
+        data changed. Skipped while a scan/resolve/scrape/manual-manifest job
+        runs (they flush themselves when done) or while auto mode is off."""
+        try:
+            if (self._active_worker is not None
+                    or app_manifest.auto_flush_suspended()
+                    or (self._manifest_flush_worker is not None
+                        and self._manifest_flush_worker.isRunning())
+                    or not self.db.get_setting("manifest_auto_enabled", True)
+                    or not app_manifest.has_dirty(self.db)):
+                return
+            worker = ManifestFlushWorker(self.db_path)
+            worker.finished_ok.connect(self._on_manifest_flush_done)
+            self._manifest_flush_worker = worker
+            worker.start()
+        except Exception:
+            pass     # background nicety -- must never disturb the UI
+
+    def _on_manifest_flush_done(self, result):
+        w, self._manifest_flush_worker = self._manifest_flush_worker, None
+        if w is not None:
+            w.wait()
+        if result is not None and (result.created or result.updated):
+            self.status_label.setText(
+                f"Manifests: {result.created} created, {result.updated} updated.")
+        if result is not None and result.failed:
+            self.status_label.setText(
+                f"Manifests: {result.failed} could not be written (see app.log).")
+
+    def _write_manifests_for(self, app_ids: Optional[list]):
+        """Manual: create/refresh manifests for the given apps (None = every app)."""
+        if self._active_worker is not None:
+            QMessageBox.information(self, "Busy", "Another job is already running.")
+            return
+        conn = self.db.connect()
+        if app_ids is None:
+            variant_ids = None
+            total = conn.execute("SELECT COUNT(*) FROM variants").fetchone()[0]
+            have = conn.execute(
+                "SELECT COUNT(*) FROM variants WHERE manifest_hash IS NOT NULL").fetchone()[0]
+            scope = "every variant in the catalog"
+        else:
+            variant_ids = app_manifest.variant_ids_for_apps(self.db, app_ids)
+            total = len(variant_ids)
+            have = 0
+            for i in range(0, len(variant_ids), 500):
+                chunk = variant_ids[i:i + 500]
+                have += conn.execute(
+                    "SELECT COUNT(*) FROM variants WHERE manifest_hash IS NOT NULL AND id IN (%s)"
+                    % ",".join("?" * len(chunk)), chunk).fetchone()[0]
+            scope = f"the {len(app_ids)} selected app(s)"
+        if total == 0:
+            QMessageBox.information(self, "Manifests", "Nothing to write — no variants found.")
+            return
+        answer = QMessageBox.question(
+            self, "Create / update manifests",
+            f"Write a .appcatalog.json manifest next to {scope}?\n\n"
+            f"{total} variant(s), {have} already have one (those are refreshed only if "
+            "something changed).\n\n"
+            "Each file records the app name, the setup file and its dependent files, "
+            "and any scraped details — so a new database or a re-organized library can "
+            "recognise this work again. No installer is modified or moved.",
+            QMessageBox.Yes | QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        worker = ManifestWorker(self.db_path, variant_ids=variant_ids)
+        worker.progress.connect(self._on_manifest_progress)
+        worker.finished_ok.connect(self._on_manifest_finished)
+        worker.failed.connect(self._on_job_failed)
+        self._active_worker = worker
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, max(total, 1))
+        self.status_label.setText(f"Writing manifests for {total} variant(s)…")
+        worker.start()
+
+    def _on_manifest_progress(self, done: int, total: int):
+        self.progress_bar.setRange(0, max(total, 1))
+        self.progress_bar.setValue(done)
+        self.status_label.setText(f"Writing manifests… {done}/{total}")
+
+    def _on_manifest_finished(self, result):
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 100)
+        self._release_worker()
+        self.status_label.setText(f"Manifests: {result.summary()}.")
+        problems = [r for r in result.items if r.status == "failed"]
+        if problems:
+            lines = "\n".join(f"• {r.message}" for r in problems[:8])
+            more = f"\n…and {len(problems) - 8} more (see app.log)" if len(problems) > 8 else ""
+            QMessageBox.warning(
+                self, "Manifests",
+                f"{result.summary()}.\n\nSome could not be written (read-only drive, "
+                f"missing folder…):\n{lines}{more}")
+        else:
+            QMessageBox.information(self, "Manifests", f"Done — {result.summary()}.")
+
+    def closeEvent(self, event):
+        """Last chance to persist pending manifests before the app exits."""
+        try:
+            self._manifest_timer.stop()
+            if self._manifest_flush_worker is not None:
+                self._manifest_flush_worker.wait(5000)
+            if self.db.get_setting("manifest_auto_enabled", True):
+                app_manifest.flush_dirty(self.db)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def _run_scrape(self, app_ids: Optional[list] = None):
         if self._active_worker is not None:
@@ -4694,7 +4991,8 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             f"Re-resolve done. {resolve_result.apps_created} new, "
             f"{resolve_result.apps_updated} updated, "
-            f"{resolve_result.apps_skipped_locked} had locked fields preserved."
+            f"{resolve_result.apps_skipped_locked} had locked fields preserved, "
+            f"{getattr(resolve_result, 'variants_pinned', 0)} variants kept in their protected app."
         )
         self.refresh_all()
 

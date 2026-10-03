@@ -746,6 +746,48 @@ class Cluster:
     alt_name_candidate: Optional[str] = None
     alt_name_source: Optional[str] = None
     has_portable_variant: bool = False
+    # Built from variant manifests (appcatalog.json): identity comes from the
+    # manifest's app_uid, so these are NEVER fuzzy-merged with other apps.
+    app_uid: Optional[str] = None
+    manifest_bound: bool = False
+
+
+def cluster_manifest_members(members: list, uid_by_id: dict, updated_by_id: dict) -> list:
+    """Clusters for variants whose manifest tells us exactly which app they belong to.
+
+    Fuzzy clustering is fine for guessing, but a manifest is not a guess: it
+    records the app the variant was IN. Fuzzy-merging those would glue back
+    together apps the user deliberately keeps apart ("Adobe Photoshop" vs
+    "Adobe Photoshop Elements", "Foxit Reader" vs "Foxit Reader Portable"),
+    across catalogs too. Group by app_uid; same name + same catalog/subcatalog
+    under different uids (a regenerated uid) is still one app."""
+    by_uid: dict = {}
+    for m in members:
+        by_uid.setdefault(uid_by_id.get(m.candidate_id) or f"name:{m.normalized_key}", []).append(m)
+
+    merged: dict = {}
+    for uid, group in by_uid.items():
+        newest = max(group, key=lambda m: updated_by_id.get(m.candidate_id, ""))
+        ident = (newest.normalized_key,
+                 (newest.catalog or "").lower(), (newest.subcatalog or "").lower())
+        slot = merged.setdefault(ident, {"uid": None, "members": [], "stamp": ""})
+        slot["members"].extend(group)
+        stamp = updated_by_id.get(newest.candidate_id, "")
+        if not uid.startswith("name:") and (slot["uid"] is None or stamp >= slot["stamp"]):
+            slot["uid"], slot["stamp"] = uid, stamp
+
+    out = []
+    for slot in merged.values():
+        group = slot["members"]
+        cluster = _build_cluster(group)
+        newest = max(group, key=lambda m: updated_by_id.get(m.candidate_id, ""))
+        cluster.canonical_name = newest.clean_name          # the manifest's own spelling
+        cluster.normalized_key = newest.normalized_key
+        cluster.cluster_confidence = 1.0
+        cluster.app_uid = slot["uid"]
+        cluster.manifest_bound = True
+        out.append(cluster)
+    return out
 
 
 def cluster_candidates(members: list[ClusterMember], settings: dict) -> list[Cluster]:
@@ -886,6 +928,9 @@ from typing import Optional
 
 log = logging.getLogger("appcatalog.resolver")
 
+import app_manifest as _mf   # variant manifests (see app_manifest.py)
+import app_curation as _cur   # alias / pinning / adoption protection (see app_curation.py)
+
 
 class ResolveProgress:
     def __init__(self):
@@ -895,6 +940,14 @@ class ResolveProgress:
         self.apps_updated = 0
         self.apps_skipped_locked = 0
         self.variants_written = 0
+        # variant manifests (appcatalog.json)
+        self.manifests_found = 0
+        self.manifests_applied = 0
+        self.manifests_db_kept = 0     # existing DB entry won (no baseline / conflict)
+        # protection of manual work (app_curation.py)
+        self.variants_pinned = 0       # existing variants left in their (protected) app
+        self.variants_adopted = 0      # orphan / moved variants re-linked instead of duplicated
+        self.empty_apps_removed = 0
         self.status = "running"
 
 
@@ -916,7 +969,28 @@ def run_resolve(db: Database, scan_root_id: Optional[int] = None) -> ResolveProg
     log.info("RESOLVE STARTING: %d install-unit candidates to process", len(rows))
 
     members: list[ClusterMember] = []
+    pinned_items = []              # (member, row, fields) -- stay in their current app
     extracted_by_id = {}
+    manifest_by_id = {}
+    bound_ids: set = set()           # fresh candidates whose identity comes from a manifest
+    uid_by_id: dict = {}
+    updated_by_id: dict = {}
+    mf_cache = _mf.ManifestCache()
+    # Variants created without a scan (monitor, manual add) or left with a
+    # stale raw candidate by Reorganize get RE-LINKED to the fresh raw row of
+    # the same folder+file -- otherwise every rescan duplicates them.
+    progress.variants_adopted, stale_raw_ids = _cur.adopt_orphan_variants(conn, rows)
+    if stale_raw_ids:
+        rows = [r for r in rows if r["id"] not in stale_raw_ids]
+    # Variants of protected apps (locked / verified / manually moved) are never
+    # re-clustered: a rescan or "Resolve all" must not undo manual work.
+    pin_map = _cur.load_pin_map(conn)
+    # candidates that already have a variant in THIS database: the DB's own
+    # naming/locks win for those -- a manifest only drives brand-new variants
+    existing_raw_ids = {
+        r[0] for r in conn.execute(
+            "SELECT raw_candidate_id FROM variants WHERE raw_candidate_id IS NOT NULL")
+    }
 
     for row in rows:
         leaf_name = _folder_display_name(row["folder_path"])
@@ -956,30 +1030,65 @@ def run_resolve(db: Database, scan_root_id: Optional[int] = None) -> ResolveProg
             fields.name_source = "manual"
             fields.extraction_confidence = 1.0
 
+        mf_ref = mf_cache.find(row["folder_path"], row["primary_file_name"])
+        if mf_ref is not None:
+            progress.manifests_found += 1
+            manifest_by_id[row["id"]] = mf_ref
+            if row["id"] not in existing_raw_ids and not forced_name:
+                if _mf.override_fields_from_manifest(fields, mf_ref):
+                    bound_ids.add(row["id"])
+                    uid_by_id[row["id"]] = mf_ref.app.get("app_uid")
+                    updated_by_id[row["id"]] = mf_ref.data.get("updated_at") or ""
+
         extracted_by_id[row["id"]] = (row, fields)
-        members.append(
-            ClusterMember(
-                candidate_id=row["id"],
-                clean_name=fields.clean_name,
-                normalized_key=normalize_key(fields.clean_name),
-                catalog=_apply_alias(row["catalog"], settings),
-                subcatalog=_apply_alias(row["subcatalog"], settings),
-                version=fields.version,
-                extraction_confidence=fields.extraction_confidence,
-                alt_name_candidate=fields.alt_name_candidate,
-                alt_name_source=fields.alt_name_source,
-                is_portable=fields.is_portable,
-            )
+        member = ClusterMember(
+            candidate_id=row["id"],
+            clean_name=fields.clean_name,
+            normalized_key=normalize_key(fields.clean_name),
+            catalog=_apply_alias(row["catalog"], settings),
+            subcatalog=_apply_alias(row["subcatalog"], settings),
+            version=fields.version,
+            extraction_confidence=fields.extraction_confidence,
+            alt_name_candidate=fields.alt_name_candidate,
+            alt_name_source=fields.alt_name_source,
+            is_portable=fields.is_portable,
         )
+        if row["id"] in pin_map:
+            pinned_items.append((member, row, fields))
+        else:
+            members.append(member)
         progress.candidates_processed += 1
 
-    clusters = cluster_candidates(members, settings)
+    # Manifest-bound variants keep the identity their manifest gives them; only
+    # the rest is clustered by (fuzzy) name.
+    plain_members = [m for m in members if m.candidate_id not in bound_ids]
+    bound_members = [m for m in members if m.candidate_id in bound_ids]
+    clusters = cluster_candidates(plain_members, settings)
+    if bound_members:
+        clusters += cluster_manifest_members(bound_members, uid_by_id, updated_by_id)
     progress.clusters_formed = len(clusters)
-    log.info("Clustering complete: %d candidates -> %d apps", len(members), len(clusters))
+    log.info("Clustering complete: %d candidates (%d from manifests) -> %d apps",
+              len(members), len(bound_members), len(clusters))
 
     settings_version = db.current_settings_version()
     auto_accept = settings.get("confidence_auto_accept", 0.85)
     needs_review = settings.get("confidence_needs_review", 0.60)
+
+    def _apply_variant_manifest(candidate_id, app_id, variant_id, variant_created, app_created):
+        mf_ref = manifest_by_id.get(candidate_id)
+        if mf_ref is None:
+            return
+        try:
+            outcome = _mf.apply_manifest(
+                conn, mf_ref, app_id=app_id, variant_id=variant_id,
+                app_created=app_created, variant_created=variant_created)
+        except Exception:
+            log.exception("manifest apply failed for %s", mf_ref.path)
+            outcome = "failed"
+        if outcome == "applied":
+            progress.manifests_applied += 1
+        elif outcome in ("db_wins_no_baseline", "conflict_db_wins"):
+            progress.manifests_db_kept += 1
 
     for cluster in clusters:
         app_id, was_created, locked_fields = _upsert_app(
@@ -994,16 +1103,37 @@ def run_resolve(db: Database, scan_root_id: Optional[int] = None) -> ResolveProg
 
         for member in cluster.members:
             row, fields = extracted_by_id[member.candidate_id]
-            _upsert_variant(conn, app_id, row, fields)
+            variant_id, variant_created = _upsert_variant(conn, app_id, row, fields)
             progress.variants_written += 1
+            _apply_variant_manifest(member.candidate_id, app_id, variant_id, variant_created, was_created)
 
         _sync_app_tags(conn, app_id, cluster)
+
+    # Pinned variants: stay in their current (protected) app. Only their own
+    # fields (version, file, ...) are refreshed; the auto-derived name is
+    # remembered as an alias so NEW folders with that name join the same app.
+    for member, row, fields in pinned_items:
+        app_id = pin_map[row["id"]]
+        variant_id, variant_created = _upsert_variant(conn, app_id, row, fields)
+        progress.variants_written += 1
+        progress.variants_pinned += 1
+        _cur.learn_alias(conn, member.normalized_key, app_id)
+        _apply_variant_manifest(member.candidate_id, app_id, variant_id, variant_created, False)
+
+    # Apps emptied by a legitimate regroup of UNPROTECTED variants are clutter.
+    progress.empty_apps_removed = _cur.remove_empty_unprotected_apps(conn)
 
     conn.commit()
     progress.status = "completed"
     log.info("RESOLVE FINISHED: %d apps created, %d updated, %d skipped (locked), %d variants written",
               progress.apps_created, progress.apps_updated, progress.apps_skipped_locked,
               progress.variants_written)
+    log.info("PROTECTION: %d variants kept in their protected app, %d re-linked (adopted), "
+              "%d empty unprotected apps removed",
+              progress.variants_pinned, progress.variants_adopted, progress.empty_apps_removed)
+    if progress.manifests_found:
+        log.info("MANIFESTS: %d found, %d applied, %d left to the existing database entry",
+                  progress.manifests_found, progress.manifests_applied, progress.manifests_db_kept)
     return progress
 
 
@@ -1068,32 +1198,62 @@ def _apply_alias(name: Optional[str], settings: dict) -> Optional[str]:
 def _upsert_app(
     conn, cluster: Cluster, settings_version: int, auto_accept: float, needs_review: float
 ) -> tuple[int, bool, list[str]]:
-    existing = conn.execute(
-        "SELECT * FROM apps WHERE normalized_key = ?", (cluster.normalized_key,)
-    ).fetchone()
+    existing = None
+    via_uid = False
+    if cluster.app_uid:
+        existing = conn.execute("SELECT * FROM apps WHERE app_uid = ?", (cluster.app_uid,)).fetchone()
+        via_uid = existing is not None
+    if existing is None:
+        # prefer the app with the same name IN THE SAME catalog/subcatalog (same
+        # name can legitimately exist elsewhere); a manifest-bound cluster
+        # only matches by name within its own catalog/subcatalog
+        same_home = conn.execute(
+            """SELECT * FROM apps WHERE normalized_key = ?
+                 AND lower(COALESCE(catalog,'')) = lower(COALESCE(?,''))
+                 AND lower(COALESCE(subcatalog,'')) = lower(COALESCE(?,'')) ORDER BY id LIMIT 1""",
+            (cluster.normalized_key, cluster.catalog, cluster.subcatalog)).fetchone()
+        if same_home is not None:
+            existing = same_home
+        elif not cluster.manifest_bound:
+            existing = conn.execute(
+                "SELECT * FROM apps WHERE normalized_key = ? ORDER BY id LIMIT 1",
+                (cluster.normalized_key,)).fetchone()
+    # Not found by its current key? The app may have been renamed (by hand or
+    # by the scraper) since -- its old keys are kept as aliases. Never create
+    # a duplicate of an app that was merely renamed.
+    via_alias = False
+    if existing is None and not cluster.manifest_bound:
+        existing = _cur.find_app_by_alias(conn, cluster.normalized_key)
+        via_alias = existing is not None
 
     confidence = cluster.cluster_confidence
     status = "resolved" if confidence >= needs_review else "needs_review"
 
     if existing is None:
+        # a manifest-bound app keeps the app_uid its manifests carry, so the
+        # identity survives a lost database (a trigger assigns one otherwise)
+        new_uid = cluster.app_uid
+        if new_uid and conn.execute("SELECT 1 FROM apps WHERE app_uid = ?", (new_uid,)).fetchone():
+            new_uid = None
         cur = conn.execute(
             """INSERT INTO apps (name, catalog, subcatalog, normalized_key, confidence,
                                   status, resolved_with_settings_version, updated_at,
-                                  alt_name_candidate, alt_name_source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)""",
+                                  alt_name_candidate, alt_name_source, app_uid)
+               VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?)""",
             (
                 cluster.canonical_name, cluster.catalog, cluster.subcatalog,
                 cluster.normalized_key, confidence, status, settings_version,
-                cluster.alt_name_candidate, cluster.alt_name_source,
+                cluster.alt_name_candidate, cluster.alt_name_source, new_uid,
             ),
         )
         return cur.lastrowid, True, []
 
     locked_fields = []
     updates = {}
-    if not existing["name_locked"]:
+    if not existing["name_locked"] and not via_alias and not via_uid:
         updates["name"] = cluster.canonical_name
     else:
+        # locked, or renamed since (alias match): the current name is deliberate
         locked_fields.append("name")
     if not existing["catalog_locked"]:
         updates["catalog"] = cluster.catalog
@@ -1131,7 +1291,7 @@ def _upsert_variant(conn, app_id: int, raw_row, fields):
     ).fetchone()
 
     if existing is None:
-        conn.execute(
+        cur = conn.execute(
             """INSERT INTO variants (app_id, raw_candidate_id, version, edition,
                                       architecture, language, source_path, file_type,
                                       file_size, confidence, updated_at,
@@ -1145,7 +1305,7 @@ def _upsert_variant(conn, app_id: int, raw_row, fields):
                 raw_row["primary_file_name"], fields.alt_name_candidate, fields.name_source,
             ),
         )
-        return
+        return cur.lastrowid, True
 
     updates = {"app_id": app_id, "updated_at": "CURRENT_TIMESTAMP"}
     if not existing["version_locked"]:
@@ -1165,6 +1325,7 @@ def _upsert_variant(conn, app_id: int, raw_row, fields):
     )
     values = [v for k, v in updates.items() if k != "updated_at"]
     conn.execute(f"UPDATE variants SET {set_clause} WHERE id = ?", (*values, existing["id"]))
+    return existing["id"], False
 
 
 # ---------------------------------------------------------------------------
@@ -1364,9 +1525,12 @@ def merge_apps(db: Database, source_app_id: int, target_app_id: int):
         return
     conn = db.connect()
     conn.execute(
-        "UPDATE variants SET app_id = ?, updated_at = datetime('now') WHERE app_id = ?",
+        "UPDATE variants SET app_id = ?, app_pinned = 1, updated_at = datetime('now') WHERE app_id = ?",
         (target_app_id, source_app_id),
     )
+    # the absorbed app's names keep pointing at the survivor, so a rescan
+    # doesn't re-create it (and pull the variants back out)
+    _cur.alias_absorbed_app(conn, source_app_id, target_app_id)
     conn.execute(
         "INSERT INTO audit_log (entity_type, entity_id, action, detail_json) VALUES (?,?,?,?)",
         ("app", target_app_id, "merge", json.dumps({"absorbed_app_id": source_app_id})),
@@ -1379,7 +1543,7 @@ def move_variant_to_app(db: Database, variant_id: int, target_app_id: int):
     """Split: move a single mis-clustered variant to a different (existing) app."""
     conn = db.connect()
     conn.execute(
-        "UPDATE variants SET app_id = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE variants SET app_id = ?, app_pinned = 1, updated_at = datetime('now') WHERE id = ?",
         (target_app_id, variant_id),
     )
     conn.execute(
@@ -1408,7 +1572,7 @@ def split_variant_to_new_app(db: Database, variant_id: int, new_name: str) -> in
     new_app_id = cur.lastrowid
 
     conn.execute(
-        "UPDATE variants SET app_id = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE variants SET app_id = ?, app_pinned = 1, updated_at = datetime('now') WHERE id = ?",
         (new_app_id, variant_id),
     )
     conn.execute(

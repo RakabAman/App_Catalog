@@ -1018,14 +1018,34 @@ class OrganizeDialog(QDialog):
         self.reorg_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.reorg_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.reorg_table.setWordWrap(False)
+        # Every column is user-resizable (drag a header divider; double-click a
+        # divider to fit that column to its contents). The last column takes any
+        # spare room; if the columns are wider than the window the table scrolls
+        # sideways. Widths are remembered between sessions.
         hh = self.reorg_table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.Stretch)
-        hh.setSectionResizeMode(2, QHeaderView.Stretch)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(6, QHeaderView.Stretch)
+        hh.setSectionResizeMode(QHeaderView.Interactive)
+        hh.setStretchLastSection(True)
+        hh.setMinimumSectionSize(40)
+        hh.setHighlightSections(False)
+        self.reorg_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.reorg_table.setTextElideMode(Qt.ElideMiddle)     # keep both ends of a long path visible
+        default_widths = [90, 380, 380, 80, 70, 110, 320]
+        saved_widths = None
+        try:
+            saved_widths = self.db.get_setting("reorg_table_col_widths", None)
+        except Exception:
+            pass
+        widths = (saved_widths if isinstance(saved_widths, list)
+                  and len(saved_widths) == len(default_widths) else default_widths)
+        for col, col_w in enumerate(widths):     # (not `w`: that is this tab's page widget)
+            try:
+                self.reorg_table.setColumnWidth(col, max(40, int(col_w)))
+            except (TypeError, ValueError):
+                self.reorg_table.setColumnWidth(col, default_widths[col])
+        self._reorg_width_timer = QTimer(self)
+        self._reorg_width_timer.setSingleShot(True)
+        self._reorg_width_timer.timeout.connect(self._save_reorg_col_widths)
+        hh.sectionResized.connect(lambda *_: self._reorg_width_timer.start(600))
         self.reorg_table.setMinimumHeight(90)
         splitter.addWidget(self.reorg_table)
 
@@ -1117,6 +1137,14 @@ class OrganizeDialog(QDialog):
 
     _GB = 1024 ** 3
 
+    def _save_reorg_col_widths(self):
+        """Remember the preview table's column widths (debounced; best effort)."""
+        try:
+            widths = [self.reorg_table.columnWidth(c) for c in range(self.reorg_table.columnCount())]
+            self.db.set_setting("reorg_table_col_widths", widths, bump_version=False)
+        except Exception:
+            logging.getLogger("appcatalog.organizer").debug("could not save reorganize column widths", exc_info=True)
+
     def _plan_notes(self, p, copy_mode: str) -> str:
         notes = []
         if p.collision:
@@ -1188,8 +1216,12 @@ class OrganizeDialog(QDialog):
         self.reorg_table.setRowCount(len(self._reorg_plans))
         for i, p in enumerate(self._reorg_plans):
             self.reorg_table.setItem(i, 0, QTableWidgetItem("Planned"))
-            self.reorg_table.setItem(i, 1, QTableWidgetItem(p.source_path))
-            self.reorg_table.setItem(i, 2, QTableWidgetItem(p.dest_path))
+            src_item = QTableWidgetItem(p.source_path)
+            src_item.setToolTip(p.source_path)           # full path when the column is narrow
+            dst_item = QTableWidgetItem(p.dest_path)
+            dst_item.setToolTip(p.dest_path)
+            self.reorg_table.setItem(i, 1, src_item)
+            self.reorg_table.setItem(i, 2, dst_item)
             self.reorg_table.setItem(i, 3, QTableWidgetItem("Yes" if p.is_portable else ""))
             self.reorg_table.setItem(i, 4, QTableWidgetItem("Yes" if p.shared_folder else ""))
         self._reorg_write_total = 0

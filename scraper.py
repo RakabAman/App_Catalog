@@ -586,6 +586,15 @@ def _build_updates_from_manifest(
     return updates
 
 
+def _flush_manifests(db) -> None:
+    """Write the manifests of everything this scrape touched (auto mode)."""
+    try:
+        import app_manifest
+        app_manifest.flush_dirty(db)
+    except Exception as e:
+        log.warning("manifest flush after scrape failed: %s", e)
+
+
 def _apply_updates(conn, app_id: int, updates: dict, tags: list[str]):
     updates = dict(updates)
     now_placeholder = updates.pop("last_scraped", None)
@@ -743,6 +752,7 @@ def run_scrape(
 
     if progress.status == "running":
         progress.status = "completed"
+    _flush_manifests(db)
     if on_progress:
         on_progress(progress)
 
@@ -816,6 +826,7 @@ def apply_manifest_candidate(db: Database, app_id: int, candidate: dict, choose_
 
     _apply_updates(conn, app_id, updates, tags)
     conn.commit()
+    _flush_manifests(db)
 
 
 def apply_choco_candidate(db: Database, app_id: int, candidate: dict, choose_name: bool = False):
@@ -853,3 +864,4 @@ def apply_choco_candidate(db: Database, app_id: int, candidate: dict, choose_nam
 
     _apply_updates(conn, app_id, updates, candidate.get("tags") or [])
     conn.commit()
+    _flush_manifests(db)

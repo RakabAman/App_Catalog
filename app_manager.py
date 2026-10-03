@@ -46,6 +46,7 @@ from typing import Callable, Optional
 
 from rapidfuzz import fuzz
 
+import app_manifest                      # variant manifests (appcatalog.json)
 from app_paths import get_logs_dir
 from database import Database
 from resolver import normalize_key
@@ -1961,8 +1962,9 @@ def preview_reorganize(
                 names = []
             for name in names:
                 full = os.path.join(sp, name)
-                if name.lower() in claimed or name.lower() in _JUNK_FILENAMES:
-                    continue
+                if (name.lower() in claimed or name.lower() in _JUNK_FILENAMES
+                        or app_manifest.is_manifest_filename(name)):
+                    continue       # (manifests are rewritten per variant after the move)
                 if os.path.isdir(full) and not os.path.islink(full) and _contains_unit(full):
                     skipped.append((full, "another app's install folder (moved by its own entry)"))
                     continue
@@ -2249,7 +2251,40 @@ def _cleanup_empty_ancestors(start_dir: str, max_levels: int = 8) -> None:
         current = parent
 
 
-def execute_reorganize(
+def execute_reorganize(*args, **kwargs) -> "ReorganizeResult":
+    """See _execute_reorganize_impl(). Wrapper only: it holds the manifest
+    auto-flusher back while files are moving, then flushes once at the end."""
+    db = kwargs["db"] if "db" in kwargs else args[0]
+    with app_manifest.suspend_auto_flush():
+        result = _execute_reorganize_impl(*args, **kwargs)
+    try:
+        app_manifest.flush_dirty(db)
+    except Exception as e:
+        log.warning("manifest flush after reorganize failed: %s", e)
+    return result
+
+
+def _write_reorg_manifest(db: Database, plan: "PlannedMove", copy_mode: str,
+                          new_file_name: Optional[str], orig_fp: Optional[str]) -> str:
+    """Write the variant manifest at the destination after a successful
+    move/copy. Returns the write status (for the move log)."""
+    archived = bool(plan.primary_file_name and new_file_name
+                    and new_file_name != plan.primary_file_name)
+    orig_name = plan.primary_file_name if archived else None
+    if copy_mode == "move":
+        # the DB row already points at the destination
+        res = app_manifest.write_variant_manifest(
+            db, plan.variant_id, force=True, orig_name=orig_name, orig_fp=orig_fp)
+    else:
+        # copy mode: the variant stays at its source in the DB; the copy at the
+        # destination still gets its own manifest
+        res = app_manifest.write_variant_manifest(
+            db, plan.variant_id, force=True, folder=plan.dest_path,
+            file_name=new_file_name, record=False, orig_name=orig_name, orig_fp=orig_fp)
+    return res.status if res.status != "failed" else f"failed: {res.message}"
+
+
+def _execute_reorganize_impl(
     db: Database, planned_moves: list[PlannedMove], *,
     copy_mode: str = "move",
     archive_format: str = "none",
@@ -2411,12 +2446,14 @@ def execute_reorganize(
                     log.warning("Could not remove empty source folder %s: %s", plan.source_path, e)
 
             new_file_name = plan.primary_file_name
+            orig_fp = None
             is_bare = bool(plan.primary_file_name) and \
                 os.path.splitext(plan.primary_file_name)[1].lower() in bare_exts
             if archive_format != "none":
                 if is_bare:
                     installer_path = os.path.join(plan.dest_path, plan.primary_file_name)
                     if os.path.exists(installer_path):
+                        orig_fp = app_manifest.quick_fingerprint(installer_path)
                         archived_path = _archive_single_file(installer_path, archive_format,
                                                              archive_password, prog)
                         if archived_path:
@@ -2441,6 +2478,13 @@ def execute_reorganize(
                     "UPDATE variants SET source_path = ?, file_name = ?, updated_at = datetime('now') "
                     "WHERE id = ?", (plan.dest_path, new_file_name, plan.variant_id))
                 conn.commit()
+
+            # variant manifest next to the files (never allowed to fail the move)
+            try:
+                entry["manifest"] = _write_reorg_manifest(db, plan, copy_mode, new_file_name, orig_fp)
+            except Exception as e:
+                entry["manifest"] = f"failed: {type(e).__name__}: {e}"
+                log.warning("manifest write failed after reorganize of %s: %s", plan.dest_path, e)
 
             result.moved += 1
             log_job.info("[%d/%d] %s OK: %s -> %s", i, total, copy_mode.upper(),

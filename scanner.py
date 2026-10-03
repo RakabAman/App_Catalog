@@ -526,6 +526,8 @@ from typing import Iterator, Optional
 
 log = logging.getLogger("appcatalog.scanner")
 
+import app_manifest as _mf   # variant manifests: claim-first grouping (see app_manifest.py)
+
 
 @dataclass
 class ScanCandidate:
@@ -1174,7 +1176,22 @@ def walk_scan_root(
 
         file_entries = [e for e in entries if e.is_file(follow_symlinks=False)]
         subfolder_names = [e.name for e in entries if e.is_dir(follow_symlinks=False)]
+        # Variant manifests (appcatalog.json / *.appcatalog.json) are never
+        # content: keep them out of the file list, the classification and the
+        # folder fingerprint (writing one must not make the folder look changed).
+        manifest_names = [e.name for e in file_entries if _mf.is_manifest_filename(e.name)]
+        if manifest_names:
+            file_entries = [e for e in file_entries if not _mf.is_manifest_filename(e.name)]
+            entries = [e for e in entries if not _mf.is_manifest_filename(e.name)]
         file_names = [e.name for e in file_entries]
+        folder_refs = _mf.load_folder_manifests(dirpath, manifest_names) if manifest_names else []
+        if folder_refs:
+            # sub-folders a confirmed manifest lists as part of its unit are
+            # dependencies, not separate apps -- don't descend into them
+            claimed_dirs = _mf.claimed_dir_names(folder_refs)
+            if claimed_dirs:
+                dirnames[:] = [d for d in dirnames if d.lower() not in claimed_dirs]
+                subfolder_names = [d for d in subfolder_names if d.lower() not in claimed_dirs]
 
         catalog, subcatalog, depth, skip, is_single_app, forced_name = resolve_scan_root_layout(
             root, display_dirpath, folder_layout or {},
@@ -1194,7 +1211,7 @@ def walk_scan_root(
             candidate = _build_single_app_candidate(
                 dirpath, display_dirpath, catalog, subcatalog, depth,
                 forced_name, settings, error_sink,
-                forced_file=locked,
+                forced_file=locked or _mf.confirmed_entry_for_folder(folder_refs),
             )
             log.info("SINGLE APP/VARIANT: [%s/%s] %s  (file: %s)",
                       candidate.catalog, candidate.subcatalog,
@@ -1243,7 +1260,15 @@ def walk_scan_root(
                         locked, display_dirpath,
                     )
 
-            groups = [[locked_match]] if locked_match else _group_installer_files(file_names)
+            if locked_match:
+                groups = [[locked_match]]
+            else:
+                groups = _group_installer_files(file_names)
+                if folder_refs:
+                    # confirmed manifests pin their entry file and claim their
+                    # dependent files (never re-guessed, never split into
+                    # bogus extra variants)
+                    groups = _mf.claim_groups(file_names, groups, folder_refs)
             if not groups:
                 # classify_folder said install_unit (it saw installer/archive
                 # extensions) but grouping found nothing -- shouldn't happen,

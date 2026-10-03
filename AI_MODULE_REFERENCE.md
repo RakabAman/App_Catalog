@@ -33,7 +33,7 @@ map below; both are build tooling, not app code.
 
 ---
 
-## 1. File map (14 files, no subfolders)
+## 1. File map (17 files, no subfolders)
 run_gui.py Entry point. python run_gui.py [path/to/catalog.db]
 config.py Pure data: DEFAULT_SETTINGS dict. No logic.
 app_paths.py PyInstaller-safe path resolution: app base dir, db path, logs/, manifest/ (checkpoint 21).
@@ -44,6 +44,9 @@ scraper.py Winget manifest + winget-show + Chocolatey/Winget enrichment orchestr
 choco_search.py Chocolatey live-search HTML scraping (standalone, deliberately kept separate).
 app_manager.py Cross-catalog tools: duplicates, category rename, structural report, physical reorganize.
 app_organizer.py OrganizeDialog (Qt) -- the UI half of app_manager's features.
+app_manifest.py Variant manifests (<app> <version>.appcatalog.json): schema/triggers, writer, auto-flush, reader, resolver apply (checkpoint 31).
+app_curation.py Protection of manual work (aliases, pinned variants, adoption), backups, manual add, installer override, empty-app repair (checkpoint 32).
+curation_dialogs.py AddAppDialog and RepairEmptyAppsDialog (Qt) for app_curation.
 monitor.py Manual "Monitor" job: watch folders -> dry-run plan -> compress + move into organized structure.
 html_report.py Shared self-contained HTML report renderer, used by app_manager.py and monitor.py (checkpoint 21).
 gui_backend.py AppsTableModel + all QThread workers + CSV import/export.
@@ -62,7 +65,12 @@ dialogs, and exposes exactly one public name (`MonitorJob`) so
 small, deliberately dependency-light leaf modules -- see their own
 docstrings, and PROGRESS.md's checkpoint 21 entry, for the full why.
 
-**Dependency direction** (no cycles): `config` <- `database` <- `scanner`,
+**Dependency direction** (no cycles): `app_curation` is imported by `database` (schema), `resolver`, `gui_backend`,
+`gui_main`, `curation_dialogs`; it imports `resolver` lazily inside functions only (checkpoint 32).
+`app_manifest` is a leaf-ish module imported by `database`
+(schema setup), `scanner`, `resolver`, `scraper`, `app_manager`, `monitor`, `gui_backend`, `gui_main`
+(checkpoint 31; it imports `scanner._installer_group_key` lazily inside one function to avoid a
+cycle). `config` <- `database` <- `scanner`,
 `resolver` <- `scraper`, `app_manager` <- `app_organizer`, `gui_backend` <-
 `monitor`, `gui_backend` <- `gui_main`, `app_paths` <- `run_gui`/`scraper`/
 `app_manager`/`monitor` (a leaf module, imported by four others, imports
@@ -176,6 +184,10 @@ this one is about scraper auto-rename), `latest_version`, `last_scraped`,
   layout, unconfigured_toplevel_role=None)` (signature changed in
   checkpoint 28 -- was `root_is_catalog`/`root_catalog_name`).
 
+
+**Checkpoint 31:** `init_schema()` ends with `app_manifest.ensure_manifest_schema(conn)`: additive columns `apps.app_uid`, `variants.variant_uid / manifest_hash / manifest_dirty / manifest_path / manifest_written_at / manifest_error`, 4 triggers (uid on insert; dirty on real change), uid backfill, 3 indexes. Idempotent; cheap on repeat runs.
+
+**Checkpoint 32:** `init_schema()` also calls `app_curation.ensure_curation_schema(conn)` (before the manifest schema): table `app_aliases`, column `variants.app_pinned` (backfilled once from `audit_log`), trigger `trg_apps_key_alias` (records the old `normalized_key` on any change).
 ---
 
 ## 3. `scanner.py` -- filesystem walk
@@ -261,6 +273,8 @@ note its much stricter safety requirements).
   (unchanged folders are skipped on a re-scan of an existing root; see
   `ScanRootsDialog` in `gui_main.py` for the UI to trigger this).
 
+
+**Checkpoint 31 (manifests):** `walk_scan_root` filters `*.appcatalog.json` out of the file list, classification and folder fingerprint; confirmed manifests pin their entry file (`_mf.claim_groups`, `forced_file` for single_app folders) and their dependent sub-folders are pruned from the walk (`_mf.claimed_dir_names`). See section 16.
 ---
 
 ## 4. `resolver.py` -- naming, version extraction, clustering
@@ -332,6 +346,12 @@ tiebreak.
 + apply a single app's re-resolution against current settings, shown via
 `ReresolveDialog` in `gui_main.py`).
 
+
+**Checkpoint 31 (manifests):** `run_resolve` looks up a manifest per candidate (`ManifestCache.find`), lets a trusted manifest name a brand-new variant (`override_fields_from_manifest`), then calls `apply_manifest` after `_upsert_variant` (which now returns `(variant_id, created)`). `ResolveProgress` has `manifests_found/applied/db_kept`. See section 16.
+
+**Checkpoint 32 (protection):** `run_resolve` first adopts orphan/moved variants (`_cur.adopt_orphan_variants`), builds a pin map (`_cur.load_pin_map`: variants of locked/verified apps or `app_pinned`), clusters only the UNPINNED candidates, then processes pinned ones separately (`_upsert_variant` into their current app + `learn_alias`), and finally deletes empty unprotected apps. `_upsert_app` falls back to `app_aliases` and never renames an app found by alias. `merge_apps` / `move_variant_to_app` / `split_variant_to_new_app` set `app_pinned = 1`; `merge_apps` also aliases the absorbed app. `ResolveProgress` gained `variants_pinned / variants_adopted / empty_apps_removed`. Never overwrite `variants.app_id` for an existing variant without checking the pin map.
+
+**Checkpoint 33 (manifest identity):** candidates whose identity comes from a manifest (`override_fields_from_manifest` -> `bound_ids`, with `uid_by_id` / `updated_by_id`) are NOT passed to `cluster_candidates`; `cluster_manifest_members` groups them by the manifest's `app_uid` (fallback exact name; same name + same catalog/subcatalog merge) and returns `Cluster(app_uid=..., manifest_bound=True)`. `_upsert_app` matches `app_uid` first, then name in the SAME catalog/subcatalog (bound clusters never fall back to other catalogs or aliases), and a new app keeps the manifest's `app_uid`. Do not fuzzy-merge manifest-bound members.
 ---
 
 ## 5. `scraper.py` -- Winget manifest + winget-show + enrichment orchestration
@@ -414,6 +434,8 @@ still organized as three clearly-marked parts (search `# Part 1` /
   `winutil entry` > `manifest placeholder / choco candidate value` >
   `existing stored value`.
 
+
+**Checkpoint 31 (manifests):** `run_scrape`, `apply_manifest_candidate` and `apply_choco_candidate` call `_flush_manifests(db)` (-> `app_manifest.flush_dirty`) once their writes are committed.
 ---
 
 ## 6. `choco_search.py` -- Chocolatey live search
@@ -531,6 +553,8 @@ the file itself). Six independent groups:
    destructive-but-DB-only execute, same two-step shape as reorganize --
    see `PROGRESS.md` checkpoints 22 and 27.
 
+
+**Checkpoint 31:** `execute_reorganize` is now a wrapper (suspends the manifest auto-flusher, flushes at the end) around `_execute_reorganize_impl`. Manifests are never copied as 'sidecars'; `_write_reorg_manifest` writes the manifest at the destination after each successful move (copy mode: `record=False`, DB row untouched; archive mode: records `orig_name` / `orig_fp`).
 ---
 
 ## 8. `app_organizer.py` -- OrganizeDialog (Qt)
@@ -550,6 +574,8 @@ reorganize is still running (the worker is parented to the dialog, so
 letting it get torn down mid-run would kill a QThread that's still
 moving files).
 
+
+**Checkpoint 31:** the Reorganize preview table (`reorg_table`) has fully resizable columns (`QHeaderView.Interactive`, last column stretches, middle-elided paths with tooltips); widths persist in setting `reorg_table_col_widths` (saved debounced by `_save_reorg_col_widths`). Do not use `w`/`v` as loop variables in the `_build_*_tab` methods -- they are the page widget/layout.
 ---
 
 ## 9. `gui_main.py` + `gui_backend.py` -- all UI (PySide6/Qt)
@@ -736,6 +762,10 @@ Organized top-to-bottom in `gui_main.py` as:
 `OrganizeDialog`'s report tab when a finding is double-clicked -- it
 clears any active filter first, then selects and scrolls to the row.
 
+
+**Checkpoint 32:** toolbar **Add app…** (`_add_app_dialog`) and **Repair empty apps…** (`_repair_empty_apps`); `_run_resolve_all` shows a confirmation whose default/escape button is Cancel (always use the button object from `addButton` for `setDefaultButton`); `DetailPanel._change_variant_installer_file` offers an override for files outside the variant folder via `_offer_installer_override`. `gui_backend.ResolveWorker` / `ScanAndResolveWorker` take DB backups first (`app_curation.create_backup`).
+
+**Checkpoint 33:** toolbar order is Scan roots… -> Add app… -> Re-resolve all ...; **Repair empty apps…** lives in the app-table context menu (`_show_apps_context_menu`, calls `_repair_empty_apps`). `DetailPanel._split_selected_variant` opens `AddAppDialog(split_variant=, split_app=)` and `app_curation.split_variant_with_details` does the work.
 ---
 
 ## 10. `monitor.py` -- manual "Monitor" job
@@ -866,6 +896,10 @@ mirroring the start dialog's UX.
   Not a bug -- a consequence of the design choice to keep monitored files
   out of `raw_candidates`.
 
+
+**Checkpoint 31:** `execute_monitor_plan` is now a wrapper (holds `app_manifest.suspend_auto_flush()` during the run, flushes once at the end) around `_execute_monitor_plan_impl`; `_record_variant` returns the new variant id and the manifest is written right after each attach (with the original file's name/fingerprint when the file was archived). Syntax-checked only, not run on real folders yet.
+
+**Checkpoint 32:** `_lookup_app_by_key` falls back to `app_aliases` (an app renamed by hand/scraper is still found by its old key).
 ---
 
 ## 11. `config.py` -- `DEFAULT_SETTINGS`
@@ -898,6 +932,8 @@ whatever reads it does so via `settings.get(key, ...)` with a safe default
 (never assume the key exists, since an old DB won't have it until
 `_ensure_defaults()`/`_merge_new_keyword_defaults()` in `database.py` run).
 
+
+**Checkpoint 31:** added `manifest_auto_enabled` (True), `manifest_auto_only_valuable` (True), `manifest_companion_words`. `reorg_table_col_widths` is stored by the GUI and has no default.
 ---
 
 ## 12. `app_paths.py` -- PyInstaller-safe filesystem layout (checkpoint 21)
@@ -1148,3 +1184,149 @@ on every scan. Two changes close this permanently:
   `os.path.normpath()` on the joined path as belt-and-braces for any
   legacy DB row. `load_app()` prepends 🔒 to the File Name cell when
   `file_locked` is set.
+
+
+---
+
+## 16. `app_manifest.py` -- variant manifests (checkpoint 31)
+
+**Purpose.** Persist the manual / scraped work next to the files so a fresh
+`catalog.db`, an app update, or a reorganized library can recognise it again.
+One JSON file per **variant (install unit)**, independent of catalog and
+subcatalog (those are never stored).
+
+### File name and placement
+
+| Case | File |
+|---|---|
+| variant owns its folder (`unit.owned = true`) | `<folder>/<App name> <version> [edition] [arch] [language].appcatalog.json` |
+| folder shared by several variants | `<folder>/<entry file name>.appcatalog.json` |
+| legacy first draft | `<folder>/appcatalog.json` (read, migrated on next write) |
+
+`is_manifest_filename()` = `appcatalog.json` or `*.appcatalog.json`. The writer
+never overwrites a manifest describing a different unit
+(`choose_manifest_path` + `same_unit`: same `variant_uid` OR same entry file in
+the same folder counts as "ours"; otherwise ` [<uid6>]` is appended). Superseded
+files of the same unit are removed after a write (rename, legacy).
+
+### Format (schema_version 1, `kind = "appcatalog.variant"`)
+
+```
+app      app_uid, name, locked[], publisher, description, homepage, license,
+         winget_id, choco_id, latest_version, scrape_status, last_scraped, tags[]
+variant  variant_uid, version, edition, architecture, language, ignored, verified,
+         locked[] (version, entry), original_name, name_source
+unit     root ".", owned, entry{path, kind, size, fp, confirmed, orig_name?, orig_fp?},
+         members[]{path, type file|dir, role entry|required|companion,
+                   size | files+bytes+tree_fp}
+```
+Paths are relative to the manifest folder. `entry.fp` = size + head/middle/tail
+1 MB hash (`quick_fingerprint`); folders use a structural fingerprint
+(`tree_stats`: sorted relative paths + sizes, no content read).
+`entry.confirmed` is true when the variant is verified, `file_locked`, or monitor-created;
+only confirmed manifests change scanning. Unknown future keys: `read_manifest`
+accepts a newer `schema_version` with a warning.
+
+### Public API (what other modules use)
+
+| Function | Used by |
+|---|---|
+| `ensure_manifest_schema(conn)` | `database.init_schema` |
+| `write_variant_manifest(db, variant_id, force=, dry_run=, folder=, file_name=, record=, orig_name=, orig_fp=)` | reorganize, monitor, workers |
+| `write_manifests(db, variant_ids=None, progress=, cancel=)` -> `BatchResult` | `ManifestWorker`, variant menu |
+| `flush_dirty(db)` / `has_dirty(db)` / `manifest_stats(db)` | GUI timer, scraper, reorganize/monitor wrappers, Settings |
+| `suspend_auto_flush()` / `auto_flush_suspended()` / `auto_enabled(settings)` | reorganize/monitor wrappers, GUI timer |
+| `variant_ids_for_apps(db, app_ids)` | app context menu |
+| `remove_manifests(db, variant_ids)` | (helper, no UI yet) |
+| `ManifestCache`, `load_folder_manifests`, `folder_manifest_names`, `is_manifest_filename` | scanner, resolver |
+| `claim_groups`, `claimed_dir_names`, `confirmed_entry_for_folder` | scanner |
+| `override_fields_from_manifest`, `apply_manifest`, `check_unit` | resolver |
+
+### Database additions
+
+Columns: `apps.app_uid`; `variants.variant_uid`, `manifest_hash` (hash of the
+content last written/applied = baseline), `manifest_dirty`, `manifest_path`,
+`manifest_written_at`, `manifest_error`. Triggers: `trg_apps_uid_ins`,
+`trg_variants_uid_ins` (also dirties), `trg_apps_manifest_dirty`,
+`trg_variants_manifest_dirty` (fire only when `OLD.x IS NOT NEW.x` for a column in
+`_APP_DIRTY_COLS` / `_VARIANT_DIRTY_COLS`; catalog/subcatalog are NOT in the
+lists). To make a new field part of the manifest: add it to `build_payload`, to
+the matching `_*_DIRTY_COLS` tuple, and to `apply_manifest`.
+
+### Auto mode (settings `manifest_auto_enabled`, `manifest_auto_only_valuable`)
+
+edit/scrape/merge/split/move -> trigger sets `manifest_dirty` -> `flush_dirty`
+writes it. Flush points: GUI timer every 4 s (`ManifestFlushWorker`), end of
+scrape, after each reorganize/monitor item, window close. `is_valuable(row)`
+(name locked, version locked, file locked, ignored, verified, scraped, or
+name_source manual/monitor) is the "only valuable" filter; manual writes ignore it.
+Failures never interrupt the triggering action: logged + `variants.manifest_error`.
+
+### Reader / precedence
+
+See `apply_manifest` (table in PROGRESS.md checkpoint 31): new variant -> full
+apply; baseline equal -> nothing; manifest newer and DB clean -> apply; both
+changed -> DB wins + `audit_log manifest_conflict`; no baseline (old DB) -> DB
+wins, only empty app details filled. DB locks always win. Integrity problems
+-> `audit_log manifest_integrity` and `needs_review` (unless verified).
+
+### GUI
+
+Toolbar **Write manifests...**; app and variant context menus **Create/update
+manifest**; Settings -> Scanning & Noise group *Variant manifests*;
+`ManifestWorker` / `ManifestFlushWorker` in `gui_backend.py`;
+`MainWindow._manifest_tick`, `_write_manifests_for`, `closeEvent`.
+
+### Gotchas
+
+- Several files have mixed CRLF/LF endings (`gui_main.py`, `gui_backend.py`,
+  `monitor.py`); edits must preserve each file's endings.
+- `execute_reorganize` / `execute_monitor_plan` are wrappers now; call them as before.
+- `_upsert_variant` returns `(variant_id, created)`.
+- Test pattern used: build an "old" DB with the ORIGINAL code (`git archive HEAD`),
+  hand-edit it with sqlite to simulate manual work, then open it with the new code.
+
+
+---
+
+## 17. `app_curation.py` + `curation_dialogs.py` -- protecting and curating manual work (checkpoint 32)
+
+**Why.** Resolve matched apps only by `normalized_key` and overwrote `variants.app_id`; any rename (manual or
+the scraper's auto-rename), merge, move or split was undone by the next rescan / "Resolve all" (duplicate app +
+EMPTY renamed app). See PROGRESS.md checkpoint 32 for the full analysis.
+
+### Schema (additive, `ensure_curation_schema`)
+`app_aliases(normalized_key PK, app_id FK cascade)`; `variants.app_pinned`; trigger `trg_apps_key_alias`
+(`AFTER UPDATE OF normalized_key`, records OLD key, `INSERT OR REPLACE`); one-off pin backfill from `audit_log`.
+
+### Resolver support
+| Function | Role |
+|---|---|
+| `load_pin_map(conn)` | raw_candidate_id -> app_id for variants that must stay (app name/catalog/subcatalog locked, verified, or `app_pinned`) |
+| `adopt_orphan_variants(conn, rows)` -> `(count, stale_raw_ids)` | re-link variants with no/stale raw row to the fresh raw row of the same folder+file; delete the old raw row if its folder is gone |
+| `find_app_by_alias`, `learn_alias`, `alias_absorbed_app` | alias lookup / learning / merge support |
+| `remove_empty_unprotected_apps(conn)` | delete empty apps with no lock/verified/scrape/description |
+
+### Manual curation
+| Function | Role |
+|---|---|
+| `create_backup(db_path, label, keep, min_interval_s)` | `backups/<db>-<label>-<ts>.db`; never raises |
+| `suggest_app_fields`, `find_existing_app`, `find_variant_at`, `add_app_manually` | Add-app (no scan root); variant has no raw row, `file_locked`, `app_pinned`, `name_source='manual'`; app verified + name/catalog/subcatalog locked |
+| `plan_installer_override` / `apply_installer_override` | installer outside the variant folder: widen the unit to the common parent, `single_app` layout entry, locked entry file; refuses scan-root/drive-root parents and >`MAX_OTHER_APPS_SWALLOWED` other apps |
+| `find_empty_app_repairs` / `apply_empty_app_repairs` | repair apps already emptied by the old bug (merge / delete / review) |
+
+### GUI
+`AddAppDialog` (toolbar **Add app…**), `RepairEmptyAppsDialog` (toolbar **Repair empty apps…**, resizable
+columns), Resolve-all confirmation, installer-override dialog in `DetailPanel`.
+
+### Rules for future code
+* Never set `variants.app_id` from a re-derived cluster without consulting `load_pin_map`.
+* Any code that changes `apps.normalized_key` is covered by the trigger -- do not bypass it with raw SQL on another table.
+* Code that merges/moves/splits variants must set `app_pinned = 1` (and alias absorbed apps).
+* Manifests carry `variant.pinned`; a manifest is trusted when confirmed / verified / pinned / scraped / name-locked.
+* Test pattern: build the "old" DB with the ORIGINAL code (`git archive HEAD`), reproduce the bug, then rerun on the new code.
+
+### Checkpoint 33 additions to section 17 / 16
+* `split_variant_with_details(db, variant_id, name=, installer_path=, unit_folder=, catalog=, subcatalog=, version=, edition=, architecture=, language=, target_app_id=)` -- split a variant into a new app (or move into `target_app_id`) applying the dialog's edits; pins the variant; see PROGRESS.md checkpoint 33 for installer/folder edit semantics.
+* `AddAppDialog(db, parent, start_dir=None, split_variant=None, split_app=None)` -- split mode prefills from the variant and calls `split_variant_with_details`.
+* Section 16 (`app_manifest.py`): `override_fields_from_manifest` now applies to EVERY manifest (not only trusted ones) for fresh variants; the manifest's `app_uid` is the cluster identity (see resolver, section 4).

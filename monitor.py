@@ -76,6 +76,8 @@ import json
 import logging
 import os
 import shutil
+
+import app_manifest   # variant manifests (appcatalog.json) -- see app_manifest.py
 import subprocess
 import time
 import traceback
@@ -245,6 +247,13 @@ def _lookup_app_by_key(db: Database, key: str) -> Optional[dict]:
         "WHERE normalized_key = ? LIMIT 1",
         (key,),
     ).fetchone()
+    if row is None:
+        # renamed since (by hand or by the scraper)? the old key is an alias
+        row = db.connect().execute(
+            "SELECT a.id, a.name, a.catalog, a.subcatalog FROM app_aliases al "
+            "JOIN apps a ON a.id = al.app_id WHERE al.normalized_key = ? LIMIT 1",
+            (key,),
+        ).fetchone()
     return dict(row) if row else None
 
 
@@ -556,7 +565,7 @@ def _record_variant(db: Database, app_id: int, item: MonitorPlanItem,
     variants table from resolver-produced ones.
     """
     conn = db.connect()
-    conn.execute(
+    cur = conn.execute(
         """INSERT INTO variants (app_id, version, edition, architecture,
                                   source_path, file_type, file_size,
                                   confidence, updated_at, file_name,
@@ -580,9 +589,24 @@ def _record_variant(db: Database, app_id: int, item: MonitorPlanItem,
                      "version": item.extracted_version})),
     )
     conn.commit()
+    return cur.lastrowid
 
 
-def execute_monitor_plan(db: Database, plan: list[MonitorPlanItem],
+def execute_monitor_plan(*args, **kwargs):
+    """Runs the monitor plan with the manifest auto-flusher held back (it
+    must not write into folders that are mid-move), then flushes once at the
+    end so every newly attached variant gets its manifest."""
+    db = kwargs["db"] if "db" in kwargs else args[0]
+    with app_manifest.suspend_auto_flush():
+        result = _execute_monitor_plan_impl(*args, **kwargs)
+    try:
+        app_manifest.flush_dirty(db)
+    except Exception as e:
+        log.warning("manifest flush after monitor run failed: %s", e)
+    return result
+
+
+def _execute_monitor_plan_impl(db: Database, plan: list[MonitorPlanItem],
                           dest_root: str, move_mode: str = "move",
                           settings: Optional[dict] = None,
                           on_progress=None, cancel_flag=None,
@@ -697,11 +721,15 @@ def execute_monitor_plan(db: Database, plan: list[MonitorPlanItem],
             archive_created = False
             archive_backend = "move-as-is"
             note = None
+            monitor_orig_fp = None
 
             if already:
                 _safe_move_or_copy(item.source_path, dest_path, move_mode)
             else:
                 os.makedirs(dest_folder, exist_ok=True)
+                # identity of the ORIGINAL installer, recorded in the manifest
+                # because the archived copy has a different fingerprint
+                monitor_orig_fp = app_manifest.quick_fingerprint(item.source_path)
                 stem_no_ext = os.path.splitext(dest_path)[0]
                 fmt = (settings.get("monitor_archive_format") or "7z").lower()
                 final_path, backend, note = _compress(
@@ -719,7 +747,16 @@ def execute_monitor_plan(db: Database, plan: list[MonitorPlanItem],
                             "Compressed OK but couldn't delete source %s: %s",
                             item.source_path, e)
 
-            _record_variant(db, app_id, item, dest_path, item.source_path)
+            new_variant_id = _record_variant(db, app_id, item, dest_path, item.source_path)
+            try:
+                mres = app_manifest.write_variant_manifest(
+                    db, new_variant_id, force=True,
+                    orig_name=(item.file_name
+                               if os.path.basename(dest_path) != item.file_name else None),
+                    orig_fp=monitor_orig_fp)
+                entry["manifest"] = mres.status
+            except Exception as e:      # never let a manifest problem fail the move
+                log.warning("manifest write failed for monitored file %s: %s", dest_path, e)
 
             outcome = "copied" if move_mode == "copy" else "moved"
             entry["status"] = outcome

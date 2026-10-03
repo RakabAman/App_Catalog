@@ -2762,3 +2762,369 @@ the resolved path is enough to see whether the normpath landed.
 Nothing in `app_manager.py`, `monitor.py`, `scraper.py`, `app_organizer.py`,
 `gui_backend.py`, or `config.py` needed to change. No new settings, no
 new dialogs, no new tables.
+
+---
+
+## Checkpoint 31: Variant manifests (`*.appcatalog.json`) + resizable Reorganize preview columns
+
+*Date: 2026-10-02.*
+
+### Problem
+
+Every manual correction lived only in `catalog.db`: locked names, confirmed
+installer files, verified status, scraped description / Winget / Choco ids.
+Lose or reset the DB, update the app, or reorganize the library, and a rescan
+had nothing but messy folder names to go on. Worse, dependent folders of a
+multi-folder installer (`Redist/`, `crack/`, `data/`) were re-detected as
+bogus extra "apps" (reproduced: the old code turned `Redist/vc.exe` and
+`crack/keygen.exe` into apps called "Redist" and "Crack").
+
+### Decisions locked in
+
+- **One manifest file per VARIANT (install unit)**, stored next to its
+  files, independent of catalog / subcatalog. Category data is deliberately
+  never written, so a move between category folders can never leave a stale
+  category behind. Tags that merely mirror a catalog/subcatalog name are
+  dropped too.
+- **Personal file names** (so one manifest can never be mistaken for, or
+  overwritten by, another):
+  - variant owns its folder -> `<folder>/<App name> <version> [edition] [arch] [language].appcatalog.json`
+  - folder shared by several variants -> `<folder>/<entry file name>.appcatalog.json`
+  - the writer NEVER overwrites a manifest that describes a different unit
+    (different `variant_uid` AND different entry file): it appends ` [<uid6>]`.
+  - renamed app -> manifest renamed, the superseded file removed.
+  - the first-draft plain name `appcatalog.json` is still READ and is migrated
+    (renamed + removed) on the next write.
+- **The manifest describes the whole unit**: `unit.entry` (the setup file,
+  with a path-independent fingerprint and a `confirmed` flag), `unit.members`
+  (every dependent file/folder with a role: `entry` / `required` /
+  `companion`), `unit.owned` (whole folder vs one file in a shared folder).
+  Paths are relative to the manifest's folder (drive letters never stored).
+  `app` carries name + scraped details; `variant` carries version / edition /
+  architecture / language / locks / original (pre-cleanup) name.
+- **Auto mode is the default** (`manifest_auto_enabled`, on by default,
+  toggle in Settings -> Scanning & Noise). Implemented with SQLite triggers +
+  a dirty flag + a flusher rather than hooks in each edit function, so every
+  code path that edits an app/variant is covered (resolver edits, scraper,
+  merge/split, monitor, ...). Category operations are not in the trigger
+  column lists, so they never cause a write.
+- Auto mode writes only variants that carry human or scrape work
+  (`manifest_auto_only_valuable`, on by default); the manual buttons always
+  write.
+- **Old databases keep working.** Everything is additive: 7 new columns, 4
+  triggers, uid backfill done with the dirty-trigger out of the way. Opening
+  an old `catalog.db` marks nothing dirty and writes no file.
+
+### Precedence when a manifest meets a database (`app_manifest.apply_manifest`)
+
+| Situation | Result |
+|---|---|
+| variant created in THIS resolve (fresh DB / new file) | manifest applies fully (name, version, edition, arch, language, locks, details) |
+| existing variant, manifest unchanged since we last wrote/applied it | nothing |
+| existing variant, manifest changed on disk, DB has no unsaved edits | manifest applies (it is newer) |
+| existing variant, manifest changed AND DB has unsaved edits | DB wins; `manifest_conflict` row in `audit_log`; DB version rewritten at next flush |
+| existing variant, no baseline (DB predates manifests) | DB wins; only EMPTY app details (description, publisher, ids ...) are filled |
+
+DB locks (name / version / file) always win over manifest values.
+
+### Scan side ("claim first")
+
+- `scanner.walk_scan_root` hides manifest files from the file list,
+  classification and the folder fingerprint (writing one does not make a
+  folder look changed; an incremental rescan of a freshly manifested tree
+  skipped 14/14 folders).
+- A **confirmed** manifest pins its entry file as the unit's representative
+  (`claim_groups`, and `forced_file` for single_app folders) and its
+  dependent sub-folders are not descended into (`claimed_dir_names`), so
+  dependencies can no longer become bogus apps and the setup file is never
+  re-guessed. Unconfirmed manifests do not change scanning.
+- `resolver.run_resolve` looks up the manifest per candidate
+  (`ManifestCache.find`, by entry file name or its pre-archive `orig_name`),
+  lets a trusted manifest name a brand-new variant, then calls
+  `apply_manifest`. `ResolveProgress` gained `manifests_found/applied/
+  db_kept`. `_upsert_variant` now returns `(variant_id, created)`.
+- Integrity: if a required member is missing or changed, or the entry is
+  gone, an `audit_log` row `manifest_integrity` is written and the app is set
+  to `needs_review` unless verified. (No dedicated screen yet, see below.)
+
+### Write side
+
+- Triggers: new variant rows (`manifest_dirty = 1`, uid assigned), and a
+  REAL change (`OLD.x IS NOT NEW.x`) to any manifest-relevant app/variant
+  column. A no-op UPDATE does not dirty anything.
+- Flush points: GUI timer every 4 s (`ManifestFlushWorker`, own DB
+  connection), end of a scrape batch / manual Winget / Choco apply, after
+  each successful reorganize item and monitor attach, and on window close.
+  `suspend_auto_flush()` holds the flusher back while files are moving
+  (`execute_reorganize` and `execute_monitor_plan` are now thin wrappers
+  around `_execute_reorganize_impl` / `_execute_monitor_plan_impl`).
+- Content hash (volatile `updated_at` / `written_by` excluded) makes a flush
+  of an unchanged variant a no-op.
+- Reorganize: manifests are never copied as "sidecars"; the manifest is
+  rewritten at the destination after the move commits. Copy mode writes at the
+  destination with `record=False` (the DB row stays at the source). Archive
+  mode records the original installer name + fingerprint (`orig_name`,
+  `orig_fp`) so both forms match later.
+- Manual: toolbar **Write manifests...** (all, with confirmation + background
+  `ManifestWorker`), app right-click **Create/update manifest** (multi-select),
+  variant right-click **Create/update manifest**.
+
+### Reorganize preview table
+
+All 7 columns are user-resizable (`Interactive`), last column takes spare
+room, horizontal scroll when wider than the window, middle-elided paths with
+full-path tooltips, double-click a header divider to fit a column. Widths are
+remembered in the new setting `reorg_table_col_widths` (list of 7 ints,
+debounced save).
+
+### Bugs caught while building (worth remembering)
+
+- In the table-width restore loop I first used `for col, w in ...`; `w` is the
+  tab's page widget in `_build_file_structure_tab`, so the loop rebound it,
+  Python garbage-collected the page and the dialog died with
+  "QVBoxLayout already deleted". Found by bisecting, loop variable renamed.
+  Lesson: never reuse `w` / `v` as loop names inside the `_build_*_tab` methods.
+- The first draft wrote the plain name `appcatalog.json` for owned folders, so
+  two variants whose folders were merged would overwrite each other's file.
+  Replaced by personal names + the same-unit collision rule above.
+
+### Verified (synthetic library; old-format DBs built with the ORIGINAL code)
+
+- Old DB opened by the new code: columns/triggers added, uids backfilled,
+  0 dirty rows, 0 files written.
+- Manual work -> manifests -> folders moved into new category folders -> DB
+  deleted -> fresh DB: locked name, verified status, scraped details, locked
+  version and locked setup file restored; no "Redist" / "Crack" apps.
+- Real `execute_reorganize` (move mode) wrote personal-name manifests inside
+  the destination folders; no manifests left behind at the source.
+- Missing dependency -> `manifest_integrity` audit row. DB-wins and conflict
+  cases. Auto OFF writes nothing and keeps the dirty flags; suspend works.
+- Legacy `appcatalog.json` migrated; same-name different-variant manifest
+  never overwritten; app rename renames the manifest.
+- Headless GUI: toolbar action, settings checkbox save/reload, manual worker,
+  auto flush after an edit, context-menu path; resizable table widths saved
+  and restored.
+
+### Not done / known gaps
+
+- `monitor.py` change (`_record_variant` now returns the new variant id, the
+  manifest is written after the attach) is syntax-checked but was NOT run
+  against real folders. First real monitor run should be watched.
+- Manifest integrity problems are only in `app.log` and `audit_log`; no
+  screen shows them yet (candidate: a Report-tab section).
+- A pristine old DB that meets manifests written elsewhere keeps its own
+  names/locks (by design). An explicit "import manifests over the database"
+  action does not exist yet.
+- Not tested on Windows; the touched files have mixed CRLF/LF endings (the
+  patches preserved each file's own endings).
+
+### Files touched
+
+New: `app_manifest.py`. Changed: `database.py` (calls `ensure_manifest_schema`),
+`config.py` (3 settings), `scanner.py`, `resolver.py`, `scraper.py`,
+`app_manager.py`, `monitor.py`, `gui_backend.py` (2 workers), `gui_main.py`
+(toolbar, 2 menus, settings group, timer, close flush), `app_organizer.py`
+(resizable table).
+
+---
+
+## Checkpoint 32: Rescan/Resolve-all no longer destroys manual work; Resolve-all confirm + backups; installer override; Add app directly; Repair empty apps
+
+*Date: 2026-10-02.*
+
+### Reported
+
+1. Rescanning via the Scan-roots dialog made duplicate app names with EMPTY variants, for many (not all) apps.
+2. "Resolve all" was clicked by mistake and wiped the manual organising / renaming; it has no confirmation.
+3. "Change installer file" picked a wrong bare exe; the real installer was one level up in a sibling sub-folder. The warning was right but there was no override.
+4. No way to add an app without scanning a root.
+
+### Root cause of 1 and 2 (reproduced with the ORIGINAL code, see "Verified")
+
+`resolver._upsert_app` matched an existing app ONLY by `apps.normalized_key`, derived from the
+folder/file names of the cluster. `resolver._upsert_variant` then overwrote the variant's `app_id` with
+whatever app that returned. So:
+
+* any change of an app's `normalized_key` -- manual rename (`edit_app_field`), the **scraper's auto-rename**
+  (`scraper_auto_rename`: sets `name` + `normalized_key`, does NOT lock the name), re-resolve acceptance --
+  made the next resolve fail to find the app, CREATE a duplicate with the auto-derived name and MOVE the
+  variants into it. The renamed/scraped app (with its description, Winget id ...) was left empty.
+  This is why it hit "many but not all" apps: those renamed or scraped. (`normalize_key("Notepad++")`
+  happens to equal `normalize_key("Notepad")`, so that rename was unaffected.)
+* manual merges (`merge_apps`), moves (`move_variant_to_app`) and splits were silently undone by the same
+  `app_id` overwrite. "Resolve all" is the same code path, hence the lost organising work.
+* Reorganize updates `variants.source_path` but leaves `raw_candidate_id` on the OLD raw row; a rescan of the
+  destination then created NEW variants (duplicates) next to the moved ones.
+
+### Fix (new module `app_curation.py`; all additive)
+
+1. **Aliases** `app_aliases(normalized_key PK, app_id)`. Trigger `trg_apps_key_alias` records the OLD key whenever
+   `apps.normalized_key` changes (covers the scraper, manual rename, every writer). `merge_apps` aliases the
+   absorbed app (`alias_absorbed_app`). `_upsert_app` looks an unknown cluster key up in the aliases before
+   creating an app; an app found by alias keeps its current name (rename was deliberate).
+2. **Pinning** `load_pin_map`: an existing variant is NOT re-clustered when its app is protected (name /
+   catalog / subcatalog locked, or `status='verified'`) or `variants.app_pinned = 1` (set by merge / move /
+   split). Pinned variants only get their own fields refreshed and teach an alias. Existing databases:
+   `app_pinned` is backfilled once from `audit_log` (variants with move/split, apps that absorbed a merge).
+3. **Adoption** `adopt_orphan_variants`: a variant with no raw candidate (monitor attach, manual add) or a stale
+   one (Reorganize moved the folder) is re-linked to the fresh raw row with the same folder + file; its old raw
+   row is deleted when that folder no longer exists (otherwise resolve made ghost variants from it).
+4. `remove_empty_unprotected_apps` at the end of resolve: apps left empty that carry no lock / verified /
+   scrape / description are clutter and are deleted.
+5. **Repair** for catalogs already damaged: toolbar **Repair empty apps…** (`find_empty_app_repairs`,
+   `apply_empty_app_repairs`, dialog `RepairEmptyAppsDialog`). For each empty app: *merge* (a similar-named app
+   in the same catalog has the variants -> they move INTO the empty app, which keeps its name + scraped data;
+   the duplicate is deleted unless it has work of its own), *delete* (nothing worth keeping), or *review*.
+   Fuzzy score >= 80 (merge) / no manual data (delete) are pre-ticked.
+6. `monitor._lookup_app_by_key` falls back to aliases.
+
+### Resolve all: confirmation + backups
+
+* "Re-resolve all" now asks first. Default / Escape button is **Cancel** (Enter cannot trigger it). The text says
+  what is re-derived and what is protected. Found while testing: my first version set the default via
+  `box.buttons()[-1]`, whose order is not guaranteed, and the destructive button was the default -- use the
+  button object returned by `addButton`.
+* `app_curation.create_backup(db_path, label, keep, min_interval_s)` writes `backups/<db>-<label>-<timestamp>.db`
+  next to the database (sqlite backup API). Taken by `ResolveWorker` (`before-resolve`, keep 10),
+  `ScanAndResolveWorker` (`before-scan`, throttled to 1 per 15 min, keep 6), Repair (`before-repair`) and the
+  installer override (`before-override`). A backup failure only logs.
+
+### Installer override (outside the variant's folder)
+
+`_change_variant_installer_file` still refuses nothing silently: for a file outside `source_path` it now calls
+`DetailPanel._offer_installer_override` -> `app_curation.plan_installer_override` / `apply_installer_override`.
+The scanner can only see files under a variant's folder, so the variant's unit root is widened to the COMMON
+PARENT folder: variant (and its raw row) re-pointed to that folder, `file_name` = relative path of the chosen
+file, `file_locked = 1`, and that folder is marked `single_app` in the scan root's folder layout (existing
+machinery: whole subtree = one unit, `forced_file` honoured). Variants already catalogued inside that folder
+(typically bogus ones made from the unit's own sub-folders) are listed and removed on confirmation; refused if
+more than `MAX_OTHER_APPS_SWALLOWED` (5) OTHER apps live there (it is a category folder) or the common parent is
+the scan root / a drive root. Cancel is the default button. After applying, re-scan the root once.
+
+### Add app directly
+
+Toolbar **Add app…** -> `AddAppDialog`: installer file, app folder (defaults to the installer's folder; a parent
+is allowed, file stored relative), name / catalog / subcatalog (editable combos of existing values) / version /
+edition / arch / language prefilled by `suggest_app_fields` (same extractor as the resolver), optional "scrape
+after adding". `add_app_manually`: app created verified with name + catalog + subcatalog locked, variant with
+`file_locked = 1`, `app_pinned = 1`, `name_source = 'manual'`, no raw candidate (like a Monitor attach). If the
+typed name collides with an existing app (key or alias) the user chooses "Add as variant" or "Create separate
+app". Duplicate file at the same folder -> refused. If its folder is later scanned, the variant is adopted (no
+duplicate). Manifests are written by auto mode as for any variant.
+
+### Manifest changes (follow-up to checkpoint 31)
+
+Found while testing that a fresh DB did not restore manual merges/moves or a scraped app name. Fixed:
+`variant.pinned` is written to the manifest, `app_pinned` is a dirty-trigger column and counts as "valuable",
+and a manifest is "trusted" (may name a brand-new variant) when it is confirmed / verified / pinned / scraped /
+name-locked. Fresh DB over the reorganized test tree now reproduces the organised state exactly.
+
+### Verified (synthetic libraries; old-format DBs built with the ORIGINAL code via `git archive HEAD`)
+
+| Scenario (manual rename, scraper-style rename, merge, manual move, rescan, Resolve all, Reorganize + rescan dest) | original | new |
+|---|---|---|
+| apps / empty apps after rescan | 8 / `VLC media player` empty | 5 / none |
+| merge, move, scraped data survive Resolve all | all lost | all kept |
+| variants after Reorganize + rescan of dest (expect 8) | 16 | 8 |
+
+Also: repair tool on a DB damaged by the original code (scraped "VLC media player" got its 2 variants back, the
+duplicate "Vlc" removed, rescan keeps it); old catalog.db opens (0 dirty, uids/pins backfilled); manual add
+(+ duplicate / name-collision checks, later scan adopts it); installer override on the "wrong bare exe, real one
+in a sibling folder" layout (rescan keeps one variant with the chosen file); headless GUI for the Resolve-all
+confirm (Cancel does nothing and takes no backup), repair dialog, add dialog, override dialog.
+
+### Not done / known gaps
+
+* Edition / architecture / language typed into a variant are not locked; Resolve all / rescan still recalculates
+  them (the app-level protection does not cover those fields).
+* Duplicate VARIANTS that earlier rescans already created (Reorganize then rescan, before this fix) are not merged
+  automatically; Clean library / Duplicates tools apply.
+* `monitor._fuzzy_candidates` still compares only current keys (the exact lookup uses aliases).
+* Adoption matches by normalised folder path + file name; not tested on Windows paths / long-path prefixes.
+* The installer override needs one rescan of the scan root afterwards (the dialog says so).
+* Extras / dependent-folder roles from FUTURE_PLAN_settings_and_extras.md are still only discussed.
+
+### Files touched
+
+New: `app_curation.py`, `curation_dialogs.py`. Changed: `database.py` (calls `ensure_curation_schema`),
+`resolver.py` (pin map, adoption, alias lookup, pinned pass, empty-app cleanup, merge/move/split pin),
+`monitor.py`, `app_manifest.py`, `gui_backend.py` (backups), `gui_main.py` (toolbar, Resolve-all confirm,
+override dialog, add/repair handlers).
+
+---
+
+## Checkpoint 33: Manifest identity (fresh DB no longer merges separately-organised apps) + UI tidy-up
+
+*Date: 2026-10-03.*
+
+### Reported
+
+1. **Repair empty apps…** does not belong on the top bar -> context menu (or Settings).
+2. **Add app…** should sit next to the **Scan roots…** button.
+3. **Split into new app…** (variant table) should use the Add-app dialog, prefilled from the variant, editable.
+4. *Bug report:* a manually edited + Organized library, scanned by a NEW database and resolved from the manifests,
+   still ends with variants under the wrong app name / under another app, even across different sub-catalogs.
+
+### Why (4) happened -- reproduced
+
+The manifests DO carry the app name (`app.name`, plus `app_uid`, locks, scraped data). The resolver used them badly:
+
+* `override_fields_from_manifest` only applied the manifest to "trusted" manifests (confirmed / verified / name-locked);
+  every other manifest was ignored and the variant fell back to filename/folder heuristics.
+* Even a trusted manifest only replaced the variant's NAME. The variant then still went through
+  `cluster_candidates`, which fuzzy-merges names across ALL catalogs (token-sort >= 88, plus a rule that merges any
+  name that is a strict prefix of another, >= 6 chars). So names the user had deliberately kept apart were glued back
+  together, and the cluster took the highest-confidence name -- i.e. the trusted one.
+* `app_uid` was in the manifest but never used for grouping; `_upsert_app` matched by name only.
+
+Reproduction (`/tmp`-style harness, 6 apps, then split/rename by hand, Reorganize, brand-new DB):
+`Adobe Photoshop` + `Adobe Photoshop Elements` -> ONE app named "Adobe Photoshop Elements" holding BOTH variants;
+`Foxit-Reader` + `Foxit Reader Portable` -> ONE app "Foxit Reader Portable". This is exactly the reported symptom.
+
+### Fix
+
+* **Every manifest decides identity for a fresh variant** (not only trusted ones): it was written from the DB's own
+  state, so using it reproduces that state. `override_fields_from_manifest` no longer checks `trusted`;
+  `apply_manifest` sets the app name for a newly created app unconditionally (locks still come from the manifest).
+* **Manifest-bound clusters** (`resolver.cluster_manifest_members`, `Cluster.app_uid`, `Cluster.manifest_bound`):
+  candidates whose identity came from a manifest are grouped by `app_uid` (fallback: exact name) and are NEVER
+  fuzzy-merged with anything. Same name + same catalog/subcatalog under different uids (a regenerated uid) is still one
+  app. The canonical name is the newest manifest's own spelling. Only the remaining candidates use
+  `cluster_candidates`.
+* **`_upsert_app` matches by `app_uid` first**, then by name -- preferring the app in the SAME catalog/subcatalog
+  (a manifest-bound cluster matches by name only inside its own catalog/subcatalog, and never via alias). A new app
+  keeps the manifest's `app_uid`, so identity survives a lost DB. An app matched by uid keeps its current name.
+* Result on the reproduction: grouping and names identical to before the DB was lost, and every `app_uid` preserved.
+  Earlier suites (rename/scrape/merge/move/rescan/Resolve-all/Reorganize, manifest recovery, repair, add, override,
+  Resolve-all confirm) unchanged.
+
+### UI
+
+* Toolbar: **Add app…** now directly after **Scan roots…**; **Repair empty apps…** removed from the toolbar and
+  added to the app-table context menu ("Repair empty apps… (whole library)").
+* **Split into new app…** opens `AddAppDialog` in *split mode* (`split_variant=`, `split_app=`): installer file, app
+  folder, name, catalog / subcatalog, version, edition, architecture, language prefilled from the variant and editable;
+  button reads "Split". Name equal to the current app is refused; a name that exists elsewhere asks "Move into that
+  app / Create separate app / Cancel". Backend: `app_curation.split_variant_with_details`:
+  - same folder, other file -> `file_name` changes + `file_locked`;
+  - different folder -> variant detached from its raw row (like a manual add), new folder/file locked, old raw row
+    dropped if unused (a rescan lists the old folder again if it still exists);
+  - changed version -> `version_locked`; new app is verified with name/catalog/subcatalog locked; variant `app_pinned`;
+  - the old app is deleted if that was its only variant and it carries no manual/scrape data.
+  The old `resolver.split_variant_to_new_app` is kept (no longer used by the GUI).
+
+### Not done / known gaps
+
+* A manifest that is not found at all is still ignored (`ManifestCache.find` matches the scanner's primary file to the
+  manifest's `entry.path` / `orig_name`). If an UNCONFIRMED manifest's folder contains several installers and the
+  scanner picks a different one, that variant falls back to heuristics. Candidate fix: fall back to the single manifest
+  of a folder / match by entry fingerprint.
+* An app has ONE catalog/subcatalog (folder majority vote across its variants); manifests intentionally do not store it.
+* Two genuinely different apps with the same name in the same catalog/subcatalog are still treated as one.
+* Variants pointing at different `app_uid`s but identical name+home are merged (by design, see above).
+
+### Files touched
+
+`resolver.py` (Cluster fields, `cluster_manifest_members`, `run_resolve`, `_upsert_app`), `app_manifest.py`
+(`override_fields_from_manifest`, `apply_manifest`), `app_curation.py` (`split_variant_with_details`),
+`curation_dialogs.py` (split mode), `gui_main.py` (toolbar, context menu, split handler).

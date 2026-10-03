@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QVBoxLayout,
 )
 
+import app_manifest
+import app_curation
 from database import Database
 from scanner import run_scan, ScanProgress
 from resolver import run_resolve, ResolveProgress, edit_app_field
@@ -591,6 +593,8 @@ class ScanAndResolveWorker(QThread):
 
     def run(self):
         try:
+            # throttled snapshot (at most one per 15 min) before a rescan changes anything
+            app_curation.create_backup(self.db_path, "before-scan", keep=6, min_interval_s=900)
             db = Database(self.db_path)
             db.init_schema()
             scan_result = run_scan(
@@ -620,6 +624,9 @@ class ResolveWorker(QThread):
 
     def run(self):
         try:
+            # Safety net: snapshot the catalog first. "Resolve all" re-derives
+            # data for every app, so keep a copy to roll back to.
+            app_curation.create_backup(self.db_path, "before-resolve", keep=10)
             db = Database(self.db_path)
             db.init_schema()
             result = run_resolve(db)
@@ -699,6 +706,67 @@ class ScrapeWorker(QThread):
         except Exception as e:
             log.error("Scrape job failed:\n%s", traceback.format_exc())
             self.failed.emit(str(e))
+
+
+class ManifestWorker(QThread):
+    """Manual 'Create / update manifests' job (all apps, or a given set of
+    variant ids). Always writes -- the auto-mode 'only valuable' filter does
+    not apply to an explicit request."""
+    progress = Signal(int, int)
+    finished_ok = Signal(object)          # app_manifest.BatchResult
+    failed = Signal(str)
+
+    def __init__(self, db_path: str, variant_ids: Optional[list] = None, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.variant_ids = variant_ids
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        db = None
+        try:
+            db = Database(self.db_path)
+            db.init_schema()
+
+            def _p(i, total, _path):
+                if i % 10 == 0 or i == total:
+                    self.progress.emit(i, total)
+
+            result = app_manifest.write_manifests(
+                db, self.variant_ids, progress=_p, cancel=lambda: self._cancelled)
+            self.finished_ok.emit(result)
+        except Exception as e:
+            log.error("Manifest job failed:\n%s", traceback.format_exc())
+            self.failed.emit(str(e))
+        finally:
+            if db is not None:
+                db.close()
+
+
+class ManifestFlushWorker(QThread):
+    """Auto mode: writes the manifests of variants whose data changed.
+    Runs on its own DB connection so the GUI never waits on file I/O."""
+    finished_ok = Signal(object)
+
+    def __init__(self, db_path: str, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+
+    def run(self):
+        db = None
+        try:
+            db = Database(self.db_path)
+            db.connect()
+            self.finished_ok.emit(app_manifest.flush_dirty(db))
+        except Exception:
+            log.error("Manifest auto-flush failed:\n%s", traceback.format_exc())
+            self.finished_ok.emit(None)
+        finally:
+            if db is not None:
+                db.close()
 
 
 def _copy_scrape_progress(p: ScrapeProgress) -> ScrapeProgress:

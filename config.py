@@ -376,6 +376,23 @@ DEFAULT_SETTINGS = {
     "scan_follow_symlinks": False,
     "incremental_scan_by_default": True,  # skip unchanged folders via fingerprint
 
+    # -- variant manifests (appcatalog.json written next to each variant) ---
+    # Auto mode keeps a manifest up to date whenever a variant's manual
+    # edits / scrape data change (see app_manifest.py). Turn it off to
+    # write manifests only when you press the buttons.
+    "manifest_auto_enabled": True,
+    # Auto mode skips untouched, purely auto-resolved variants (the
+    # resolver recreates those from the files). Untick to write them too.
+    "manifest_auto_only_valuable": True,
+    # Names containing any of these words are listed as 'companion' (readme,
+    # crack, keygen ...) rather than 'required' members of a unit.
+    "manifest_companion_words": [
+        "readme", "read me", "read_me", "crack", "keygen", "key gen", "patch",
+        "patcher", "serial", "activat", "licen", "instruction", "how to",
+        "howto", "release note", "changelog", "nfo", "diz", "info", "website",
+        "cover", "screenshot", "thumbs", "desktop.ini",
+    ],
+
     # -- scraper (checkpoint 12: Winget manifest + Chocolatey enrichment) ---
     # "sources enabled" flag kept from the earlier placeholder for anything
     # still to come (e.g. a future AlternativeTo source); the two sources
