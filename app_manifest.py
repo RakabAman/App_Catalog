@@ -121,7 +121,7 @@ _COLUMN_MIGRATIONS = [
 ]
 
 _APP_DIRTY_COLS = (
-    "name", "name_locked", "publisher", "description", "homepage_url",
+    "name", "name_locked", "publisher", "description", "description_locked", "homepage_url",
     "winget_id", "choco_id", "license", "latest_version", "scrape_status",
     "last_scraped", "status",
 )
@@ -351,7 +351,7 @@ class ManifestRef:
         out = set()
         for m in (self.data.get("unit") or {}).get("members") or []:
             p = (m.get("path") or "").replace("\\", "/")
-            if p:
+            if p and m.get("role") != "excluded":
                 out.add(p.split("/", 1)[0].lower())
         return out
 
@@ -451,7 +451,7 @@ def claimed_dir_names(refs: list[ManifestRef]) -> set[str]:
             continue
         for m in (r.data.get("unit") or {}).get("members") or []:
             p = (m.get("path") or "").replace("\\", "/")
-            if m.get("type") == "dir" and p and "/" not in p:
+            if m.get("type") == "dir" and p and "/" not in p and m.get("role") != "excluded":
                 out.add(p.lower())
     return out
 
@@ -471,12 +471,14 @@ _VARIANT_SQL = """
 SELECT v.*,
        a.name AS a_name, a.name_locked AS a_name_locked,
        a.publisher AS a_publisher, a.description AS a_description,
+       a.description_locked AS a_description_locked,
        a.homepage_url AS a_homepage, a.license AS a_license,
        a.winget_id AS a_winget_id, a.choco_id AS a_choco_id,
        a.latest_version AS a_latest_version,
        a.scrape_status AS a_scrape_status, a.last_scraped AS a_last_scraped,
        a.status AS a_status, a.app_uid AS a_uid,
-       a.catalog AS a_catalog, a.subcatalog AS a_subcatalog
+       a.catalog AS a_catalog, a.subcatalog AS a_subcatalog,
+       (SELECT COUNT(*) FROM variant_sidecars vs WHERE vs.variant_id = v.id) AS sc_overrides
 FROM variants v JOIN apps a ON a.id = v.app_id
 WHERE v.id = ?
 """
@@ -492,7 +494,7 @@ def is_valuable(row) -> bool:
     return bool(
         row["a_name_locked"] or row["version_locked"] or row["file_locked"]
         or row["is_ignored"] or row["a_status"] == "verified"
-        or row["a_scrape_status"] == "scraped" or row["app_pinned"]
+        or row["a_scrape_status"] == "scraped" or row["app_pinned"] or row["sc_overrides"]
         or (row["name_source"] or "") in ("manual", "monitor")
     )
 
@@ -598,7 +600,12 @@ def _classify_member(name: str, is_dir: bool, words: list[str]) -> str:
 
 
 def _build_members(folder: str, entry_rel: Optional[str], owned: bool,
-                   prev: Optional[dict], words: list[str]) -> list[dict]:
+                   prev: Optional[dict], words: list[str],
+                   sidecar_items: Optional[list] = None) -> list[dict]:
+    """sidecar_items: app_sidecars.SidecarItem list (all origins) for this variant.
+    Excluded ones get role 'excluded' (owned folders) or are omitted (shared folders);
+    in a shared folder the sidecars are listed as 'companion' members."""
+    excluded = {i.rel_path.lower() for i in (sidecar_items or []) if i.origin == "excluded"}
     prev_roles = {}
     for m in ((prev or {}).get("unit") or {}).get("members") or []:
         if m.get("path"):
@@ -624,6 +631,8 @@ def _build_members(folder: str, entry_rel: Optional[str], owned: bool,
             if role is None:
                 role = "entry" if (not is_dir and e.name.lower() == entry_top and "/" not in (entry_rel or "").replace("\\", "/")) \
                     else _classify_member(e.name, is_dir, words)
+            if e.name.lower() in excluded:
+                role = "excluded"          # the user said: not part of this variant
             if is_dir:
                 files, nbytes, tfp = tree_stats(e.path)
                 members.append({"path": e.name, "type": "dir", "role": role,
@@ -666,13 +675,18 @@ def _build_members(folder: str, entry_rel: Optional[str], owned: bool,
             members.append({"path": n, "type": "file",
                             "role": "entry" if is_entry else "required",
                             "size": os.path.getsize(full)})
+    listed = {m["path"].lower() for m in members}
+    for it in sidecar_items or []:
+        if it.origin == "excluded" or not it.exists or it.rel_path.lower() in listed:
+            continue
+        members.append({"path": it.rel_path, "type": "dir" if it.is_dir else "file", "role": "companion"})
     return members
 
 
 def build_payload(conn, variant_id: int, *, folder: Optional[str] = None,
                   file_name: Optional[str] = None, prev: Optional[dict] = None,
                   orig_name: Optional[str] = None, orig_fp: Optional[str] = None,
-                  settings: Optional[dict] = None):
+                  settings: Optional[dict] = None, sidecar_ctx=None):
     """Returns (payload, folder, owned) or (None, folder, False) if the
     variant's folder is missing."""
     row = _fetch_variant(conn, variant_id)
@@ -688,6 +702,8 @@ def build_payload(conn, variant_id: int, *, folder: Optional[str] = None,
     owned = _is_owned_folder(conn, folder, variant_id) if folder == row["source_path"] else True
     words = settings.get("manifest_companion_words") or DEFAULT_COMPANION_WORDS
     words = [w.lower() for w in words]
+    import app_sidecars
+    sidecar_items = app_sidecars.list_sidecars_conn(conn, settings, variant_id, sidecar_ctx)
 
     entry_rel = (file_name or "").replace("\\", "/") or None
     entry_abs = os.path.join(folder, entry_rel.replace("/", os.sep)) if entry_rel else None
@@ -722,6 +738,8 @@ def build_payload(conn, variant_id: int, *, folder: Optional[str] = None,
             original_name = os.path.basename((rc["folder_path"] or "").rstrip("\\/")) or rc["primary_file_name"]
 
     app_locked = ["name"] if row["a_name_locked"] else []
+    if row["a_description_locked"]:
+        app_locked.append("description")
     var_locked = []
     if row["version_locked"]:
         var_locked.append("version")
@@ -773,9 +791,12 @@ def build_payload(conn, variant_id: int, *, folder: Optional[str] = None,
             "root": ".",
             "owned": owned,
             "entry": entry,
-            "members": _build_members(folder, entry_rel, owned, prev, words),
+            "members": _build_members(folder, entry_rel, owned, prev, words, sidecar_items),
         },
     }
+    overrides = app_sidecars.export_overrides(conn, variant_id)
+    if overrides:
+        payload["unit"]["sidecars"] = overrides      # restored on a fresh database
     return payload, folder, owned
 
 
@@ -814,7 +835,7 @@ def write_variant_manifest(db, variant_id: int, *, force: bool = False, dry_run:
                            folder: Optional[str] = None, file_name: Optional[str] = None,
                            record: bool = True, orig_name: Optional[str] = None,
                            orig_fp: Optional[str] = None,
-                           settings: Optional[dict] = None) -> WriteResult:
+                           settings: Optional[dict] = None, sidecar_ctx=None) -> WriteResult:
     """Write (or refresh) one variant's manifest.
 
     force=False  auto mode: skipped unless the variant carries real work
@@ -856,7 +877,7 @@ def write_variant_manifest(db, variant_id: int, *, force: bool = False, dry_run:
 
         payload, _, _ = build_payload(conn, variant_id, folder=eff_folder, file_name=eff_file,
                                       prev=prev, orig_name=orig_name, orig_fp=orig_fp,
-                                      settings=settings)
+                                      settings=settings, sidecar_ctx=sidecar_ctx)
         if payload is None:
             return WriteResult(variant_id, "skipped", message="folder not found")
         if folder:                        # explicit destination: force owned-style content
@@ -923,6 +944,7 @@ class BatchResult:
     skipped: int = 0
     failed: int = 0
     cancelled: bool = False
+    removed: int = 0                 # old metadata files deleted by a forced rebuild
     items: list = field(default_factory=list)
 
     def add(self, r: WriteResult):
@@ -935,8 +957,11 @@ class BatchResult:
         return self.created + self.updated + self.unchanged + self.skipped + self.failed
 
     def summary(self) -> str:
-        return (f"{self.created} created, {self.updated} updated, {self.unchanged} unchanged, "
-                f"{self.skipped} skipped, {self.failed} failed")
+        s = (f"{self.created} created, {self.updated} updated, {self.unchanged} unchanged, "
+             f"{self.skipped} skipped, {self.failed} failed")
+        if self.removed:
+            s += f" ({self.removed} old file(s) removed first)"
+        return s
 
 
 def variant_ids_for_apps(db, app_ids: Iterable[int]) -> list[int]:
@@ -951,23 +976,68 @@ def variant_ids_for_apps(db, app_ids: Iterable[int]) -> list[int]:
     return out
 
 
+def delete_variant_manifests(conn, variant_id: int) -> int:
+    """Delete every metadata file that describes this variant's unit (any file
+    name, including the legacy plain appcatalog.json and an unreadable one it was
+    last written to) and forget the stored baseline. Other variants' files in a
+    shared folder are untouched. Returns the number of files removed."""
+    row = conn.execute("SELECT variant_uid, source_path, file_name, manifest_path FROM variants WHERE id = ?",
+                       (variant_id,)).fetchone()
+    if row is None:
+        return 0
+    entry = (row["file_name"] or "").replace("\\", "/") or None
+    removed = 0
+    seen = set()
+    folder = row["source_path"]
+    if folder and os.path.isdir(folder):
+        owned = _is_owned_folder(conn, folder, variant_id)
+        own_name = ((os.path.basename(entry) + SIBLING_SUFFIX).lower() if entry else None)
+        for p, d in _folder_manifests(folder):
+            if p == row["manifest_path"] or same_unit(d, row["variant_uid"], entry):
+                seen.add(p)
+            elif d is None and (owned or os.path.basename(p).lower() == own_name):
+                # unreadable: in a folder that belongs to this variant (or named exactly
+                # like its own file) it can only be this variant's -- clear it too
+                seen.add(p)
+    if row["manifest_path"] and os.path.isfile(row["manifest_path"]):
+        seen.add(row["manifest_path"])
+    for p in seen:
+        try:
+            os.remove(p)
+            removed += 1
+        except OSError as e:
+            log.warning("could not delete metadata file %s: %s", p, e)
+    conn.execute("UPDATE variants SET manifest_hash = NULL, manifest_path = NULL, "
+                 "manifest_written_at = NULL WHERE id = ?", (variant_id,))
+    conn.commit()
+    return removed
+
+
 def write_manifests(db, variant_ids: Optional[Iterable[int]] = None, *, dry_run: bool = False,
                     progress: Optional[Callable[[int, int, str], None]] = None,
-                    cancel: Optional[Callable[[], bool]] = None) -> BatchResult:
-    """Manual 'Create / update manifests': always writes (force=True)."""
+                    cancel: Optional[Callable[[], bool]] = None, rebuild: bool = False) -> BatchResult:
+    """Manual 'Sync metadata files': always writes (force=True).
+
+    rebuild=True is the FORCED variant: each variant's existing metadata file is
+    deleted first and a brand-new one is created from the database, so nothing stale
+    survives (manual member roles stored only in the old file are discarded)."""
+    import app_sidecars
     conn = db.connect()
     if variant_ids is None:
         ids = [r[0] for r in conn.execute("SELECT id FROM variants ORDER BY id")]
     else:
         ids = list(variant_ids)
     settings = db.get_all_settings()
+    ctx = app_sidecars.SidecarContext(conn, settings)          # one library scan for the whole batch
     res = BatchResult()
     total = len(ids)
     for n, vid in enumerate(ids, start=1):
         if cancel and cancel():
             res.cancelled = True
             break
-        r = write_variant_manifest(db, vid, force=True, dry_run=dry_run, settings=settings)
+        if rebuild and not dry_run:
+            res.removed += delete_variant_manifests(conn, vid)
+        r = write_variant_manifest(db, vid, force=True, dry_run=dry_run, settings=settings, sidecar_ctx=ctx)
         res.add(r)
         if progress:
             progress(n, total, r.path or "")
@@ -989,10 +1059,14 @@ def flush_dirty(db, *, limit: int = 500) -> BatchResult:
         conn = db.connect()
         ids = [r[0] for r in conn.execute(
             "SELECT id FROM variants WHERE manifest_dirty = 1 ORDER BY id LIMIT ?", (limit,))]
+        if ids:
+            import app_sidecars
+            ctx = app_sidecars.SidecarContext(conn, settings)
         for vid in ids:
             if auto_flush_suspended():
                 break
-            res.add(write_variant_manifest(db, vid, force=not only_valuable, settings=settings))
+            res.add(write_variant_manifest(db, vid, force=not only_valuable, settings=settings,
+                                           sidecar_ctx=ctx))
         return res
     finally:
         _flush_lock.release()
@@ -1152,6 +1226,9 @@ def apply_manifest(conn, ref: ManifestRef, *, app_id: int, variant_id: int,
                 sets["name_locked"] = 1
         if var.get("verified"):
             sets["status"] = "verified"
+        if "description" in (app.get("locked") or []) and app.get("description"):
+            sets["description"] = app["description"]
+            sets["description_locked"] = 1
         if sets:
             cols = ", ".join(f"{k} = ?" for k in sets)
             conn.execute(f"UPDATE apps SET {cols} WHERE id = ?", (*sets.values(), app_id))
@@ -1198,6 +1275,10 @@ def apply_manifest(conn, ref: ManifestRef, *, app_id: int, variant_id: int,
         if mode == "full":
             if var.get("pinned") and not vrow["app_pinned"]:
                 sets["app_pinned"] = 1
+            sc = (ref.data.get("unit") or {}).get("sidecars")
+            if sc:
+                import app_sidecars
+                app_sidecars.import_overrides(conn, variant_id, sc)
             if var.get("ignored") and not vrow["is_ignored"]:
                 sets["is_ignored"] = 1
             if ref.confirmed and not vrow["file_locked"]:

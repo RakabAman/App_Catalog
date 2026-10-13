@@ -33,11 +33,11 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFontDatabase, QPainter
+from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
-    QFileDialog, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog,
+    QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter, QStackedWidget,
     QTabWidget, QTableWidget, QTableWidgetItem, QToolButton, QTreeWidget,
@@ -45,14 +45,15 @@ from PySide6.QtWidgets import (
 )
 
 from database import Database
-from resolver import merge_apps
+from resolver import merge_apps, apply_case_mode
 from app_manager import (
     log,
     find_duplicate_groups, rename_catalog, rename_subcatalog,
     get_category_tree, move_subcatalog, promote_subcatalog_to_catalog,
     demote_catalog_to_subcatalog, merge_subcatalogs,
     generate_catalog_report, report_to_markdown, report_to_csv_rows,
-    preview_reorganize, execute_reorganize, ReorganizeResult, plan_bytes_to_write,
+    preview_reorganize, execute_reorganize, ReorganizeResult, plan_bytes_to_write, find_misplaced_variants,
+    find_mixed_location_apps,
     validate_archive_password, fmt_bytes, fmt_duration,
 )
 
@@ -76,13 +77,15 @@ class _ReorganizeWorker(QThread):
     failed = Signal(str)                    # something unexpected blew up the whole run
 
     def __init__(self, db: Database, plans: list, copy_mode: str, archive_format: str,
-                 archive_password: Optional[str] = None, parent=None):
+                 archive_password: Optional[str] = None, parent=None,
+                 archive_scope: str = "installer"):
         super().__init__(parent)
         self.db = db
         self.plans = plans
         self.copy_mode = copy_mode
         self.archive_format = archive_format
         self.archive_password = archive_password
+        self.archive_scope = archive_scope
         self.cancel_event = threading.Event()
 
     def cancel(self):
@@ -94,6 +97,7 @@ class _ReorganizeWorker(QThread):
                 self.db, self.plans,
                 copy_mode=self.copy_mode, archive_format=self.archive_format,
                 archive_password=self.archive_password,
+                archive_scope=self.archive_scope,
                 progress_callback=self.reorg_event.emit,
                 cancel_event=self.cancel_event,
             )
@@ -156,9 +160,15 @@ class _QtLogHandler(logging.Handler):
 
 
 class OrganizeDialog(QDialog):
-    def __init__(self, db: Database, parent=None):
+    def __init__(self, db: Database, parent=None, scope_provider=None, filter_callback=None):
+        """scope_provider(kind) -> list of app ids (None = every app) for kind in
+        'list' | 'selected' | 'categories'; supplied by the main window so Reorganize and the
+        Location check can be limited to the list / selection / categories shown there."""
         super().__init__(parent)
         self.db = db
+        self._scope_provider = scope_provider
+        self._filter_callback = filter_callback     # filter_callback(app_ids, label): list only these apps in the main window
+        self._custom_scope_ids = None
         self.setWindowTitle("Organize")
         # The window can be made as small as this; each tab scrolls instead of forcing the
         # window to stay big (a tab's own minimum -- e.g. ~870x450 for Reorganize -- used to
@@ -170,10 +180,12 @@ class OrganizeDialog(QDialog):
         self.resize(w0, h0)
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
+        self.tabs = tabs
         tabs.addTab(self._scrollable(self._build_duplicates_tab()), "Duplicates")
         tabs.addTab(self._scrollable(self._build_categories_tab()), "Categories")
         tabs.addTab(self._scrollable(self._build_report_tab()), "Report")
         tabs.addTab(self._scrollable(self._build_file_structure_tab()), "Reorganize Files")
+        tabs.addTab(self._scrollable(self._build_location_tab()), "Location check")
         layout.addWidget(tabs)
 
         close_row = QHBoxLayout()
@@ -182,6 +194,196 @@ class OrganizeDialog(QDialog):
         self.close_btn.clicked.connect(self.accept)
         close_row.addWidget(self.close_btn)
         layout.addLayout(close_row)
+
+    # ---- scope (whole catalog / list / selection / categories) -----------------------
+    def _make_scope_combo(self, with_custom: bool = False) -> QComboBox:
+        cb = QComboBox()
+        total = self.db.connect().execute("SELECT COUNT(*) FROM apps").fetchone()[0]
+        cb.addItem(f"Whole catalog ({total} apps)", "all")
+        if self._scope_provider is not None:
+            for kind, label in (("list", "Current list in the main window"),
+                                ("selected", "Apps selected in the main window"),
+                                ("categories", "Categories selected in the filter list")):
+                try:
+                    ids = self._scope_provider(kind)
+                except Exception:
+                    ids = []
+                n = total if ids is None else len(ids)
+                cb.addItem(f"{label} ({n} apps)", kind)
+                if n == 0:
+                    cb.model().item(cb.count() - 1).setEnabled(False)
+        if with_custom:
+            cb.addItem("Apps found by the Location check", "custom")
+            cb.model().item(cb.count() - 1).setEnabled(False)
+        cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        cb.setMinimumContentsLength(12)
+        cb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        return cb
+
+    def _scope_ids(self, cb: QComboBox):
+        """None = every app, otherwise the list of app ids in the chosen scope."""
+        kind = cb.currentData()
+        if kind == "all":
+            return None
+        if kind == "custom":
+            return list(self._custom_scope_ids or [])
+        return self._scope_provider(kind) if self._scope_provider else None
+
+    def show_reorganize(self, scope_kind: str = "all"):
+        """Opens straight on the Reorganize tab with the scope preselected."""
+        self.tabs.setCurrentIndex(3)
+        i = self.reorg_scope_combo_scope.findData(scope_kind)
+        if i >= 0 and self.reorg_scope_combo_scope.model().item(i).isEnabled():
+            self.reorg_scope_combo_scope.setCurrentIndex(i)
+
+    # ---- Location check ---------------------------------------------------------------
+    def _build_location_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setSpacing(8)
+        intro = QLabel("<b>Mixed locations</b>: apps whose variants sit in different folders on disk "
+                       "(e.g. one variant in <i>cat1/sub1/app1</i>, another in <i>cat1/sub2/app2</i>) -- whatever "
+                       "the app's own category says. <b>Not in the app's own folder</b>: variants whose folder is not "
+                       "<code>&lt;scan root&gt;/Catalog/Subcatalog/App/…</code> of the app that owns them. "
+                       "Use <i>Apply as filter</i> to list just these apps in the main window and fix them by hand. "
+                       "Letter case is ignored.")
+        intro.setTextFormat(Qt.RichText)
+        intro.setWordWrap(True)
+        v.addWidget(intro)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Look for:"))
+        self.loc_mode_combo = QComboBox()
+        self.loc_mode_combo.addItem("Apps with variants in mixed locations", "mixed")
+        self.loc_mode_combo.addItem("Variants not in their app's own folder", "wrong")
+        mode_row.addWidget(self.loc_mode_combo, 1)
+        v.addLayout(mode_row)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("In:"))
+        self.loc_scope_combo = self._make_scope_combo()
+        row.addWidget(self.loc_scope_combo, 1)
+        self.loc_check_btn = QPushButton("Check locations")
+        self.loc_check_btn.clicked.connect(self._run_location_check)
+        row.addWidget(self.loc_check_btn)
+        v.addLayout(row)
+        self.loc_status = QLabel("Press “Check locations”. Nothing is changed by the check.")
+        self.loc_status.setWordWrap(True)
+        v.addWidget(self.loc_status)
+        self.loc_table = QTableWidget(0, 6)
+        self.loc_table.setHorizontalHeaderLabels(
+            ["App", "Version", "Currently in", "Should be in", "Problem", "Folders used"])
+        self.loc_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.loc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.loc_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.loc_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.loc_table.customContextMenuRequested.connect(self._loc_context_menu)
+        self.loc_table.setMinimumHeight(220)
+        hh = self.loc_table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.Interactive)
+        hh.setStretchLastSection(True)
+        for col, wd in enumerate([170, 70, 250, 250, 130, 80]):
+            self.loc_table.setColumnWidth(col, wd)
+        v.addWidget(self.loc_table, 1)
+        btns = QHBoxLayout()
+        self.loc_fix_btn = QPushButton("Reorganize these apps…")
+        self.loc_fix_btn.setToolTip("Opens the Reorganize tab limited to the apps of the selected rows "
+                                    "(all rows when none is selected). Pick the destination there and preview first.")
+        self.loc_fix_btn.setEnabled(False)
+        self.loc_fix_btn.clicked.connect(self._loc_send_to_reorganize)
+        btns.addWidget(self.loc_fix_btn)
+        self.loc_filter_btn = QPushButton("Apply as filter in the main list")
+        self.loc_filter_btn.setToolTip("Close this window and show only these apps in the main list "
+                                       "(of the selected rows; all rows when none is selected). "
+                                       "Clear it with the ✕ chip or Reset.")
+        self.loc_filter_btn.setEnabled(False)
+        self.loc_filter_btn.clicked.connect(self._loc_apply_filter)
+        btns.addWidget(self.loc_filter_btn)
+        btns.addStretch()
+        v.addLayout(btns)
+        self._loc_rows = []
+        return w
+
+    def _run_location_check(self):
+        ids = self._scope_ids(self.loc_scope_combo)
+        mixed = self.loc_mode_combo.currentData() == "mixed"
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            rows, st = (find_mixed_location_apps(self.db, app_ids=ids) if mixed
+                        else find_misplaced_variants(self.db, app_ids=ids))
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._loc_rows = rows
+        self._loc_mixed = mixed
+        self.loc_table.setHorizontalHeaderLabels(
+            ["App", "Version", "Location of this variant" if mixed else "Currently in",
+             "App's own folder" if mixed else "Should be in", "Status" if mixed else "Problem", "Locations"
+             if mixed else "Folders used"])
+        self.loc_table.setRowCount(len(rows))
+        shade = QColor(128, 128, 128, 40)
+        last_app, band = None, False
+        for i, r in enumerate(rows):
+            if r["app_id"] != last_app:
+                last_app, band = r["app_id"], not band
+            text = r.get("label") or (", ".join(r["problems"]) + " differ" + ("s" if len(r["problems"]) == 1 else ""))
+            vals = [r["app_name"] or "", r["version"] or "", r["actual"], r["expected"], text, str(r["locations"])]
+            for c, val in enumerate(vals):
+                it = QTableWidgetItem(val)
+                it.setToolTip(r["source_path"])
+                if band:
+                    it.setBackground(shade)     # rows of one app share a shade
+                self.loc_table.setItem(i, c, it)
+        if mixed:
+            if rows:
+                self.loc_status.setText(
+                    f"{st['mixed_apps']} app(s) have variants in more than one location "
+                    f"({st['variants']} variants) — {st['apps']} app(s) checked.")
+            else:
+                self.loc_status.setText(f"No mixed locations — all {st['apps']} checked app(s) keep their variants together.")
+        else:
+            note = (f"  ({st['too_shallow']} variant(s) sit too close to the scan root to be judged)"
+                    if st["too_shallow"] else "")
+            if rows:
+                self.loc_status.setText(
+                    f"{st['misplaced']} variant(s) of {st['apps']} app(s) are not under their app's folder "
+                    f"— {st['checked']} checked.{note}")
+            else:
+                self.loc_status.setText(f"All {st['checked']} checked variant(s) are where their app says.{note}")
+        self.loc_fix_btn.setEnabled(bool(rows))
+        self.loc_filter_btn.setEnabled(bool(rows) and self._filter_callback is not None)
+
+    def _loc_selected_rows(self) -> list:
+        sel = sorted({i.row() for i in self.loc_table.selectedIndexes()})
+        return [self._loc_rows[i] for i in sel] if sel else list(self._loc_rows)
+
+    def _loc_send_to_reorganize(self):
+        ids = sorted({r["app_id"] for r in self._loc_selected_rows()})
+        if not ids:
+            return
+        self._custom_scope_ids = ids
+        cb = self.reorg_scope_combo_scope
+        i = cb.findData("custom")
+        cb.setItemText(i, f"Apps found by the Location check ({len(ids)} apps)")
+        cb.model().item(i).setEnabled(True)
+        cb.setCurrentIndex(i)
+        self.tabs.setCurrentIndex(3)
+
+    def _loc_apply_filter(self):
+        """Closes the dialog and lists just these apps in the main window."""
+        ids = sorted({r["app_id"] for r in self._loc_selected_rows()})
+        if not ids or self._filter_callback is None:
+            return
+        what = "mixed locations" if getattr(self, "_loc_mixed", True) else "not in own folder"
+        self._filter_callback(ids, f"Location check: {what}")
+        self.accept()
+
+    def _loc_context_menu(self, pos):
+        item = self.loc_table.itemAt(pos)
+        if item is None:
+            return
+        r = self._loc_rows[item.row()]
+        menu = QMenu(self)
+        open_act = menu.addAction("Open the variant's folder")
+        if menu.exec(self.loc_table.viewport().mapToGlobal(pos)) is open_act:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(r["source_path"]))
 
     @staticmethod
     def _scrollable(page: QWidget) -> QScrollArea:
@@ -511,6 +713,20 @@ class OrganizeDialog(QDialog):
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self._refresh_category_views)
         toolbar_row.addWidget(refresh_btn)
+        case_btn = QToolButton()
+        case_btn.setText("Letter case ▾")
+        case_btn.setPopupMode(QToolButton.InstantPopup)
+        case_btn.setToolTip("Change the letter case of catalogs/subcatalogs, or merge spellings "
+                            "that differ only by case (e.g. 'Ide' and 'IDE').")
+        case_menu = QMenu(case_btn)
+        case_menu.addAction("Selected → UPPERCASE",
+                            lambda: self._convert_selected_tree_case("upper"))
+        case_menu.addAction("Selected → Smart Title Case",
+                            lambda: self._convert_selected_tree_case("title"))
+        case_menu.addSeparator()
+        case_menu.addAction("Merge case duplicates…", self._merge_case_duplicates)
+        case_btn.setMenu(case_menu)
+        toolbar_row.addWidget(case_btn)
         toolbar_row.addSpacing(16)
         self.cat_tree_view_btn = QPushButton("Tree view")
         self.cat_board_view_btn = QPushButton("Board view")
@@ -561,6 +777,26 @@ class OrganizeDialog(QDialog):
         self.cat_stack.setCurrentIndex(index)
         self.cat_tree_view_btn.setChecked(index == 0)
         self.cat_board_view_btn.setChecked(index == 1)
+
+    def _merge_case_duplicates(self):
+        from resolver import merge_case_duplicate_categories
+        changes = merge_case_duplicate_categories(self.db, apply=False)
+        if not changes:
+            QMessageBox.information(self, "Merge case duplicates", "No case-only duplicates found.")
+            return
+        lines = [f"• {c['kind']}: {c['from']!r} → {c['to']!r}  ({c['apps']} app(s))"
+                 + (f"  in {c['catalog']}" if c.get("catalog") else "") for c in changes[:25]]
+        if len(changes) > 25:
+            lines.append(f"… and {len(changes) - 25} more")
+        if QMessageBox.question(self, "Merge case duplicates",
+                                "These spellings will be unified:\n\n" + "\n".join(lines)
+                                + "\n\nContinue?") != QMessageBox.Yes:
+            return
+        merge_case_duplicate_categories(self.db)
+        self._refresh_category_views()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "refresh_all"):
+            parent.refresh_all()
 
     def _refresh_category_views(self):
         """Re-reads the catalog/subcatalog structure once and repopulates
@@ -666,6 +902,11 @@ class OrganizeDialog(QDialog):
         levels = {d["level"] for d in datas}
         menu = QMenu(self)
         rename_action = move_action = promote_action = demote_action = merge_action = None
+        upper_action = menu.addAction("Make UPPERCASE")
+        title_action = menu.addAction("Make Smart Title Case")
+        upper_action.setToolTip("Rewrite the selected catalog / subcatalog names in capitals")
+        title_action.setToolTip("Rewrite the selected names in smart Title Case (IPTV -> Iptv, 'cd dvd' -> 'Cd Dvd')")
+        menu.addSeparator()
         if len(datas) == 1:
             rename_action = menu.addAction("Rename…")
             if datas[0]["level"] == "subcatalog":
@@ -680,7 +921,11 @@ class OrganizeDialog(QDialog):
         chosen = menu.exec(global_pos)
         if chosen is None:
             return
-        if chosen is rename_action:
+        if chosen is upper_action:
+            self._convert_category_case(datas, "upper")
+        elif chosen is title_action:
+            self._convert_category_case(datas, "title")
+        elif chosen is rename_action:
             self._rename_category_data(datas[0])
         elif chosen is move_action:
             self._move_subcatalog_data(datas[0])
@@ -690,6 +935,43 @@ class OrganizeDialog(QDialog):
             self._demote_catalog_data(datas[0])
         elif chosen is merge_action:
             self._merge_subcatalogs_data(datas)
+
+    def _convert_selected_tree_case(self, mode: str):
+        datas = [i.data(0, Qt.UserRole) for i in self.cat_tree.selectedItems()]
+        datas = [d for d in datas if d]
+        if not datas:
+            QMessageBox.information(self, "Nothing selected",
+                                    "Select one or more catalogs / subcatalogs in the tree view first.")
+            return
+        self._convert_category_case(datas, mode)
+
+    def _convert_category_case(self, datas: list, mode: str):
+        """UPPERCASE / smart Title Case for every selected catalog or subcatalog.
+        Subcatalogs first, so a selected catalog's rename can't invalidate them."""
+        changed = apps = 0
+        ordered = sorted(datas, key=lambda d: 0 if d["level"] == "subcatalog" else 1)
+        for d in ordered:
+            if d["level"] == "catalog":
+                old = d["catalog"]
+                new = apply_case_mode(old, mode)
+                if old and new and new != old:
+                    apps += rename_catalog(self.db, old, new)
+                    changed += 1
+            else:
+                old = d["subcatalog"]
+                new = apply_case_mode(old, mode)
+                if old and new and new != old:
+                    apps += rename_subcatalog(self.db, new, old, catalog=d["catalog"])
+                    changed += 1
+        self._refresh_category_views()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "refresh_all"):
+            parent.refresh_all()
+        label = "UPPERCASE" if mode == "upper" else "Smart Title Case"
+        QMessageBox.information(
+            self, "Done",
+            f"{changed} name(s) converted to {label} ({apps} app(s) affected)." if changed
+            else f"Nothing to change -- the selection is already {label}.")
 
     def _rename_category_data(self, data: dict):
         if data["level"] == "catalog":
@@ -923,90 +1205,200 @@ class OrganizeDialog(QDialog):
         QApplication.clipboard().setText(report_to_markdown(self._current_report))
         QMessageBox.information(self, "Copied", "Report copied to clipboard as Markdown.")
 
+    _REORG_HELP = (
+        "<b>Moves or copies</b> every app version into "
+        "<code>&lt;destination&gt;/Catalog/Subcatalog/AppName/Version/</code> "
+        "(Portable-tagged apps go under <code>Portable/…</code>).<br><br>"
+        "• A version's own folder moves as one unit, so readme / crack / keygen / serial / skins travel with it.<br>"
+        "• Installers <b>sharing</b> a folder: only that version's own file moves; unclaimed sidecars "
+        "(Patch/, Crack/, Tutorial/ …) are <b>copied</b> alongside. Other apps' folders are never copied "
+        "— they move on their own row.<br>"
+        "• Only <b>bare installers</b> (.exe / .msi …) are compressed — that one file, never the folder "
+        "(unless you pick 'Whole variant').<br>"
+        "• <b>Preview first</b>: the preview window shows what each row will really write. "
+        "Nothing changes until you press Execute there."
+    )
+
+    def _show_reorg_help(self):
+        QMessageBox.information(self, "How Reorganize works", self._REORG_HELP)
+
     def _build_file_structure_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
-        v.setSpacing(6)
+        v.setSpacing(8)
 
-        intro = QLabel(
-            "<b>Moves or copies</b> every app version into "
-            "<code>&lt;destination&gt;/Catalog/Subcatalog/AppName/Version/</code> "
-            "(Portable-tagged apps go under <code>Portable/…</code>).<br>"
-            "• A version's own folder moves as one unit, so readme / crack / keygen / serial / skins travel with it.<br>"
-            "• Installers <b>sharing</b> a folder: only that version's own file moves; unclaimed sidecars "
-            "(Patch/, Crack/, Tutorial/ …) are <b>copied</b> alongside. Other apps' folders are never copied "
-            "— they move on their own row.<br>"
-            "• Only <b>bare installers</b> (.exe / .msi …) are compressed — that one file, never the folder.<br>"
-            "• <b>Preview first</b>: the table shows what each row will really write. "
-            "Nothing changes until you press Execute."
-        )
+        head = QHBoxLayout()
+        intro = QLabel("<b>Move or copy</b> every app version into "
+                       "<code>&lt;destination&gt;/Catalog/Subcatalog/AppName/Version/</code>. "
+                       "Press <b>Preview</b> first -- nothing changes until you Execute.")
         intro.setTextFormat(Qt.RichText)
         intro.setWordWrap(True)
-        v.addWidget(intro)
+        head.addWidget(intro, 1)
+        help_btn = QPushButton("How it works…")
+        help_btn.clicked.connect(self._show_reorg_help)
+        head.addWidget(help_btn)
+        v.addLayout(head)
 
-        # --- setup: destination / options / password / portable / preview, 3 compact rows ---
-        dest_row = QHBoxLayout()
-        dest_row.addWidget(QLabel("Destination:"))
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(QLabel("Reorganize:"))
+        self.reorg_scope_combo_scope = self._make_scope_combo(with_custom=True)
+        self.reorg_scope_combo_scope.setToolTip(
+            "Limit the plan to some apps -- e.g. the apps of one category, or the ones you just fixed. "
+            "Other apps are left completely alone (but still counted when deciding what is a shared folder).")
+        scope_row.addWidget(self.reorg_scope_combo_scope, 1)
+        v.addLayout(scope_row)
+
+        # --- setup: one compact grid; every row can stretch, so nothing is clipped ---------
+        setup = QGroupBox("Setup")
+        g = QGridLayout(setup)
+        g.setContentsMargins(8, 6, 8, 8)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(6)
+        for c in (1, 3, 5):
+            g.setColumnStretch(c, 1)
+
+        g.addWidget(QLabel("Destination:"), 0, 0)
         self.dest_edit = QLineEdit()
-        dest_row.addWidget(self.dest_edit, 1)
+        g.addWidget(self.dest_edit, 0, 1, 1, 5)
         browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse_dest)
-        dest_row.addWidget(browse_btn)
-        v.addLayout(dest_row)
+        g.addWidget(browse_btn, 0, 6)
 
-        opts_row = QHBoxLayout()
-        opts_row.addWidget(QLabel("Transfer:"))
+        g.addWidget(QLabel("Transfer:"), 1, 0)
         self.reorg_copy_mode_combo = QComboBox()
         self.reorg_copy_mode_combo.addItem("Move (default)", "move")
         self.reorg_copy_mode_combo.addItem("Copy (originals stay in place)", "copy")
         self.reorg_copy_mode_combo.currentIndexChanged.connect(self._refresh_preview_sizes)
-        opts_row.addWidget(self.reorg_copy_mode_combo)
-        opts_row.addSpacing(12)
-        opts_row.addWidget(QLabel("Archive as:"))
+        g.addWidget(self.reorg_copy_mode_combo, 1, 1)
+        g.addWidget(QLabel("Archive as:"), 1, 2)
         self.reorg_archive_combo = QComboBox()
         self.reorg_archive_combo.addItem("None -- leave as folder", "none")
         self.reorg_archive_combo.addItem("7z (recommended)", "7z")
         self.reorg_archive_combo.addItem("Zip", "zip")
         self.reorg_archive_combo.addItem("RAR (needs rar/WinRAR on PATH)", "rar")
-        opts_row.addWidget(self.reorg_archive_combo)
-        opts_row.addSpacing(12)
+        g.addWidget(self.reorg_archive_combo, 1, 3)
+        g.addWidget(QLabel("Compress:"), 1, 4)
+        self.reorg_scope_combo = QComboBox()
+        self.reorg_scope_combo.addItem("Bare installer only (.exe, .msi …)", "installer")
+        self.reorg_scope_combo.addItem("Whole variant — installer + sidecars", "variant")
+        self.reorg_scope_combo.setToolTip(
+            "Bare installer only: each .exe/.msi is compressed on its own; everything else stays as it is.\n"
+            "Whole variant: the installer AND its sidecars (readme, crack, plugins, dependent folders — see\n"
+            "the Sidecars dialog in the variants table) go into ONE archive named after the installer. The\n"
+            "archive is verified before the originals are removed. Items you excluded from the sidecars\n"
+            "stay outside it.")
+        self.reorg_scope_combo.currentIndexChanged.connect(self._refresh_preview_sizes)
+        g.addWidget(self.reorg_scope_combo, 1, 5, 1, 2)
 
         _s = self.db.get_all_settings()
-        self.reorg_pw_check = QCheckBox("Password")
+        self.reorg_pw_check = QCheckBox("Password:")
         self.reorg_pw_check.setChecked(bool(_s.get("archive_password_enabled", False)))
+        g.addWidget(self.reorg_pw_check, 2, 0)
         self.reorg_pw_edit = QLineEdit(_s.get("archive_password") or "")
-        self.reorg_pw_edit.setPlaceholderText("password")
+        self.reorg_pw_edit.setPlaceholderText("archive password")
         self.reorg_pw_edit.setToolTip(
             "The password is also added to each archive's filename in brackets,\n"
             "e.g. Setup.exe -> Setup(password).7z. Avoid \\ / : * ? \" < > | ( )\n"
             "-- they can't be used in a filename. Zip encryption needs pyzipper\n"
             "or a 7z binary on PATH; 7z needs py7zr; RAR needs rar on PATH.")
-        opts_row.addWidget(self.reorg_pw_check)
-        opts_row.addWidget(self.reorg_pw_edit, 1)
-        v.addLayout(opts_row)
+        g.addWidget(self.reorg_pw_edit, 2, 1, 1, 6)       # its own full-width row: never squeezed out
 
         def _sync_pw_enabled(*_):
             archiving = self.reorg_archive_combo.currentData() != "none"
+            self.reorg_scope_combo.setEnabled(archiving)
             self.reorg_pw_check.setEnabled(archiving)
             self.reorg_pw_edit.setEnabled(archiving and self.reorg_pw_check.isChecked())
         self.reorg_archive_combo.currentIndexChanged.connect(_sync_pw_enabled)
+        self.reorg_archive_combo.currentIndexChanged.connect(self._refresh_preview_sizes)
         self.reorg_pw_check.toggled.connect(_sync_pw_enabled)
         _sync_pw_enabled()
 
-        prev_row = QHBoxLayout()
-        self.reorg_portable_check = QCheckBox(
-            "Route Portable-tagged apps into a \"Portable\" category (original catalog becomes the subcategory)")
-        self.reorg_portable_check.setChecked(True)
-        prev_row.addWidget(self.reorg_portable_check, 1)
-        self.reorg_preview_btn = QPushButton("Preview (dry run -- changes nothing)")
-        self.reorg_preview_btn.clicked.connect(self._preview_reorganize)
-        prev_row.addWidget(self.reorg_preview_btn)
-        v.addLayout(prev_row)
+        g.addWidget(QLabel("Category folders:"), 3, 0)
+        self.reorg_cat_case_combo = QComboBox()
+        self.reorg_cat_case_combo.addItem("As in the app", "as_is")
+        self.reorg_cat_case_combo.addItem("UPPERCASE", "upper")
+        g.addWidget(self.reorg_cat_case_combo, 3, 1)
+        g.addWidget(QLabel("Subcategory folders:"), 3, 2)
+        self.reorg_sub_case_combo = QComboBox()
+        self.reorg_sub_case_combo.addItem("As in the app", "as_is")
+        self.reorg_sub_case_combo.addItem("UPPERCASE", "upper")
+        g.addWidget(self.reorg_sub_case_combo, 3, 3)
+        for _combo, _key in ((self.reorg_cat_case_combo, "reorganize_catalog_case"),
+                             (self.reorg_sub_case_combo, "reorganize_subcatalog_case")):
+            _combo.setCurrentIndex(max(_combo.findData(_s.get(_key, "as_is")), 0))
+            _combo.setToolTip("Letter case of the folder names created at this level. 'As in the app' "
+                              "uses the catalog/subcatalog text exactly as shown in the app "
+                              "(no automatic Title Case).")
+            _combo.currentIndexChanged.connect(
+                lambda _=0, c=_combo, k=_key: self.db.set_setting(k, c.currentData(), bump_version=False))
 
-        self.reorg_status_label = QLabel(
+        g.addWidget(QLabel("Unknown version:"), 3, 4)
+        self.reorg_unknown_edit = QLineEdit(
+            (_s.get("reorganize_unknown_version_name") or "").strip() or "unknown-version")
+        self.reorg_unknown_edit.setToolTip(
+            "Folder name used where a variant has no version. The scanner treats a folder with this name as "
+            "empty, so the app name still comes from the folder above it.")
+        self.reorg_unknown_edit.editingFinished.connect(
+            lambda: self.db.set_setting("reorganize_unknown_version_name",
+                                        self.reorg_unknown_edit.text().strip() or "unknown-version",
+                                        bump_version=False))
+        g.addWidget(self.reorg_unknown_edit, 3, 5, 1, 2)
+        self.reorg_portable_check = QCheckBox("Route Portable apps into a \"Portable\" category")
+        self.reorg_portable_check.setToolTip(
+            "Portable-tagged apps go under Portable/<original catalog>/… -- the original catalog "
+            "becomes the subcategory.")
+        self.reorg_portable_check.setChecked(True)
+        g.addWidget(self.reorg_portable_check, 4, 0, 1, 7)
+        # long item texts must not dictate the tab's minimum width (no sideways scrolling)
+        for _cb in (self.reorg_copy_mode_combo, self.reorg_archive_combo, self.reorg_scope_combo,
+                    self.reorg_cat_case_combo, self.reorg_sub_case_combo):
+            _cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            _cb.setMinimumContentsLength(6)
+            _cb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        v.addWidget(setup)
+
+        # --- actions ---------------------------------------------------------------
+        act = QHBoxLayout()
+        self.reorg_preview_btn = QPushButton("Preview (dry run -- changes nothing)")
+        self.reorg_preview_btn.setMinimumHeight(30)
+        self.reorg_preview_btn.clicked.connect(self._preview_reorganize)
+        act.addWidget(self.reorg_preview_btn, 1)
+        self.reorg_show_btn = QPushButton("Show preview / status window")
+        self.reorg_show_btn.setMinimumHeight(30)
+        self.reorg_show_btn.setEnabled(False)
+        self.reorg_show_btn.setToolTip("Re-open the preview table and the live run status")
+        self.reorg_show_btn.clicked.connect(self._show_reorg_window)
+        act.addWidget(self.reorg_show_btn)
+        v.addLayout(act)
+
+        self.reorg_tab_status = QLabel(
             "Choose a destination and press Preview. Nothing is changed until you press Execute.")
+        self.reorg_tab_status.setWordWrap(True)
+        v.addWidget(self.reorg_tab_status)
+        v.addStretch(1)
+
+        self._build_reorg_window()
+        return w
+
+    def _build_reorg_window(self):
+        """The preview table + live run status live in their own (non-modal) window,
+        opened by 'Preview'. It can be hidden during a run and re-opened from the tab."""
+        win = QDialog(self)
+        win.setWindowTitle("Reorganize — preview & status")
+        win.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        win.resize(1200, 760)
+        wv = QVBoxLayout(win)
+        wv.setContentsMargins(8, 8, 8, 8)
+        wv.setSpacing(6)
+
+        self.reorg_status_label = QLabel("")
         self.reorg_status_label.setWordWrap(True)
-        v.addWidget(self.reorg_status_label)
+        wv.addWidget(self.reorg_status_label)
+        self.reorg_roots_label = QLabel("")
+        self.reorg_roots_label.setTextFormat(Qt.RichText)
+        self.reorg_roots_label.setWordWrap(True)
+        self.reorg_roots_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        wv.addWidget(self.reorg_roots_label)
 
         # --- plan table (top) and live panel (bottom) share a draggable splitter ---------
         splitter = QSplitter(Qt.Vertical)
@@ -1014,22 +1406,18 @@ class OrganizeDialog(QDialog):
 
         self.reorg_table = QTableWidget(0, 7)
         self.reorg_table.setHorizontalHeaderLabels(
-            ["Status", "Source folder", "Destination", "Portable?", "Shared?", "Will write", "Notes"])
+            ["Status", "Source (relative)", "Destination (relative)", "Portable?", "Shared?", "Will write", "Notes"])
         self.reorg_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.reorg_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.reorg_table.setWordWrap(False)
-        # Every column is user-resizable (drag a header divider; double-click a
-        # divider to fit that column to its contents). The last column takes any
-        # spare room; if the columns are wider than the window the table scrolls
-        # sideways. Widths are remembered between sessions.
         hh = self.reorg_table.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.Interactive)
         hh.setStretchLastSection(True)
         hh.setMinimumSectionSize(40)
         hh.setHighlightSections(False)
         self.reorg_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.reorg_table.setTextElideMode(Qt.ElideMiddle)     # keep both ends of a long path visible
-        default_widths = [90, 380, 380, 80, 70, 110, 320]
+        self.reorg_table.setTextElideMode(Qt.ElideMiddle)
+        default_widths = [90, 300, 300, 80, 70, 110, 320]
         saved_widths = None
         try:
             saved_widths = self.db.get_setting("reorg_table_col_widths", None)
@@ -1037,7 +1425,7 @@ class OrganizeDialog(QDialog):
             pass
         widths = (saved_widths if isinstance(saved_widths, list)
                   and len(saved_widths) == len(default_widths) else default_widths)
-        for col, col_w in enumerate(widths):     # (not `w`: that is this tab's page widget)
+        for col, col_w in enumerate(widths):
             try:
                 self.reorg_table.setColumnWidth(col, max(40, int(col_w)))
             except (TypeError, ValueError):
@@ -1053,8 +1441,6 @@ class OrganizeDialog(QDialog):
         lv = QVBoxLayout(live)
         lv.setContentsMargins(6, 4, 6, 6)
         lv.setSpacing(4)
-
-        # the rolling log takes ALL the space (same detailed lines the terminal prints)
         self.reorg_activity_log = QPlainTextEdit()
         self.reorg_activity_log.setReadOnly(True)
         self.reorg_activity_log.setMaximumBlockCount(5000)
@@ -1063,7 +1449,6 @@ class OrganizeDialog(QDialog):
         self.reorg_activity_log.setPlaceholderText("Every step of a run scrolls past here, line for line as in the terminal…")
         lv.addWidget(self.reorg_activity_log, 1)
 
-        # ...and ONE thin status bar underneath: progress bars + the current step on a single line
         status_bar = QHBoxLayout()
         status_bar.setSpacing(8)
         self.reorg_overall_bar = QProgressBar()
@@ -1089,9 +1474,8 @@ class OrganizeDialog(QDialog):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         self.reorg_splitter = splitter
-        v.addWidget(splitter, 1)
+        wv.addWidget(splitter, 1)
 
-        # --- run controls ------------------------------------------------------------
         btn_row = QHBoxLayout()
         self.execute_btn = QPushButton("Execute previewed plan")
         self.execute_btn.setEnabled(False)
@@ -1105,8 +1489,14 @@ class OrganizeDialog(QDialog):
             "already in progress finishes its one file first.")
         self.reorg_cancel_btn.clicked.connect(self._cancel_reorganize)
         btn_row.addWidget(self.reorg_cancel_btn)
-        v.addLayout(btn_row)
+        hide_btn = QPushButton("Hide window")
+        hide_btn.setToolTip("Closes this window; a running job keeps going. Re-open it with "
+                            "'Show preview / status window'.")
+        hide_btn.clicked.connect(win.hide)
+        btn_row.addWidget(hide_btn)
+        wv.addLayout(btn_row)
 
+        self.reorg_win = win
         self._reorg_plans = []
         self._reorg_worker = None
         self._reorg_run_started = 0.0
@@ -1116,7 +1506,39 @@ class OrganizeDialog(QDialog):
         self._reorg_timer = QTimer(self)
         self._reorg_timer.setInterval(1000)
         self._reorg_timer.timeout.connect(self._tick_reorg_clock)
-        return w
+
+    def _show_reorg_window(self):
+        self.reorg_win.show()
+        self.reorg_win.raise_()
+        self.reorg_win.activateWindow()
+
+    def _set_reorg_summary(self, text: str):
+        self.reorg_status_label.setText(text)
+        self.reorg_tab_status.setText(text)
+
+    @staticmethod
+    def _common_root(paths: list) -> str:
+        """Deepest folder shared by all paths ('' when they sit on different drives)."""
+        paths = [os.path.normpath(p) for p in paths if p]
+        if not paths:
+            return ""
+        try:
+            root = os.path.commonpath(paths)
+        except ValueError:
+            return ""
+        if root in paths:                       # a single plan -> use its parent folder
+            root = os.path.dirname(root)
+        return root
+
+    @staticmethod
+    def _rel_to(path: str, root: str) -> str:
+        if not root or not path:
+            return path
+        try:
+            rel = os.path.relpath(os.path.normpath(path), root)
+        except ValueError:
+            return path
+        return path if rel.startswith("..") else rel
 
     def _rebalance_reorg_splitter(self, table_share: float):
         """Gives the plan table `table_share` (0-1) of the height, the live panel the rest."""
@@ -1156,6 +1578,9 @@ class OrganizeDialog(QDialog):
         if p.shared_extra_paths:
             notes.append(f"{len(p.shared_extra_paths)} sidecar item(s) ({fmt_bytes(p.extras_bytes)}) "
                          f"copied alongside, originals stay")
+        if (self.reorg_archive_combo.currentData() != "none"
+                and self.reorg_scope_combo.currentData() == "variant"):
+            notes.append("whole variant (installer + sidecars) compressed into one archive")
         if p.skipped_items:
             names = ", ".join(os.path.basename(x[0]) for x in p.skipped_items[:4])
             more = f" +{len(p.skipped_items) - 4} more" if len(p.skipped_items) > 4 else ""
@@ -1195,30 +1620,52 @@ class OrganizeDialog(QDialog):
                 f"{' (everything else is an instant rename)' if mode == 'move' else ''}.")
         if left:
             text += f"  {left} folder/file(s) deliberately left in place (see Notes)."
-        self.reorg_status_label.setText(text)
+        if getattr(self, "_reorg_in_place", 0):
+            text += f"  {self._reorg_in_place} variant(s) already in place (left alone)."
+        self._set_reorg_summary(text)
 
     def _preview_reorganize(self):
         dest = self.dest_edit.text().strip()
         if not dest:
             QMessageBox.warning(self, "No destination", "Choose a destination folder first.")
             return
-        self.reorg_status_label.setText("Scanning folders and measuring sizes… (nothing is changed)")
+        scope_ids = self._scope_ids(self.reorg_scope_combo_scope)
+        if scope_ids is not None and not scope_ids:
+            QMessageBox.information(self, "Nothing to reorganize", "The chosen scope contains no apps.")
+            return
+        self._set_reorg_summary("Scanning folders and measuring sizes… (nothing is changed)")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
         try:
-            self._reorg_plans = preview_reorganize(
+            all_plans = preview_reorganize(
                 self.db, dest,
                 portable_to_dedicated_category=self.reorg_portable_check.isChecked(),
+                catalog_case=self.reorg_cat_case_combo.currentData(),
+                subcatalog_case=self.reorg_sub_case_combo.currentData(),
+                app_ids=scope_ids,
+                unknown_version_name=self.reorg_unknown_edit.text(),
             )
         finally:
             QApplication.restoreOverrideCursor()
+        # variants already sitting exactly where they belong have nothing to do
+        self._reorg_plans = [p for p in all_plans if not p.in_place]
+        self._reorg_in_place = len(all_plans) - len(self._reorg_plans)
         mode = self.reorg_copy_mode_combo.currentData()
+        # Show the common source root and the destination once; the table rows then carry
+        # only the part below them (display only -- the plans keep their full paths).
+        src_root = self._common_root([p.source_path for p in self._reorg_plans])
+        dst_root = os.path.normpath(dest)
+        esc = html.escape
+        self.reorg_roots_label.setText(
+            f"<b>Source root:</b> {esc(src_root) if src_root else '(items come from different drives -- full paths shown)'}"
+            f"<br><b>Destination:</b> {esc(dst_root)}"
+            f"<br><span style='color:#909090'>Table paths are relative to these. Hover a cell for the full path.</span>")
         self.reorg_table.setRowCount(len(self._reorg_plans))
         for i, p in enumerate(self._reorg_plans):
             self.reorg_table.setItem(i, 0, QTableWidgetItem("Planned"))
-            src_item = QTableWidgetItem(p.source_path)
-            src_item.setToolTip(p.source_path)           # full path when the column is narrow
-            dst_item = QTableWidgetItem(p.dest_path)
+            src_item = QTableWidgetItem(self._rel_to(p.source_path, src_root))
+            src_item.setToolTip(p.source_path)           # full path on hover
+            dst_item = QTableWidgetItem(self._rel_to(p.dest_path, dst_root))
             dst_item.setToolTip(p.dest_path)
             self.reorg_table.setItem(i, 1, src_item)
             self.reorg_table.setItem(i, 2, dst_item)
@@ -1233,6 +1680,8 @@ class OrganizeDialog(QDialog):
         self.reorg_activity_log.clear()
         self.execute_btn.setEnabled(len(self._reorg_plans) > 0)
         self._rebalance_reorg_splitter(0.62)
+        self.reorg_show_btn.setEnabled(True)
+        self._show_reorg_window()
 
     # ---- execute ----------------------------------------------------------
 
@@ -1272,7 +1721,12 @@ class OrganizeDialog(QDialog):
         lines = [f"This will {verb} {len(self._reorg_plans)} item(s) on disk.",
                  f"Data physically written: {fmt_bytes(to_write)}"
                  + (f"  (destination has {fmt_bytes(free)} free)" if free is not None else "") + "."]
-        if archive_format != "none":
+        archive_scope = self.reorg_scope_combo.currentData()
+        if archive_format != "none" and archive_scope == "variant":
+            lines.append(f"Each variant is then compressed to ONE .{archive_format} archive: its installer AND "
+                         "its sidecars (readme, crack, plugins, dependent folders …). The archive is verified, "
+                         "then the loose originals are removed. Items you excluded from the sidecars stay outside it.")
+        elif archive_format != "none":
             lines.append(f"Each bare installer (.exe/.msi/...) is then compressed to .{archive_format}, "
                          f"that one file only; everything else is left as it is.")
         if archive_password:
@@ -1304,7 +1758,7 @@ class OrganizeDialog(QDialog):
 
         self._reorg_worker = _ReorganizeWorker(
             self.db, self._reorg_plans, copy_mode, archive_format,
-            archive_password=archive_password, parent=self)
+            archive_password=archive_password, parent=self, archive_scope=archive_scope)
         self._reorg_worker.reorg_event.connect(self._on_reorg_event)
         self._reorg_worker.finished_ok.connect(self._on_reorg_finished)
         self._reorg_worker.failed.connect(self._on_reorg_failed)
@@ -1462,7 +1916,7 @@ class OrganizeDialog(QDialog):
         self.reorg_phase_label.setText("Cancelled." if result.cancelled else "Done.")
         self.reorg_overall_bar.setValue(self.reorg_overall_bar.maximum() if not result.cancelled
                                         else self.reorg_overall_bar.value())
-        self.reorg_status_label.setText(summary.replace("\n", "   |   "))
+        self._set_reorg_summary(summary.replace("\n", "   |   "))
         self._finish_run_ui()
         self.execute_btn.setEnabled(False)
         self._reorg_plans = []       # a finished/cancelled plan is stale -- preview again for a new one

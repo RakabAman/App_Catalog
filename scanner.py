@@ -171,11 +171,40 @@ class ArchiveInspectionResult:
     error: Optional[str] = None
 
 
+_TAR_SUFFIXES = (".tgz", ".tar.gz", ".tar", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz")
+_TAR_LIST_MAX_MB = 400      # listing a .tar.gz means decompressing it end to end
+
+
 def _archive_type(path: str) -> str:
+    name = Path(path).name.lower()
+    if name.endswith(_TAR_SUFFIXES):
+        return "tar"
     ext = Path(path).suffix.lower()
     return {
         ".zip": "zip", ".7z": "7z", ".rar": "rar", ".iso": "iso",
     }.get(ext, "unsupported")
+
+
+def _list_tar(path: str) -> list[ArchiveEntry]:
+    import tarfile
+    if os.path.getsize(path) > _TAR_LIST_MAX_MB * 1024 * 1024:
+        raise RuntimeError(f"tar archive larger than {_TAR_LIST_MAX_MB} MB -- not listed "
+                           f"(it would have to be decompressed completely)")
+    with tarfile.open(path, "r:*") as t:
+        return [ArchiveEntry(m.name, m.size) for m in t.getmembers() if m.isfile()]
+
+
+def _extract_tar(path: str, dest: str) -> None:
+    import tarfile
+    with tarfile.open(path, "r:*") as t:
+        try:
+            t.extractall(dest, filter="data")          # Python 3.12+: blocks traversal / links
+        except TypeError:
+            root = os.path.realpath(dest)
+            safe = [m for m in t.getmembers()
+                    if (m.isfile() or m.isdir())
+                    and os.path.realpath(os.path.join(dest, m.name)).startswith(root + os.sep)]
+            t.extractall(dest, members=safe)
 
 
 def _list_zip(path: str) -> list[ArchiveEntry]:
@@ -232,6 +261,8 @@ def list_archive(path: str) -> ArchiveInspectionResult:
             result.entries = _list_rar(path)
         elif atype == "iso":
             result.entries = _list_iso(path)
+        elif atype == "tar":
+            result.entries = _list_tar(path)
     except Exception as e:
         result.error = str(e)
         if atype == "rar":
@@ -313,6 +344,8 @@ def extract_and_inspect(
                 z.extractall(tmp_root)
         elif result.archive_type == "iso":
             _extract_iso(path, tmp_root)
+        elif result.archive_type == "tar":
+            _extract_tar(path, tmp_root)
         else:
             return result
 
@@ -390,8 +423,65 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-INSTALLER_EXTS = {".exe", ".msi", ".msix", ".msixbundle"}
-ARCHIVE_EXTS = {".zip", ".rar", ".7z", ".iso"}
+DEFAULT_INSTALLER_EXTS = [".exe", ".msi", ".msix", ".msixbundle"]
+DEFAULT_ARCHIVE_EXTS = [".zip", ".rar", ".7z", ".iso", ".tgz", ".tar.gz"]
+INSTALLER_EXTS = set(DEFAULT_INSTALLER_EXTS)
+ARCHIVE_EXTS = set(DEFAULT_ARCHIVE_EXTS)
+_EXT_SIG = None
+
+
+def normalize_ext_list(value) -> list:
+    """['zip', ' .RAR ', '.tar.gz', 'zip'] -> ['.zip', '.rar', '.tar.gz'] (accepts a
+    list or a comma / space / newline separated string)."""
+    import re as _re
+    if isinstance(value, str):
+        value = _re.split(r"[,\s;]+", value)
+    out = []
+    for v in value or []:
+        v = (v or "").strip().lower()
+        if not v:
+            continue
+        if not v.startswith("."):
+            v = "." + v
+        if v not in out:
+            out.append(v)
+    return out
+
+
+def apply_extension_settings(settings: dict) -> None:
+    """Loads the installer / archive extension lists from settings (cheap no-op when
+    unchanged). Empty lists fall back to the defaults."""
+    global INSTALLER_EXTS, ARCHIVE_EXTS, _EXT_SIG
+    inst = normalize_ext_list(settings.get("installer_extensions")) or list(DEFAULT_INSTALLER_EXTS)
+    arch = normalize_ext_list(settings.get("archive_extensions")) or list(DEFAULT_ARCHIVE_EXTS)
+    sig = (tuple(inst), tuple(arch))
+    if sig == _EXT_SIG:
+        return
+    INSTALLER_EXTS, ARCHIVE_EXTS, _EXT_SIG = set(inst), set(arch), sig
+
+
+def extension_signature() -> str:
+    return "i:" + ",".join(sorted(INSTALLER_EXTS)) + "|a:" + ",".join(sorted(ARCHIVE_EXTS))
+
+
+def _is_installer(name: str) -> bool:
+    n = Path(name).name.lower()
+    return any(n.endswith(e) for e in INSTALLER_EXTS)
+
+
+def _is_archive(name: str) -> bool:
+    n = Path(name).name.lower()
+    return any(n.endswith(e) for e in ARCHIVE_EXTS)
+
+
+def _file_ext(name: str) -> str:
+    """Longest configured extension the name ends with ('.tar.gz'), else the plain suffix."""
+    n = Path(name).name.lower()
+    best = ""
+    for e in INSTALLER_EXTS | ARCHIVE_EXTS:
+        if n.endswith(e) and len(e) > len(best):
+            best = e
+    return best or Path(n).suffix.lower()
 
 
 @dataclass
@@ -408,6 +498,7 @@ def classify_folder(
     depth: int = 99,
 ) -> Classification:
     folder_name_lower = Path(folder_path).name.lower()
+    apply_extension_settings(settings)
 
     # Catalog (depth 1) and subcatalog (depth 2) levels are structural,
     # defined by the user's own folder scheme -- they must never be
@@ -455,8 +546,8 @@ def classify_folder(
     if apply_keyword_rules and _word_match(noise_keywords, noise_short_only_keywords, noise_short_only_max_len):
         return Classification("noise", f"folder name matches noise keyword")
 
-    installer_files = [f for f in file_names if Path(f).suffix.lower() in INSTALLER_EXTS]
-    archive_files = [f for f in file_names if Path(f).suffix.lower() in ARCHIVE_EXTS]
+    installer_files = [f for f in file_names if _is_installer(f)]
+    archive_files = [f for f in file_names if _is_archive(f)]
 
     if installer_files or archive_files:
         return Classification(
@@ -877,7 +968,7 @@ def _group_installer_files(file_names: list[str]) -> list[list[str]]:
     """
     installer_like = [
         f for f in file_names
-        if Path(f).suffix.lower() in INSTALLER_EXTS or Path(f).suffix.lower() in ARCHIVE_EXTS
+        if _is_installer(f) or _is_archive(f)
     ]
     groups: dict[str, list[str]] = {}
     for f in installer_like:
@@ -927,8 +1018,8 @@ def _pick_representative(group: list[str], settings: Optional[dict] = None) -> t
     e.g. "Setup/setup.exe") -- the depth tiebreak is a no-op for the
     bare-filename case since every entry there sits at depth 0 anyway."""
     settings = settings or {}
-    installers = [f for f in group if Path(f).suffix.lower() in INSTALLER_EXTS]
-    archives = [f for f in group if Path(f).suffix.lower() in ARCHIVE_EXTS]
+    installers = [f for f in group if _is_installer(f)]
+    archives = [f for f in group if _is_archive(f)]
 
     def _score(path: str) -> tuple:
         n = Path(path).name.lower()
@@ -949,7 +1040,7 @@ def _pick_representative(group: list[str], settings: Optional[dict] = None) -> t
     if not pool:
         return None, None
     best = max(pool, key=_score)
-    return best, Path(best).suffix.lower().lstrip(".")
+    return best, _file_ext(best).lstrip(".")
 
 
 def _pick_primary_file(file_names: list[str], settings: Optional[dict] = None) -> tuple[Optional[str], Optional[str]]:
@@ -1144,16 +1235,21 @@ def walk_scan_root(
     folder_layout: Optional[dict] = None,
     locked_files: Optional[dict] = None,
     unconfigured_toplevel_role: str = "catalog",
+    only_under: Optional[str] = None,
 ) -> Iterator[ScanCandidate]:
+    """Walks the scan root -- or, with only_under, just that sub-folder (the folder itself and
+    everything below it). Layout (catalog / subcatalog / skip) is always resolved relative to
+    the real scan root, so a partial walk classifies folders exactly like a full one."""
     root = os.path.abspath(root)
     walk_root = _apply_long_path_prefix(root)
-    log.info("Scan starting at: %s", root)
+    start = _apply_long_path_prefix(os.path.abspath(only_under)) if only_under else walk_root
+    log.info("Scan starting at: %s%s", root, f"  (only under {only_under})" if only_under else "")
     if walk_root != root:
         log.info("Windows long-path prefix applied for filesystem calls (paths >260 chars supported).")
 
     folder_count = 0
 
-    for dirpath, dirnames, filenames in os.walk(walk_root, followlinks=follow_symlinks):
+    for dirpath, dirnames, filenames in os.walk(start, followlinks=follow_symlinks):
         display_dirpath = _strip_long_path_prefix(dirpath)
 
         # skip the scan root itself as a candidate (it's not an install unit)
@@ -1402,6 +1498,14 @@ def run_scan(
     )
 
     incremental = settings.get("incremental_scan_by_default", True)
+    apply_extension_settings(settings)
+    _ext_sig = extension_signature()
+    _sig_map = dict(settings.get("scan_ext_signature_by_root") or {})
+    if incremental and _sig_map.get(str(scan_root_id)) != _ext_sig:
+        # the installer/archive extension lists changed since this root was last scanned:
+        # unchanged folders must be looked at again (they may now contain recognised files)
+        incremental = False
+        log.info("Installer/archive extension settings changed -> full (non-incremental) scan of this root")
     existing_fingerprints = {}
     if incremental:
         rows = conn.execute(
@@ -1469,6 +1573,12 @@ def run_scan(
         _write_scan_errors(conn, scan_root_id, scan_errors)
 
     progress.errors_count = len(scan_errors)
+    if progress.status not in ("cancelled", "failed"):
+        try:
+            _sig_map[str(scan_root_id)] = _ext_sig
+            db.set_setting("scan_ext_signature_by_root", _sig_map, bump_version=False)
+        except Exception:
+            log.exception("could not remember the extension signature")
 
     log.info("=" * 70)
     log.info("SCAN FINISHED: status=%s folders_seen=%d install_units_found=%d "
@@ -1485,6 +1595,83 @@ def run_scan(
         on_progress(progress)
 
     return progress
+
+
+def run_partial_scan(
+    db: Database,
+    root_path: str,
+    folders: list,
+    on_progress: Optional[Callable[[str], None]] = None,
+    cancel_flag: Optional[Callable[[], bool]] = None,
+) -> dict:
+    """
+    Re-scans ONLY the given folders (each folder and everything below it) of one scan root,
+    ignoring the incremental fingerprint -- used to pick up changes inside one app's folder
+    without walking the whole library. The scan root's own status / timestamps are left alone.
+
+    Returns {"folders_scanned", "install_units", "candidate_ids" (set, every install-unit
+    row under the folders), "stale_candidate_ids" (rows under the folders the walk did not
+    see again), "missing_folders", "errors"}.
+    """
+    conn = db.connect()
+    settings = db.get_all_settings()
+    apply_extension_settings(settings)
+    row = conn.execute("SELECT id FROM scan_roots WHERE path = ?", (root_path,)).fetchone()
+    if row is None:
+        raise ValueError(f"{root_path} is not a registered scan root")
+    scan_root_id = row["id"]
+    scan_root_row = db.get_scan_root_by_id(scan_root_id)
+    folder_layout = db.get_folder_layout(scan_root_id)
+    locked_files = {
+        r["folder_path"]: r["file_name"]
+        for r in conn.execute(
+            """
+            SELECT rc.folder_path, v.file_name
+            FROM variants v JOIN raw_candidates rc ON rc.id = v.raw_candidate_id
+            WHERE rc.scan_root_id = ? AND v.file_locked = 1 AND v.file_name IS NOT NULL
+            """, (scan_root_id,)).fetchall()
+    }
+    unconfigured = (scan_root_row["unconfigured_toplevel_role"] or "catalog") if scan_root_row else "catalog"
+
+    started = conn.execute("SELECT datetime('now')").fetchone()[0]
+    out = {"folders_scanned": 0, "install_units": 0, "candidate_ids": set(),
+           "stale_candidate_ids": set(), "missing_folders": [], "errors": []}
+    errors: list = []
+    for folder in folders:
+        if cancel_flag and cancel_flag():
+            break
+        if not os.path.isdir(folder):
+            out["missing_folders"].append(folder)
+            continue
+        if on_progress:
+            on_progress(f"Scanning {folder}")
+        for cand in walk_scan_root(
+            root_path, settings,
+            follow_symlinks=settings.get("scan_follow_symlinks", False),
+            error_sink=errors, folder_layout=folder_layout, locked_files=locked_files,
+            unconfigured_toplevel_role=unconfigured, only_under=folder,
+        ):
+            if cancel_flag and cancel_flag():
+                break
+            _upsert_candidate(conn, scan_root_id, cand)
+            out["folders_scanned"] += 1
+            if cand.unit_type == "install_unit":
+                out["install_units"] += 1
+    conn.commit()
+
+    def _under(path: str, base: str) -> bool:
+        p, b = os.path.normcase(os.path.normpath(path)), os.path.normcase(os.path.normpath(base))
+        return p == b or p.startswith(b + os.sep)
+
+    for r in conn.execute(
+        "SELECT id, folder_path, last_seen_at FROM raw_candidates "
+        "WHERE scan_root_id = ? AND unit_type = 'install_unit'", (scan_root_id,)):
+        if any(_under(r["folder_path"], f) for f in folders):
+            out["candidate_ids"].add(r["id"])
+            if (r["last_seen_at"] or "") < started:
+                out["stale_candidate_ids"].add(r["id"])
+    out["errors"] = errors
+    return out
 
 
 def _write_scan_errors(conn, scan_root_id: int, scan_errors: list):

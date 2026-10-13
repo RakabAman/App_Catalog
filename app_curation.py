@@ -91,6 +91,12 @@ def ensure_curation_schema(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError as e:
         if "duplicate column" not in str(e).lower():
             raise
+    # A hand-written description is kept: scraping never overwrites it while set.
+    try:
+        conn.execute("ALTER TABLE apps ADD COLUMN description_locked INTEGER DEFAULT 0")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
 
     # Remember an app's previous key whenever it changes -- covers the
     # scraper's auto-rename, manual rename, re-resolve acceptance, anything.
@@ -570,6 +576,94 @@ def split_variant_with_details(db, variant_id: int, *, name: str, installer_path
     remove_empty_unprotected_apps(conn)             # the old app, if this was its only variant
     conn.commit()
     return {"app_id": app_id, "variant_id": variant_id, "created_app": created}
+
+
+def _new_verified_app(conn, name: str, catalog: Optional[str], subcatalog: Optional[str]) -> int:
+    """A new manually-created app: verified, name / catalog / subcatalog locked."""
+    from resolver import normalize_key, _ensure_tag
+    cur = conn.execute(
+        """INSERT INTO apps (name, name_locked, catalog, catalog_locked, subcatalog, subcatalog_locked,
+                              normalized_key, confidence, status, updated_at)
+           VALUES (?, 1, ?, ?, ?, ?, ?, 1.0, 'verified', datetime('now'))""",
+        (name, catalog or None, 1 if catalog else 0, subcatalog or None, 1 if subcatalog else 0,
+         normalize_key(name)))
+    app_id = cur.lastrowid
+    for tag in (catalog, subcatalog):
+        if tag:
+            conn.execute("INSERT OR IGNORE INTO app_tags (app_id, tag_id) VALUES (?, ?)",
+                         (app_id, _ensure_tag(conn, tag)))
+    return app_id
+
+
+def split_variants_multi(db, variant_ids: list, *, name: Optional[str] = None,
+                         catalog: Optional[str] = None, subcatalog: Optional[str] = None,
+                         per_variant: bool = False, target_app_id: Optional[int] = None) -> dict:
+    """Split SEVERAL variants out of their app(s) in one go.
+
+      per_variant=False  all of them into ONE new app called `name` (or into
+                         `target_app_id` if given)
+      per_variant=True   each into its OWN new app, named from its own file
+
+    The variants keep their own version / edition / file; they are pinned to the new
+    app so rescans and Resolve all leave them there. Apps left empty (and carrying no
+    manual or scraped work) are removed. Returns {'app_ids': [...], 'created': n, 'moved': n}."""
+    ids = [int(v) for v in dict.fromkeys(variant_ids)]
+    if not ids:
+        raise ValueError("No variants selected.")
+    conn = db.connect()
+    rows = {r["id"]: r for r in conn.execute(
+        "SELECT * FROM variants WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)}
+    if not rows:
+        raise ValueError("Variants not found.")
+    ids = [i for i in ids if i in rows]
+    app_ids: list = []
+    created = 0
+    if per_variant:
+        from resolver import normalize_key
+        used = {r[0] for r in conn.execute("SELECT normalized_key FROM apps")}
+        for vid in ids:
+            v = rows[vid]
+            full = os.path.join(v["source_path"], v["file_name"]) if v["file_name"] else v["source_path"]
+            nm = (suggest_app_fields(db, full, v["source_path"]).get("name") or "").strip() \
+                or os.path.basename((v["source_path"] or "").rstrip("\\/")) or "New app"
+            if normalize_key(nm) in used:
+                # several variants of one name: tell the new apps apart by version / file name
+                stem = os.path.splitext(os.path.basename((v["file_name"] or "").replace("\\", "/")))[0]
+                cand = f"{nm} {v['version']}" if v["version"] else (f"{nm} ({stem})" if stem else nm)
+                n = 2
+                while normalize_key(cand) in used:
+                    cand = f"{nm} {n}"
+                    n += 1
+                nm = cand
+            used.add(normalize_key(nm))
+            new_id = _new_verified_app(conn, nm, catalog, subcatalog)
+            created += 1
+            app_ids.append(new_id)
+            conn.execute("UPDATE variants SET app_id = ?, app_pinned = 1, updated_at = datetime('now') WHERE id = ?",
+                         (new_id, vid))
+            conn.execute("INSERT INTO audit_log (entity_type, entity_id, action, detail_json) VALUES (?,?,?,?)",
+                         ("variant", vid, "split", json.dumps({"new_app_id": new_id, "from_app_id": v["app_id"]})))
+    else:
+        if target_app_id is None:
+            nm = (name or "").strip()
+            if not nm:
+                raise ValueError("Please enter an app name.")
+            target_app_id = _new_verified_app(conn, nm, catalog, subcatalog)
+            created = 1
+        elif any(rows[i]["app_id"] == target_app_id for i in ids) and len(ids) == 1:
+            raise ValueError("The variant is already in that app.")
+        app_ids.append(target_app_id)
+        for vid in ids:
+            v = rows[vid]
+            if v["app_id"] == target_app_id:
+                continue
+            conn.execute("UPDATE variants SET app_id = ?, app_pinned = 1, updated_at = datetime('now') WHERE id = ?",
+                         (target_app_id, vid))
+            conn.execute("INSERT INTO audit_log (entity_type, entity_id, action, detail_json) VALUES (?,?,?,?)",
+                         ("variant", vid, "split", json.dumps({"new_app_id": target_app_id, "from_app_id": v["app_id"]})))
+    remove_empty_unprotected_apps(conn)
+    conn.commit()
+    return {"app_ids": app_ids, "created": created, "moved": len(ids)}
 
 
 # ---------------------------------------------------------------------------

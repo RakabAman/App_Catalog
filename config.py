@@ -270,6 +270,35 @@ DEFAULT_SETTINGS = {
     # apply to an app name if it happens to exactly match a key).
     "folder_name_aliases": {},
 
+    # Letter case of catalog / subcatalog names derived from FOLDER names at
+    # resolve time (separately for each level):
+    #   "as_is"  use the folder name exactly as written (IPTV stays IPTV)
+    #   "title"  smart Title Case (old behaviour: "IPTV" -> "Iptv"; names that
+    #            already have mixed case are left alone)
+    #   "upper"  UPPERCASE
+    # An explicit entry in folder_name_aliases always wins over this.
+    # File types the scanner treats as installers / archives (one install unit per
+    # file). Edited in Settings > Scanning & Noise. Suffix match on the file name,
+    # so multi-part endings such as ".tar.gz" work too.
+    "installer_extensions": [".exe", ".msi", ".msix", ".msixbundle"],
+    "archive_extensions": [".zip", ".rar", ".7z", ".iso", ".tgz", ".tar.gz"],
+    "catalog_case_mode": "as_is",
+    # How the left filter list (catalog / subcatalog tree) is DISPLAYED --
+    # visual only, the stored text and the folders are never changed:
+    # "as_is" (exactly as stored) | "title" (smart Title Case).
+    "filter_tree_case": "as_is",
+    "subcatalog_case_mode": "as_is",
+
+    # Letter case of the catalog / subcatalog FOLDERS created by Reorganize
+    # (and Monitor): "as_is" (use the name as it is in the app) or "upper".
+    # Never auto Title Case.
+    # Folder name Reorganize / Monitor use for a variant whose version is unknown. The resolver
+    # treats a folder with this name (and the default "unknown-version") as EMPTY, so the app
+    # name is taken from the folder above it instead of becoming an app called "unknown".
+    "reorganize_unknown_version_name": "unknown-version",
+    "reorganize_catalog_case": "as_is",
+    "reorganize_subcatalog_case": "as_is",
+
     # App-name synonyms: regex -> canonical replacement, checked AFTER all
     # other name cleaning (bracket/noise/version/edition stripping) but
     # BEFORE clustering. Idea borrowed from a parallel build of this app

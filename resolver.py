@@ -132,6 +132,14 @@ def extract_fields(
     parent_folder_name = _norm(parent_folder_name)
     pe_product_name = _norm(pe_product_name)
 
+    # A folder that only says "unknown version" (what Reorganize creates when a variant has no
+    # version) carries no name at all: treat it as zero characters so the folder above it -- the
+    # app's own folder -- is what gets identified.
+    _placeholders = {_norm("unknown-version").lower(),
+                     _norm((settings.get("reorganize_unknown_version_name") or "").strip()).lower()} - {""}
+    if folder_name and folder_name.strip().lower() in _placeholders:
+        folder_name = ""
+
     pe_version = pe_product_version or pe_file_version
 
     candidates: list[tuple[str, str]] = []
@@ -691,6 +699,21 @@ def _smart_case(name: str) -> str:
     return name
 
 
+CASE_MODES = ("as_is", "title", "upper")
+
+
+def apply_case_mode(name: Optional[str], mode: Optional[str]) -> Optional[str]:
+    """Letter-case conversion for catalog/subcatalog labels.
+    as_is -> unchanged, title -> smart Title Case, upper -> UPPERCASE."""
+    if not name:
+        return name
+    if mode == "upper":
+        return name.upper()
+    if mode == "title":
+        return _smart_case(name)
+    return name
+
+
 def normalize_key(name: str) -> str:
     """Key used for fuzzy clustering -- aggressively normalized."""
     key = name.lower()
@@ -951,10 +974,15 @@ class ResolveProgress:
         self.status = "running"
 
 
-def run_resolve(db: Database, scan_root_id: Optional[int] = None) -> ResolveProgress:
+def run_resolve(db: Database, scan_root_id: Optional[int] = None,
+                candidate_ids: Optional[set] = None) -> ResolveProgress:
     """
     Full (re-)resolve pass over all install_unit raw_candidates.
     Safe to call repeatedly -- matches existing apps by normalized_key.
+
+    candidate_ids: resolve ONLY these raw_candidates rows (a targeted re-resolve after a
+    partial rescan). Protected apps (locked / verified / manually moved) are still never
+    re-clustered, so manual fixes survive.
     """
     conn = db.connect()
     settings = db.get_all_settings()
@@ -966,6 +994,8 @@ def run_resolve(db: Database, scan_root_id: Optional[int] = None) -> ResolveProg
         query += " AND scan_root_id = ?"
         params = (scan_root_id,)
     rows = conn.execute(query, params).fetchall()
+    if candidate_ids is not None:
+        rows = [r for r in rows if r["id"] in candidate_ids]
     log.info("RESOLVE STARTING: %d install-unit candidates to process", len(rows))
 
     members: list[ClusterMember] = []
@@ -1046,7 +1076,7 @@ def run_resolve(db: Database, scan_root_id: Optional[int] = None) -> ResolveProg
             clean_name=fields.clean_name,
             normalized_key=normalize_key(fields.clean_name),
             catalog=_apply_alias(row["catalog"], settings),
-            subcatalog=_apply_alias(row["subcatalog"], settings),
+            subcatalog=_apply_alias(row["subcatalog"], settings, "subcatalog"),
             version=fields.version,
             extraction_confidence=fields.extraction_confidence,
             alt_name_candidate=fields.alt_name_candidate,
@@ -1124,6 +1154,11 @@ def run_resolve(db: Database, scan_root_id: Optional[int] = None) -> ResolveProg
     progress.empty_apps_removed = _cur.remove_empty_unprotected_apps(conn)
 
     conn.commit()
+    # Never leave "Ide" and "IDE" side by side after a (re)scan.
+    try:
+        merge_case_duplicate_categories(db)
+    except Exception:
+        log.exception("case-duplicate category merge failed (non-fatal)")
     progress.status = "completed"
     log.info("RESOLVE FINISHED: %d apps created, %d updated, %d skipped (locked), %d variants written",
               progress.apps_created, progress.apps_updated, progress.apps_skipped_locked,
@@ -1172,27 +1207,28 @@ def _sync_app_tags(conn, app_id: int, cluster):
 
 
 def _ensure_tag(conn, name: str) -> int:
-    row = conn.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
+    row = conn.execute("SELECT id FROM tags WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
     if row:
         return row["id"]
     cur = conn.execute("INSERT INTO tags (name) VALUES (?)", (name,))
     return cur.lastrowid
 
 
-def _apply_alias(name: Optional[str], settings: dict) -> Optional[str]:
+def _apply_alias(name: Optional[str], settings: dict, kind: str = "catalog") -> Optional[str]:
     """Folder/catalog/subcatalog name -> preferred display conversion,
-    e.g. {"burners": "CD/DVD Burner"}. Case-insensitive key match. Falls
-    back to the same smart-case title-casing used for app names when no
-    explicit alias is defined, so catalog/subcatalog/tags read as "Cd Dvd
-    Recorder" instead of shouty "CD DVD RECORDER" -- explicit aliases still
-    take priority for cases that need exact wording (e.g. "CD/DVD Burner")."""
+    e.g. {"burners": "CD/DVD Burner"}. Case-insensitive key match. When no
+    explicit alias is defined the label is converted according to the
+    "catalog_case_mode" / "subcatalog_case_mode" setting (kind selects which):
+    as_is (default) keeps the folder name exactly, title = smart Title Case,
+    upper = UPPERCASE. Explicit aliases always win."""
     if not name:
         return name
     aliases = settings.get("folder_name_aliases", {})
     alias = aliases.get(name.strip().lower())
     if alias:
         return alias
-    return _smart_case(name)
+    mode = settings.get("subcatalog_case_mode" if kind == "subcatalog" else "catalog_case_mode", "as_is")
+    return apply_case_mode(name.strip(), mode)
 
 
 def _upsert_app(
@@ -1388,7 +1424,7 @@ def propose_reresolve_app(db: Database, app_id: int,
         if v["catalog"]:
             catalogs.append(_apply_alias(v["catalog"], settings))
         if v["subcatalog"]:
-            subcatalogs.append(_apply_alias(v["subcatalog"], settings))
+            subcatalogs.append(_apply_alias(v["subcatalog"], settings, "subcatalog"))
         if best_fields is None or fields.extraction_confidence > best_fields.extraction_confidence:
             best_fields = fields
 
@@ -1499,6 +1535,161 @@ def edit_app_field(db: Database, app_id: int, field: str, value: str):
         ("app", app_id, "edit", json.dumps({field: value})),
     )
     conn.commit()
+    if field in ("catalog", "subcatalog") and value:
+        _unify_case_variants(db, app_id, field, value)
+
+
+def remember_case_alias(db: Database, value: str) -> None:
+    """Pins the spelling of a category so a rescan reproduces it. Stored as a
+    folder_name_aliases entry (lowercase key -> value) -- but only when the key
+    is free or already a case-variant of `value`, so a user's own alias
+    (e.g. burners=CD/DVD Burner) is never overwritten."""
+    value = (value or "").strip()
+    if not value:
+        return
+    aliases = dict(db.get_setting("folder_name_aliases", {}) or {})
+    key = value.lower()
+    current = aliases.get(key)
+    if current == value or (current is not None and current.lower() != key):
+        return
+    aliases[key] = value
+    db.set_setting("folder_name_aliases", aliases, bump_version=False)
+
+
+def _unify_case_variants(db: Database, app_id: int, field: str, value: str) -> None:
+    """After a manual catalog/subcatalog edit: every OTHER spelling that differs
+    only by letter case ("Ide" vs "IDE") is switched to the new spelling (a
+    subcategory only within the same catalog), and the spelling is remembered
+    so a rescan doesn't resurrect the old one."""
+    conn = db.connect()
+    if field == "catalog":
+        rows = conn.execute("SELECT DISTINCT catalog AS v FROM apps WHERE catalog IS NOT NULL").fetchall()
+        variants = [r["v"] for r in rows if r["v"] != value and r["v"].lower() == value.lower()]
+        for old in variants:
+            conn.execute("UPDATE apps SET catalog = ?, updated_at = datetime('now') WHERE catalog = ?",
+                         (value, old))
+    else:
+        app = conn.execute("SELECT catalog FROM apps WHERE id = ?", (app_id,)).fetchone()
+        cat = app["catalog"] if app else None
+        rows = conn.execute("SELECT DISTINCT subcatalog AS v FROM apps WHERE catalog IS ? "
+                            "AND subcatalog IS NOT NULL", (cat,)).fetchall()
+        variants = [r["v"] for r in rows if r["v"] != value and r["v"].lower() == value.lower()]
+        for old in variants:
+            conn.execute("UPDATE apps SET subcatalog = ?, updated_at = datetime('now') "
+                         "WHERE catalog IS ? AND subcatalog = ?", (value, cat, old))
+    conn.commit()
+    if variants or value.lower() != value:
+        remember_case_alias(db, value)
+
+
+def _pick_canonical_spelling(low: str, group: list, aliases: dict) -> str:
+    """group: [{'name','n','locked'}]. Case-only alias wins, then the spelling
+    used by the most manually-locked apps (a deliberate user choice), then the
+    most-used spelling, then alphabetical (deterministic)."""
+    a = aliases.get(low)
+    if a and a.lower() == low:
+        return a
+    return max(group, key=lambda r: (r["locked"] or 0, r["n"], r["name"] != r["name"].lower(), r["name"]))["name"]
+
+
+def merge_case_duplicate_categories(db: Database, apply: bool = True) -> list:
+    """Finds catalogs / subcatalogs that exist under several spellings that
+    differ only by letter case ("Ide"/"IDE", "System"/"SYSTEM") and unifies
+    them. Returns [{'kind','catalog','from','to','apps'}]; apply=False is a
+    dry run."""
+    conn = db.connect()
+    aliases = {k.lower(): v for k, v in
+               (db.get_setting("folder_name_aliases", {}) or {}).items() if isinstance(v, str)}
+    changes = []
+
+    def _groups(rows, keyfn):
+        g = {}
+        for r in rows:
+            g.setdefault(keyfn(r), []).append(r)
+        return {k: v for k, v in g.items() if len(v) > 1}
+
+    rows = [dict(name=r["c"], n=r["n"], locked=r["l"]) for r in conn.execute(
+        "SELECT catalog AS c, COUNT(*) AS n, SUM(COALESCE(catalog_locked,0)) AS l FROM apps "
+        "WHERE catalog IS NOT NULL AND catalog != '' GROUP BY catalog")]
+    for low, grp in _groups(rows, lambda r: r["name"].lower()).items():
+        canon = _pick_canonical_spelling(low, grp, aliases)
+        for r in grp:
+            if r["name"] != canon:
+                changes.append({"kind": "catalog", "catalog": None, "from": r["name"],
+                                "to": canon, "apps": r["n"]})
+                if apply:
+                    conn.execute("UPDATE apps SET catalog = ?, updated_at = datetime('now') WHERE catalog = ?",
+                                 (canon, r["name"]))
+    if apply:
+        conn.commit()
+
+    rows = [dict(cat=r["c"], name=r["s"], n=r["n"], locked=r["l"]) for r in conn.execute(
+        "SELECT catalog AS c, subcatalog AS s, COUNT(*) AS n, SUM(COALESCE(subcatalog_locked,0)) AS l "
+        "FROM apps WHERE subcatalog IS NOT NULL AND subcatalog != '' GROUP BY catalog, subcatalog")]
+    for (_c, low), grp in _groups(rows, lambda r: ((r["cat"] or "").lower(), r["name"].lower())).items():
+        canon = _pick_canonical_spelling(low, grp, aliases)
+        for r in grp:
+            if r["name"] != canon:
+                changes.append({"kind": "subcatalog", "catalog": r["cat"], "from": r["name"],
+                                "to": canon, "apps": r["n"]})
+                if apply:
+                    conn.execute("UPDATE apps SET subcatalog = ?, updated_at = datetime('now') "
+                                 "WHERE catalog IS ? AND subcatalog = ?", (canon, r["cat"], r["name"]))
+    if apply and changes:
+        conn.execute("INSERT INTO audit_log (entity_type, entity_id, action, detail_json) VALUES (?,?,?,?)",
+                     ("category", 0, "merge_case_duplicates", json.dumps(changes)))
+        conn.commit()
+        log.info("Merged %d case-duplicate category spelling(s)", len(changes))
+    return changes
+
+
+def folder_derived_category_pairs(db: Database) -> set:
+    """Lower-cased (catalog, subcatalog) pairs that the scanned folders
+    actually produce today (after aliases / case mode). Subcatalog '' = none."""
+    conn = db.connect()
+    settings = db.get_all_settings()
+    out = set()
+    for r in conn.execute("SELECT DISTINCT catalog, subcatalog FROM raw_candidates "
+                          "WHERE unit_type = 'install_unit'"):
+        c = _apply_alias(r["catalog"], settings) or ""
+        s = _apply_alias(r["subcatalog"], settings, "subcatalog") or ""
+        out.add((c.lower(), s.lower()))
+    return out
+
+
+def resync_categories_from_folders(db: Database, pairs: list) -> dict:
+    """For apps currently in the given (catalog, subcatalog|None) categories:
+    sets catalog/subcatalog back to what their own folders say and UNLOCKS both
+    fields. Apps without any scanned variant are left alone. Returns counts."""
+    conn = db.connect()
+    settings = db.get_all_settings()
+    updated = skipped = 0
+    seen = set()
+    for cat, sub in pairs:
+        if sub is None:
+            apps = conn.execute("SELECT id FROM apps WHERE catalog IS ?", (cat,)).fetchall()
+        else:
+            apps = conn.execute("SELECT id FROM apps WHERE catalog IS ? AND COALESCE(subcatalog,'') = ?",
+                                (cat, sub)).fetchall()
+        for a in apps:
+            if a["id"] in seen:
+                continue
+            seen.add(a["id"])
+            vs = conn.execute("SELECT r.catalog, r.subcatalog FROM variants v JOIN raw_candidates r "
+                              "ON r.id = v.raw_candidate_id WHERE v.app_id = ?", (a["id"],)).fetchall()
+            cats = [_apply_alias(v["catalog"], settings) for v in vs if v["catalog"]]
+            subs = [_apply_alias(v["subcatalog"], settings, "subcatalog") for v in vs if v["subcatalog"]]
+            if not cats:
+                skipped += 1
+                continue
+            conn.execute("UPDATE apps SET catalog = ?, subcatalog = ?, catalog_locked = 0, "
+                         "subcatalog_locked = 0, updated_at = datetime('now') WHERE id = ?",
+                         (_majority_local(cats), _majority_local(subs) if subs else None, a["id"]))
+            updated += 1
+    conn.commit()
+    if updated:
+        merge_case_duplicate_categories(db)
+    return {"updated": updated, "skipped_no_folder_info": skipped}
 
 
 def unlock_app_field(db: Database, app_id: int, field: str):

@@ -597,6 +597,11 @@ def _flush_manifests(db) -> None:
 
 def _apply_updates(conn, app_id: int, updates: dict, tags: list[str]):
     updates = dict(updates)
+    if "description" in updates:
+        # the user wrote this description by hand: scraping must not replace it
+        row = conn.execute("SELECT description_locked FROM apps WHERE id = ?", (app_id,)).fetchone()
+        if row is not None and row["description_locked"]:
+            updates.pop("description")
     now_placeholder = updates.pop("last_scraped", None)
     set_parts = [f"{k} = ?" for k in updates]
     values = list(updates.values())

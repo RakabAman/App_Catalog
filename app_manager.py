@@ -42,14 +42,17 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from rapidfuzz import fuzz
 
 import app_manifest                      # variant manifests (appcatalog.json)
+import app_sidecars                      # per-variant sidecar choices
 from app_paths import get_logs_dir
 from database import Database
-from resolver import normalize_key
+from resolver import normalize_key, apply_case_mode, remember_case_alias
+import resolver as _resolver
+import scanner as _scanner
 
 log = logging.getLogger("appcatalog.organizer")
 log_job = logging.getLogger("appcatalog.organizer.job")
@@ -748,6 +751,8 @@ def rename_catalog(db: Database, old_name: str, new_name: str) -> int:
         ("catalog", 0, "rename", json.dumps({"old": old_name, "new": new_name, "affected": cur.rowcount})),
     )
     conn.commit()
+    if old_name.lower() == new_name.lower():
+        remember_case_alias(db, new_name)   # case-only rename: a rescan must not undo it
     log.info("Renamed catalog %r -> %r (%d app(s) affected)", old_name, new_name, cur.rowcount)
     return cur.rowcount
 
@@ -780,6 +785,8 @@ def rename_subcatalog(db: Database, new_name: str, old_name: str, catalog: Optio
          json.dumps({"old": old_name, "new": new_name, "catalog": catalog, "affected": cur.rowcount})),
     )
     conn.commit()
+    if old_name.lower() == new_name.lower():
+        remember_case_alias(db, new_name)
     log.info("Renamed subcatalog %r -> %r%s (%d app(s) affected)",
               old_name, new_name, f" in catalog {catalog!r}" if catalog else " (all catalogs)", cur.rowcount)
     return cur.rowcount
@@ -1443,6 +1450,11 @@ def report_to_csv_rows(report: CatalogReport) -> list[list[str]]:
 
 VALID_ARCHIVE_FORMATS = ("7z", "zip", "rar", "none")
 VALID_COPY_MODES = ("move", "copy")
+# What gets compressed when an archive format is chosen:
+#   "installer"  only the bare installer (.exe/.msi ...), one file -> one archive (default)
+#   "variant"    the WHOLE variant -- installer + its sidecars (readme, crack, plugins,
+#                dependent folders ...) -- into ONE archive named after the installer
+VALID_ARCHIVE_SCOPES = ("installer", "variant")
 
 # ----------------------------------------------------------------------
 # Archive password protection ("password in the filename")
@@ -1580,6 +1592,7 @@ class PlannedMove:
     shared_folder: bool = False  # True if the folder is used by several variants OR contains other
                                   # install units (see container_folder) -- per-file handling, never
                                   # a whole-folder move
+    in_place: bool = False       # the variant already sits exactly at dest_path -- nothing to do
     shared_extra_paths: list = field(default_factory=list)  # shared_folder plans only: files AND
                                   # folders (patch, crack, keygen, skins, tutorial, ...) not claimed
                                   # by any variant, copied along as sidecars. Never a folder that
@@ -1843,8 +1856,17 @@ def preview_reorganize(
     portable_to_dedicated_category: bool = True,
     portable_category_name: str = "Portable",
     max_sidecar_gb: Optional[float] = None,
+    catalog_case: Optional[str] = None,
+    subcatalog_case: Optional[str] = None,
+    app_ids: Optional[Iterable[int]] = None,
+    unknown_version_name: Optional[str] = None,
 ) -> list[PlannedMove]:
     """
+    app_ids: restrict the plan to the variants of these apps (a category, a selection, the
+    current list ...). Everything else is still taken into account when deciding what is
+    shared / what is another app's folder, so a partial plan is exactly as safe as a full one.
+    Variants that already sit at their destination get PlannedMove.in_place = True.
+
     DRY RUN ONLY -- computes where every variant's install unit WOULD go under
     dest_root/Catalog/Subcatalog/AppName/Version/ (or
     dest_root/Portable/OriginalCatalog/AppName/Version/ for portable-tagged
@@ -1886,6 +1908,9 @@ def preview_reorganize(
         ORDER BY a.catalog, a.subcatalog, a.name, v.version
         """
     ).fetchall()
+    if app_ids is not None:
+        _scope = set(app_ids)
+        rows = [r for r in rows if r["app_id"] in _scope]
     # EVERY variant, ignored or not: they are all "somebody's" install unit/file.
     everyone = conn.execute("SELECT source_path, file_name FROM variants").fetchall()
 
@@ -1896,6 +1921,16 @@ def preview_reorganize(
         except (TypeError, ValueError):
             max_sidecar_gb = DEFAULT_MAX_SIDECAR_GB
     cap_bytes = int(max_sidecar_gb * 1024 ** 3) if max_sidecar_gb and max_sidecar_gb > 0 else 0
+
+    # Letter case of the category / subcategory FOLDERS: "as_is" (name exactly as
+    # in the app) or "upper". Separate for each level; never auto Title Case.
+    _stg = db.get_all_settings()
+    if catalog_case is None:
+        catalog_case = _stg.get("reorganize_catalog_case", "as_is")
+    if subcatalog_case is None:
+        subcatalog_case = _stg.get("reorganize_subcatalog_case", "as_is")
+    unknown_version_name = ((unknown_version_name if unknown_version_name is not None
+                             else _stg.get("reorganize_unknown_version_name")) or "").strip() or "unknown-version"
 
     folder_counts: dict = {}
     for r in rows:
@@ -1936,6 +1971,8 @@ def preview_reorganize(
             _size_cache[path] = _path_size(path)
         return _size_cache[path]
 
+    sidecar_overrides = app_sidecars.all_overrides(conn)     # {variant_id: {rel_lower: (rel, state)}}
+
     plans = []
     for r in rows:
         sp = r["source_path"]
@@ -1944,10 +1981,12 @@ def preview_reorganize(
         subcatalog_raw = r["subcatalog"] or "Misc"
         if is_portable and catalog_raw != portable_category_name:
             catalog_raw, subcatalog_raw = portable_category_name, catalog_raw
+        catalog_raw = apply_case_mode(catalog_raw, catalog_case)
+        subcatalog_raw = apply_case_mode(subcatalog_raw, subcatalog_case)
 
         dest = os.path.join(
             dest_root, _safe_path_component(catalog_raw), _safe_path_component(subcatalog_raw),
-            _safe_path_component(r["app_name"]), _safe_path_component(r["version"] or "unknown-version"),
+            _safe_path_component(r["app_name"]), _safe_path_component(r["version"] or unknown_version_name),
         )
 
         container = _is_container(sp)
@@ -1976,13 +2015,26 @@ def preview_reorganize(
                 extras_bytes += size
             if r["file_name"]:
                 own_bytes = _size(os.path.join(sp, r["file_name"]))
+            # the user's own sidecar choices (Sidecars dialog): excluded items are not
+            # copied along, added ones are -- even past the size cap
+            ov = sidecar_overrides.get(r["variant_id"])
+            if ov:
+                removed = {low for low, (_rel, st) in ov.items() if st == "removed"}
+                extras = [e for e in extras
+                          if os.path.relpath(e, sp).replace("\\", "/").lower() not in removed]
+                for _low, (rel, st) in ov.items():
+                    full = os.path.join(sp, rel.replace("/", os.sep))
+                    if st == "added" and os.path.exists(full) and full not in extras:
+                        extras.append(full)
+                extras_bytes = sum(_size(e) for e in extras)
         else:
             own_bytes = _size(sp)
 
         plans.append(PlannedMove(
             app_id=r["app_id"], variant_id=r["variant_id"],
             source_path=sp, primary_file_name=r["file_name"],
-            dest_path=dest, collision=os.path.exists(dest),
+            dest_path=dest, collision=os.path.exists(dest) and _norm(sp) != _norm(dest),
+            in_place=_norm(sp).rstrip(os.sep) == _norm(dest).rstrip(os.sep),
             is_portable=is_portable, shared_folder=shared,
             shared_extra_paths=extras,
             app_name=r["app_name"] or "", version=r["version"] or "",
@@ -2218,6 +2270,195 @@ def _archive_single_file(file_path: str, archive_format: str,
     return target
 
 
+def _bundle_members(dest_dir: str, entry_rel: Optional[str], sidecar_rels: list) -> list:
+    """Top-level members (relative, '/'-separated) of a variant bundle: the installer
+    (or the top-level folder that holds it) plus its sidecars, without duplicates or
+    items already inside an included folder. Only paths that exist in dest_dir."""
+    wanted = []
+    entry_rel = (entry_rel or "").replace("\\", "/")
+    if entry_rel:
+        wanted.append(entry_rel.split("/", 1)[0])
+    wanted += [(r or "").replace("\\", "/") for r in sidecar_rels]
+    members: list = []
+    for rel in sorted({w for w in wanted if w}, key=lambda s: (s.count("/"), s.lower())):
+        low = rel.lower()
+        if any(low == m.lower() or low.startswith(m.lower() + "/") for m in members):
+            continue
+        if os.path.lexists(os.path.join(dest_dir, rel.replace("/", os.sep))):
+            members.append(rel)
+    return members
+
+
+def _bundle_expected_files(dest_dir: str, members: list) -> list:
+    out = []
+    for m in members:
+        p = os.path.join(dest_dir, m.replace("/", os.sep))
+        if os.path.isdir(p) and not os.path.islink(p):
+            for root, _dirs, files in os.walk(p):
+                for f in files:
+                    out.append(os.path.relpath(os.path.join(root, f), dest_dir).replace(os.sep, "/"))
+        else:
+            out.append(m)
+    return out
+
+
+def _write_bundle(dest_dir: str, members: list, target: str, fmt: str,
+                  password: Optional[str]) -> None:
+    """Write `members` (relative to dest_dir) into the archive `target`. Raises on failure."""
+    def _walk_into(add_file, add_dir):
+        for m in members:
+            p = os.path.join(dest_dir, m.replace("/", os.sep))
+            if os.path.isdir(p) and not os.path.islink(p):
+                for root, dirs, files in os.walk(p):
+                    rel_root = os.path.relpath(root, dest_dir).replace(os.sep, "/")
+                    if not dirs and not files:
+                        add_dir(root, rel_root)
+                    for f in files:
+                        add_file(os.path.join(root, f), f"{rel_root}/{f}")
+            else:
+                add_file(p, m)
+
+    if fmt == "7z":
+        import py7zr                                   # ImportError handled by the caller
+        with py7zr.SevenZipFile(target, "w", password=password or None) as z:
+            _walk_into(lambda p, arc: z.write(p, arcname=arc), lambda p, arc: z.write(p, arcname=arc))
+    elif fmt == "zip":
+        if not password:
+            with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+                _walk_into(lambda p, arc: zf.write(p, arc), lambda p, arc: zf.write(p, arc + "/"))
+            return
+        try:
+            import pyzipper
+        except ImportError:
+            pyzipper = None
+        if pyzipper is not None:
+            with pyzipper.AESZipFile(target, "w", compression=pyzipper.ZIP_DEFLATED,
+                                     encryption=pyzipper.WZ_AES) as zf:
+                zf.setpassword(password.encode("utf-8"))
+                zf.setencryption(pyzipper.WZ_AES, nbits=256)
+                _walk_into(lambda p, arc: zf.write(p, arc), lambda p, arc: None)
+            return
+        exe = find_7z_executable()
+        if not exe:
+            raise RuntimeError("Password-protected zip needs 'pyzipper' or a 7z binary on PATH.")
+        subprocess.run([exe, "a", "-tzip", "-mem=AES256", f"-p{password}", target, *members],
+                       cwd=dest_dir, check=True, capture_output=True, timeout=7200)
+    elif fmt == "rar":
+        cmd = ["rar", "a", "-r"] + ([f"-p{password}"] if password else []) + [target, *members]
+        proc = subprocess.run(cmd, cwd=dest_dir, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+        if proc.returncode != 0:
+            raise RuntimeError(f"rar failed: {proc.stderr.strip()[:200]}")
+    else:
+        raise ValueError(f"unsupported archive format {fmt!r}")
+
+
+def _verify_bundle(target: str, fmt: str, password: Optional[str], expected: list, dest_dir: str) -> bool:
+    """The archive must exist, open, and contain every file we are about to delete."""
+    want = {e.lower() for e in expected}
+    try:
+        if fmt == "zip":
+            try:
+                import pyzipper
+                zf = pyzipper.AESZipFile(target) if password else zipfile.ZipFile(target)
+            except ImportError:
+                zf = zipfile.ZipFile(target)
+            with zf:
+                names = {n.lower() for n in zf.namelist() if not n.endswith("/")}
+                if not password and zf.testzip() is not None:
+                    return False
+        elif fmt == "7z":
+            import py7zr
+            with py7zr.SevenZipFile(target, "r", password=password or None) as z:
+                names = {n.replace("\\", "/").lower() for n in z.getnames()}
+                try:
+                    if z.testzip() is not None:
+                        return False
+                except Exception:
+                    pass
+        else:     # rar
+            proc = subprocess.run(["rar", "t", target], capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+            return proc.returncode == 0
+        return want <= names
+    except Exception as e:
+        log.error("Could not verify archive %s: %s", target, e)
+        return False
+
+
+def _archive_variant_bundle(dest_dir: str, entry_rel: Optional[str], sidecar_rels: list,
+                            archive_format: str, password: Optional[str] = None,
+                            prog: Optional[_Progress] = None) -> Optional[tuple]:
+    """Compress a WHOLE variant -- its installer plus its sidecars -- into one archive
+    inside dest_dir (named after the installer: Setup.exe + readme + Crack/ -> Setup.7z),
+    then remove the originals. Items that are not part of the variant (excluded
+    sidecars, metadata files) stay where they are.
+
+    Safety: the archive is verified (it must open and contain every file about to be
+    removed) BEFORE anything is deleted; on any failure or cancel the partial archive
+    is removed and the folder is left exactly as it was.
+    Returns (archive_path, [member names]) or None."""
+    if archive_format not in VALID_ARCHIVE_FORMATS or archive_format == "none":
+        return None
+    if password:
+        err = validate_archive_password(password)
+        if err:
+            log.error("Not archiving %s: %s", dest_dir, err)
+            return None
+    members = _bundle_members(dest_dir, entry_rel, sidecar_rels)
+    if not members:
+        return None
+    stem = os.path.splitext(os.path.basename((entry_rel or "").replace("\\", "/")))[0] \
+        or os.path.basename(dest_dir.rstrip("\\/")) or "variant"
+    target = os.path.join(dest_dir, f"{with_password_in_name(stem, password)}.{archive_format}")
+    if os.path.exists(target):
+        log.warning("Archive target %s already exists -- leaving %s uncompressed", target, dest_dir)
+        return None
+
+    expected = _bundle_expected_files(dest_dir, members)
+    total = sum(_path_size(os.path.join(dest_dir, m.replace("/", os.sep))) for m in members)
+    prog = prog or _Progress(None, 0, None)
+    label = f"{len(members)} item(s) -> {os.path.basename(target)}"
+    pw_note = ", password-protected" if password else ""
+    fmt = archive_format
+    ok = False
+    try:
+        if fmt == "7z":
+            try:
+                import py7zr                                    # noqa: F401
+            except ImportError:
+                log.warning("py7zr is not installed -- bundling as zip instead")
+                return _archive_variant_bundle(dest_dir, entry_rel, sidecar_rels, "zip", password, prog)
+        op = prog.op("archive", f"Compressing whole variant to {fmt}{pw_note}: {label}", 0, False,
+                     detail_extra=f"input {_fmt_bytes(total)}; watching output size")
+        with _SizePoller(target, op):
+            _write_bundle(dest_dir, members, target, fmt, password)
+        op.finish()
+        if not _verify_bundle(target, fmt, password, expected, dest_dir):
+            log.error("Archive %s failed verification -- originals kept", target)
+            return None
+        ok = True
+    except ReorganizeCancelled:
+        raise
+    except Exception as e:
+        log.error("Bundling %s into %s%s failed: %s", dest_dir, fmt, pw_note, e)
+        return None
+    finally:
+        if not ok:
+            _remove_partial(target)
+
+    for m in members:                         # verified -- now remove the originals
+        p = os.path.join(dest_dir, m.replace("/", os.sep))
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p)
+            elif os.path.lexists(p):
+                os.remove(p)
+        except OSError as e:
+            log.warning("Archived %s but could not remove the original %s: %s", target, p, e)
+    return target, members
+
+
 def _cleanup_empty_ancestors(start_dir: str, max_levels: int = 8) -> None:
     """
     After a version folder is emptied out and removed, its parent (an
@@ -2289,6 +2530,7 @@ def _execute_reorganize_impl(
     copy_mode: str = "move",
     archive_format: str = "none",
     archive_password: Optional[str] = None,
+    archive_scope: str = "installer",
     move_log_dir: Optional[str] = None,
     progress_callback: Optional[Callable[[ReorgEvent], None]] = None,
     cancel_event: Optional[threading.Event] = None,
@@ -2314,9 +2556,10 @@ def _execute_reorganize_impl(
                       only this variant's own file moves; its loose sidecar FILES
                       are copied. Sub-folders are never touched (see
                       preview_reorganize()).
-    Only a bare installer (.exe/.msi/... -- setting
-    "reorganize_bare_installer_extensions") is ever archived, and only that one
-    file, never the folder.
+    archive_scope="installer" (default): only a bare installer (.exe/.msi/... -- setting
+    "reorganize_bare_installer_extensions") is archived, that one file, never the folder.
+    archive_scope="variant": the installer AND its sidecars (see app_sidecars.py) are
+    compressed together into one verified archive; items the user excluded stay outside.
     Every plan is isolated: one failure is recorded, the batch continues.
     A JSON move log is flushed before and after every plan.
     """
@@ -2324,6 +2567,8 @@ def _execute_reorganize_impl(
         raise ValueError(f"copy_mode must be one of {VALID_COPY_MODES}, got {copy_mode!r}")
     if archive_format not in VALID_ARCHIVE_FORMATS:
         raise ValueError(f"archive_format must be one of {VALID_ARCHIVE_FORMATS}, got {archive_format!r}")
+    if archive_scope not in VALID_ARCHIVE_SCOPES:
+        raise ValueError(f"archive_scope must be one of {VALID_ARCHIVE_SCOPES}, got {archive_scope!r}")
 
     if archive_format == "none":
         archive_password = None       # a password only means something when archiving
@@ -2339,11 +2584,14 @@ def _execute_reorganize_impl(
     prog = _Progress(progress_callback, total, cancel_event)
 
     settings = db.get_all_settings()
+    sidecar_ctx = app_sidecars.SidecarContext(conn, settings) if (
+        archive_format != "none" and archive_scope == "variant") else None
     bare_exts = {
         e.lower() if e.startswith(".") else f".{e.lower()}"
         for e in (settings.get("reorganize_bare_installer_extensions") or DEFAULT_BARE_INSTALLER_EXTENSIONS)
     }
 
+    sidecar_rels_by_plan: dict = {}
     log_dir = Path(move_log_dir) if move_log_dir else get_logs_dir(db.path)
     run_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_path = log_dir / f"reorganize_log_{run_stamp}.json"
@@ -2375,7 +2623,7 @@ def _execute_reorganize_impl(
             "source": plan.source_path, "dest": plan.dest_path,
             "shared_folder": plan.shared_folder, "container_folder": plan.container_folder,
             "sidecars_copied": len(plan.shared_extra_paths),
-            "copy_mode": copy_mode, "archive_format": archive_format,
+            "copy_mode": copy_mode, "archive_format": archive_format, "archive_scope": archive_scope,
             "timestamp": datetime.now().isoformat(), "status": "pending",
         }
         log_entries.append(entry)
@@ -2397,6 +2645,10 @@ def _execute_reorganize_impl(
             continue
 
         try:
+            if archive_format != "none" and archive_scope == "variant":
+                # what counts as a sidecar is decided from the SOURCE folder, before anything moves
+                sidecar_rels_by_plan[plan.variant_id] = app_sidecars.effective_rels(
+                    db, plan.variant_id, sidecar_ctx)
             os.makedirs(plan.dest_path, exist_ok=True)
             item_collisions = []
             moved_any = False
@@ -2409,7 +2661,11 @@ def _execute_reorganize_impl(
                     if collided:
                         item_collisions.append(own)
                 for item in plan.shared_extra_paths:
-                    transferred, collided = _transfer_item(item, plan.dest_path, "copy", prog)
+                    rel_dir = os.path.dirname(os.path.relpath(item, plan.source_path))
+                    target_dir = (plan.dest_path if rel_dir in ("", ".") or rel_dir.startswith("..")
+                                  else os.path.join(plan.dest_path, rel_dir))
+                    os.makedirs(target_dir, exist_ok=True)
+                    transferred, collided = _transfer_item(item, target_dir, "copy", prog)
                     moved_any = moved_any or transferred
                     if collided:
                         item_collisions.append(item)
@@ -2419,6 +2675,11 @@ def _execute_reorganize_impl(
                         log_job.info("[%d/%d] left in place: %s -- %s", i, total, p_, why)
             else:
                 names = os.listdir(plan.source_path)
+                _dest_n = _norm(plan.dest_path).rstrip(os.sep)
+                # when the destination lives INSIDE the source folder (e.g. .../App -> .../App/1.0),
+                # the folder holding the destination is not an item to move (it would move into itself)
+                names = [n for n in names
+                         if not (_dest_n + os.sep).startswith(_norm(os.path.join(plan.source_path, n)).rstrip(os.sep) + os.sep)]
                 for n_idx, n in enumerate(names, start=1):
                     prog.emit("move", f"Item {n_idx}/{len(names)}: {n}")
                     transferred, collided = _transfer_item(
@@ -2449,7 +2710,35 @@ def _execute_reorganize_impl(
             orig_fp = None
             is_bare = bool(plan.primary_file_name) and \
                 os.path.splitext(plan.primary_file_name)[1].lower() in bare_exts
-            if archive_format != "none":
+            if archive_format != "none" and archive_scope == "variant":
+                # ---- whole variant: installer + sidecars -> one archive --------------------------
+                rels = sidecar_rels_by_plan.get(plan.variant_id, [])
+                if not rels and not is_bare:
+                    entry["archive_skipped_already_compressed"] = True
+                    log_job.info("[%d/%d] Not archiving -- nothing to bundle with %s",
+                                 i, total, plan.primary_file_name or "(no file name)")
+                else:
+                    if plan.primary_file_name:
+                        orig_fp = app_manifest.quick_fingerprint(
+                            os.path.join(plan.dest_path, plan.primary_file_name))
+                    bundled = _archive_variant_bundle(plan.dest_path, plan.primary_file_name, rels,
+                                                      archive_format, archive_password, prog)
+                    if bundled:
+                        archived_path, members = bundled
+                        new_file_name = os.path.basename(archived_path)
+                        result.archived += 1
+                        entry["archive_path"] = archived_path
+                        entry["archive_scope"] = "variant"
+                        entry["archived_items"] = members
+                        if archive_password:
+                            entry["archive_password_protected"] = True
+                        if copy_mode == "move":
+                            # the sidecars now live INSIDE the archive: the overrides refer to
+                            # paths that no longer exist
+                            app_sidecars.clear_overrides(db, plan.variant_id)
+                    else:
+                        entry["archive_failed"] = True
+            elif archive_format != "none":
                 if is_bare:
                     installer_path = os.path.join(plan.dest_path, plan.primary_file_name)
                     if os.path.exists(installer_path):
@@ -2669,6 +2958,8 @@ def scan_for_missing_sources(
     db: Database, root_path: Optional[str] = None,
     on_progress: Optional[Callable[[int, int], None]] = None,
     cancel_flag: Optional[Callable[[], bool]] = None,
+    app_ids: Optional[Iterable[int]] = None,
+    check_files: bool = False,
 ) -> list[MissingItem]:
     """
     DRY RUN, read-only, never touches the DB or filesystem beyond
@@ -2698,7 +2989,7 @@ def scan_for_missing_sources(
     conn = db.connect()
     rows = conn.execute("""
         SELECT v.id AS variant_id, v.app_id, v.source_path, v.version,
-               v.raw_candidate_id, a.name AS app_name, rc.scan_root_id
+               v.raw_candidate_id, v.file_name, a.name AS app_name, rc.scan_root_id
         FROM variants v
         JOIN apps a ON a.id = v.app_id
         LEFT JOIN raw_candidates rc ON rc.id = v.raw_candidate_id
@@ -2707,6 +2998,9 @@ def scan_for_missing_sources(
 
     if root_path:
         rows = [r for r in rows if _path_is_under(r["source_path"], root_path)]
+    if app_ids is not None:
+        _scope = set(app_ids)
+        rows = [r for r in rows if r["app_id"] in _scope]
 
     # One reachability check per scan root (not per variant) -- cheap and
     # avoids repeatedly stat-ing a drive that isn't there.
@@ -2727,6 +3021,9 @@ def scan_for_missing_sources(
             reason = "scan root path unreachable"
         elif not os.path.exists(r["source_path"]):
             reason = "file not found"
+        elif check_files and r["file_name"] and os.path.isdir(r["source_path"]) \
+                and not os.path.exists(os.path.join(r["source_path"], r["file_name"])):
+            reason = "installer file no longer in its folder"
 
         if reason:
             missing.append(MissingItem(
@@ -2832,3 +3129,316 @@ def generate_clean_library_html_report(
     )
     out_path.write_text(html, encoding="utf-8")
     return str(out_path)
+
+
+# =====================================================================
+# Targeted re-scan of specific apps' folders (one app / a few / a whole category)
+# =====================================================================
+
+
+@dataclass
+class RescanPlan:
+    folders_by_root: dict = field(default_factory=dict)     # {root_path: [folder, ...]}
+    skipped: list = field(default_factory=list)             # human-readable reasons
+    app_count: int = 0
+
+    @property
+    def folder_count(self) -> int:
+        return sum(len(v) for v in self.folders_by_root.values())
+
+
+@dataclass
+class RescanResult:
+    plan: Optional[RescanPlan] = None
+    folders_scanned: int = 0          # folders walked (the app folders and their sub-folders)
+    install_units: int = 0
+    missing_folders: list = field(default_factory=list)
+    scan_errors: int = 0
+    apps_created: int = 0
+    variants_before: int = 0
+    variants_after: int = 0
+    resolved_candidates: int = 0
+    affected_app_ids: set = field(default_factory=set)
+    missing: list = field(default_factory=list)             # list[MissingItem]
+    cancelled: bool = False
+
+
+def plan_rescan(db: Database, app_ids: Iterable[int]) -> RescanPlan:
+    app_ids = list(dict.fromkeys(app_ids))
+    plan = RescanPlan(app_count=len(app_ids))
+    if not app_ids:
+        return plan
+    conn = db.connect()
+    roots = [(r["id"], r["path"]) for r in conn.execute("SELECT id, path FROM scan_roots")]
+    folders: dict = {}          # normalized folder -> (display folder, root_path)
+
+    for i in range(0, len(app_ids), 500):
+        chunk = app_ids[i:i + 500]
+        rows = conn.execute(
+            f"SELECT v.source_path, rc.folder_path AS raw_folder FROM variants v "
+            f"LEFT JOIN raw_candidates rc ON rc.id = v.raw_candidate_id "
+            f"WHERE v.app_id IN ({','.join('?' * len(chunk))})", chunk).fetchall()
+        for r in rows:
+            # the variant's CURRENT folder is the truth (a reorganize may have moved it);
+            # fall back to the scan row's folder when that no longer exists
+            cand = [p for p in (r["source_path"], r["raw_folder"]) if p]
+            folder = next((p for p in cand if os.path.isdir(p)), None)
+            if folder is None:
+                if cand:
+                    plan.skipped.append(f"folder no longer exists: {cand[0]}")
+                continue
+            owners = [(len(rp), rp) for _id, rp in roots if _path_is_under(folder, rp)]
+            if not owners:
+                plan.skipped.append(f"not inside any scan root: {folder}")
+                continue
+            root_path = max(owners)[1]
+            if os.path.normcase(os.path.normpath(folder)) == os.path.normcase(os.path.normpath(root_path)):
+                plan.skipped.append(f"installer sits directly in the scan root {folder} "
+                                    f"(a full scan of that root is needed)")
+                continue
+            folders[os.path.normcase(os.path.normpath(folder))] = (folder, root_path)
+
+    # drop folders nested inside another selected folder of the same root
+    keys = sorted(folders)
+    kept = []
+    for k in keys:
+        if not any(k.startswith(o + os.sep) for o in kept):
+            kept.append(k)
+    for k in kept:
+        folder, root_path = folders[k]
+        plan.folders_by_root.setdefault(root_path, []).append(folder)
+    plan.skipped = list(dict.fromkeys(plan.skipped))
+    return plan
+
+
+def _variant_count(db: Database, app_ids: Iterable[int]) -> int:
+    ids = list(app_ids)
+    conn = db.connect()
+    n = 0
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        n += conn.execute(f"SELECT COUNT(*) FROM variants WHERE app_id IN ({','.join('?' * len(chunk))})",
+                          chunk).fetchone()[0]
+    return n
+
+
+def rescan_apps(db: Database, app_ids: Iterable[int],
+                on_progress: Optional[Callable[[str], None]] = None,
+                cancel_flag: Optional[Callable[[], bool]] = None) -> RescanResult:
+    app_ids = list(dict.fromkeys(app_ids))
+    res = RescanResult()
+    res.plan = plan_rescan(db, app_ids)
+    res.variants_before = _variant_count(db, app_ids)
+    candidate_ids: set = set()
+
+    for root_path, folders in res.plan.folders_by_root.items():
+        if cancel_flag and cancel_flag():
+            res.cancelled = True
+            break
+        out = _scanner.run_partial_scan(db, root_path, folders, on_progress=on_progress,
+                                       cancel_flag=cancel_flag)
+        res.folders_scanned += out["folders_scanned"]
+        res.install_units += out["install_units"]
+        res.missing_folders += out["missing_folders"]
+        res.scan_errors += len(out["errors"])
+        candidate_ids |= out["candidate_ids"]
+
+    if candidate_ids and not res.cancelled:
+        if on_progress:
+            on_progress(f"Resolving {len(candidate_ids)} item(s)…")
+        prog = _resolver.run_resolve(db, candidate_ids=candidate_ids)
+        res.apps_created = prog.apps_created
+        res.resolved_candidates = prog.candidates_processed
+
+    # apps affected = the ones asked for + whatever now owns variants of the scanned items
+    affected = set(app_ids)
+    conn = db.connect()
+    cids = list(candidate_ids)
+    for i in range(0, len(cids), 500):
+        chunk = cids[i:i + 500]
+        for r in conn.execute(
+                f"SELECT DISTINCT app_id FROM variants WHERE raw_candidate_id IN ({','.join('?' * len(chunk))})",
+                chunk):
+            affected.add(r["app_id"])
+    # drop ids of apps that no longer exist (merged away / emptied)
+    existing = {r["id"] for r in conn.execute("SELECT id FROM apps")}
+    res.affected_app_ids = {a for a in affected if a in existing}
+    res.variants_after = _variant_count(db, res.affected_app_ids)
+
+    if on_progress:
+        on_progress("Checking for files that disappeared…")
+    res.missing = scan_for_missing_sources(db, app_ids=res.affected_app_ids, check_files=True)
+    return res
+
+
+def format_rescan_report(res: RescanResult) -> str:
+    plan = res.plan
+    lines = [f"Re-scanned {plan.folder_count} folder(s) of {plan.app_count} app(s): "
+             f"{res.folders_scanned} folder(s) walked, {res.install_units} installer / archive unit(s) found."]
+    if res.cancelled:
+        lines.append("Cancelled before everything was done.")
+    delta = res.variants_after - res.variants_before
+    lines.append(f"Variants: {res.variants_before} → {res.variants_after}"
+                 + (f"  ({delta:+d})" if delta else "")
+                 + (f";  {res.apps_created} new app(s) created." if res.apps_created else "."))
+    if res.missing:
+        lines.append(f"{len(res.missing)} variant(s) no longer have their files on disk.")
+    if res.scan_errors:
+        lines.append(f"{res.scan_errors} folder(s) could not be read.")
+    if res.missing_folders:
+        lines.append(f"{len(res.missing_folders)} folder(s) are gone.")
+    if plan.skipped:
+        lines.append("")
+        lines.append(f"Not re-scanned ({len(plan.skipped)}):")
+        lines += ["  - " + s for s in plan.skipped[:30]]
+    return "\n".join(lines)
+
+
+# =====================================================================
+# Location check: variants that are not under their own app's folder
+# =====================================================================
+
+def find_misplaced_variants(db: Database, app_ids: Optional[Iterable[int]] = None,
+                            portable_category_name: str = "Portable") -> tuple[list, dict]:
+    """
+    After a reorganize / merge / manual fixes: finds variants whose folder on disk is not
+    <scan root>/<Catalog>/<Subcatalog>/<App>/... of the app that owns them in the catalog
+    (e.g. an app in cat1/sub1/app1 that still has a variant sitting in cat1/sub2/app2).
+
+    Letter case is ignored; a Portable app may sit either under its own catalog/subcatalog or
+    under Portable/<catalog>. Only variants at least three folders deep below a scan root can be
+    judged; shallower ones are counted in stats["too_shallow"].
+
+    Returns (rows, stats). Each row: app_id, app_name, catalog, subcatalog, variant_id, version,
+    file_name, source_path, actual (relative "Cat/Sub/App"), expected ("Cat/Sub/App"),
+    problems (["catalog", "subcatalog", "app folder"]), locations (how many distinct folders the
+    app's variants are spread over).
+    """
+    conn = db.connect()
+    roots = [r["path"] for r in conn.execute("SELECT path FROM scan_roots")]
+    rows = conn.execute("""
+        SELECT v.id AS variant_id, v.app_id, v.source_path, v.file_name, v.version,
+               a.name AS app_name, a.catalog, a.subcatalog, a.normalized_key
+        FROM variants v JOIN apps a ON a.id = v.app_id
+        WHERE v.is_ignored = 0
+        ORDER BY a.catalog, a.subcatalog, a.name, v.version
+    """).fetchall()
+    if app_ids is not None:
+        _scope = set(app_ids)
+        rows = [r for r in rows if r["app_id"] in _scope]
+    portable_ids = {r["app_id"] for r in conn.execute(
+        "SELECT at.app_id FROM app_tags at JOIN tags t ON t.id = at.tag_id WHERE LOWER(t.name) = 'portable'")}
+
+    def _low(s: str) -> str:
+        return _safe_path_component(s or "").lower()
+
+    stats = {"checked": 0, "too_shallow": 0, "no_root": 0, "misplaced": 0, "apps": 0}
+    found, by_app = [], {}
+    for r in rows:
+        sp = r["source_path"] or ""
+        owners = [(len(rp), rp) for rp in roots if _path_is_under(sp, rp)]
+        if not owners:
+            stats["no_root"] += 1
+            continue
+        root = max(owners)[1]
+        parts = [p for p in os.path.relpath(os.path.normpath(sp), os.path.normpath(root)).split(os.sep)
+                 if p not in (".", "")]
+        if len(parts) < 3:
+            stats["too_shallow"] += 1
+            continue
+        stats["checked"] += 1
+        a_cat, a_sub, a_app = parts[0], parts[1], parts[2]
+        exp_cat = r["catalog"] or "Uncategorized"
+        exp_sub = r["subcatalog"] or "Misc"
+        expected = "/".join(_safe_path_component(x) for x in (exp_cat, exp_sub, r["app_name"] or ""))
+
+        def _app_ok(folder: str) -> bool:
+            return (folder.lower() == _low(r["app_name"])
+                    or normalize_key(folder) == (r["normalized_key"] or normalize_key(r["app_name"] or "")))
+
+        options = [(_low(exp_cat), _low(exp_sub))]
+        if r["app_id"] in portable_ids:
+            options.append((_low(portable_category_name), _low(exp_cat)))
+        problems = []
+        if not any(a_cat.lower() == c for c, _s in options):
+            problems.append("catalog")
+        if not any(a_sub.lower() == s_ for _c, s_ in options):
+            problems.append("subcatalog")
+        if not _app_ok(a_app):
+            problems.append("app folder")
+        row = dict(app_id=r["app_id"], app_name=r["app_name"], catalog=r["catalog"], subcatalog=r["subcatalog"],
+                   variant_id=r["variant_id"], version=r["version"], file_name=r["file_name"],
+                   source_path=sp, actual="/".join((a_cat, a_sub, a_app)), expected=expected,
+                   problems=problems, root=root)
+        by_app.setdefault(r["app_id"], set()).add("/".join((a_cat, a_sub, a_app)).lower())
+        if problems:
+            found.append(row)
+    for row in found:
+        row["locations"] = len(by_app.get(row["app_id"], ()))
+    stats["misplaced"] = len(found)
+    stats["apps"] = len({r["app_id"] for r in found})
+    return found, stats
+
+
+def find_mixed_location_apps(db: Database, app_ids: Optional[Iterable[int]] = None) -> tuple[list, dict]:
+    """
+    Apps whose variants live in DIFFERENT places on disk -- regardless of where the app "should"
+    be. A location is <scan root>/Catalog/Subcatalog/AppFolder (version sub-folders below that do
+    not count as different); a variant closer than three folders to its scan root counts as its
+    own location (its exact folder). Letter case is ignored.
+
+    Returns (rows, stats). One row per variant of every mixed app, same keys as
+    find_misplaced_variants plus: label ("main location" for the location holding most of the app's
+    variants, otherwise "other location"), locations (number of distinct places).
+    """
+    conn = db.connect()
+    roots = [r["path"] for r in conn.execute("SELECT path FROM scan_roots")]
+    rows = conn.execute("""
+        SELECT v.id AS variant_id, v.app_id, v.source_path, v.file_name, v.version,
+               a.name AS app_name, a.catalog, a.subcatalog
+        FROM variants v JOIN apps a ON a.id = v.app_id
+        WHERE v.is_ignored = 0
+        ORDER BY a.catalog, a.subcatalog, a.name, v.version
+    """).fetchall()
+    if app_ids is not None:
+        _scope = set(app_ids)
+        rows = [r for r in rows if r["app_id"] in _scope]
+
+    stats = {"checked": 0, "apps": 0, "mixed_apps": 0, "variants": 0}
+    per_app: dict = {}
+    for r in rows:
+        sp = r["source_path"] or ""
+        owners = [(len(rp), rp) for rp in roots if _path_is_under(sp, rp)]
+        if owners:
+            root = max(owners)[1]
+            parts = [p for p in os.path.relpath(os.path.normpath(sp), os.path.normpath(root)).split(os.sep)
+                     if p not in (".", "")]
+            loc = "/".join(parts[:3]) if len(parts) >= 3 else "/".join(parts) or "."
+        else:
+            root, loc = "", os.path.normpath(sp)
+        key = (os.path.normcase(root), loc.lower())
+        stats["checked"] += 1
+        per_app.setdefault(r["app_id"], []).append((key, loc, root, r))
+
+    out = []
+    for app_id, items in per_app.items():
+        stats["apps"] += 1
+        counts: dict = {}
+        for key, *_ in items:
+            counts[key] = counts.get(key, 0) + 1
+        if len(counts) < 2:
+            continue
+        stats["mixed_apps"] += 1
+        main_key = max(counts, key=lambda k: counts[k])
+        for key, loc, root, r in items:
+            expected = "/".join(_safe_path_component(x) for x in
+                                (r["catalog"] or "Uncategorized", r["subcatalog"] or "Misc", r["app_name"] or ""))
+            out.append(dict(
+                app_id=app_id, app_name=r["app_name"], catalog=r["catalog"], subcatalog=r["subcatalog"],
+                variant_id=r["variant_id"], version=r["version"], file_name=r["file_name"],
+                source_path=r["source_path"] or "", actual=loc, expected=expected, root=root,
+                problems=[] if key == main_key else ["other location"],
+                label="main location" if key == main_key else "other location",
+                locations=len(counts)))
+    stats["variants"] = len(out)
+    return out, stats

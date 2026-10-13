@@ -12,9 +12,10 @@ from typing import Optional
 import re
 import app_manifest
 import app_curation
-from curation_dialogs import AddAppDialog, RepairEmptyAppsDialog
+import app_sidecars
+from curation_dialogs import AddAppDialog, RepairEmptyAppsDialog, SidecarsDialog
 from PySide6.QtCore import Qt, Signal, QItemSelectionModel, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QTableView,
     QLineEdit, QLabel, QPushButton, QToolBar,
@@ -25,7 +26,7 @@ from PySide6.QtWidgets import (
     QMenu, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QStackedWidget,
     QToolButton, QWidgetAction,
 )
-from PySide6.QtWidgets import QGridLayout, QSizePolicy 
+from PySide6.QtWidgets import QApplication, QGridLayout, QSizePolicy 
 from database import Database
 from resolver import (
     propose_reresolve_app, apply_reresolve_app, set_app_status,
@@ -45,7 +46,7 @@ from scanner import resolve_scan_root_layout, list_top_level_folders, list_child
 
 from gui_backend import (
     AppsTableModel, AppsTableDelegate, AppPickerDialog, COLUMNS,
-    export_apps_csv, import_apps_csv,
+    export_apps_csv, import_apps_csv, format_import_report,
     ScanWorker, ScanAndResolveWorker, ResolveWorker, ScrapeWorker,
     ChocoSearchWorker, WingetSearchWorker, CleanLibraryScanWorker,
     ManifestWorker, ManifestFlushWorker,
@@ -93,6 +94,7 @@ VARIANT_COLUMNS = [
     ("file_name", "File Name"),
     ("edition", "Edition"),
     ("type", "Type"),
+    ("sidecars", "Sidecars"),
     ("name_source", "Name Source"),
     ("scanned_at", "Scanned"),
     ("path", "Path"),
@@ -102,6 +104,23 @@ VARIANT_COLUMNS = [
 # variants.version_locked = 1 so a later Re-resolve won't overwrite
 # the manual edit (same lock convention as app name/catalog/subcatalog).
 EDITABLE_VARIANT_COLUMNS = {"version", "edition"}
+
+
+def conn_has_app(db, app_id) -> bool:
+    """True if the app row still exists (it is removed when its last variant leaves
+    and it carries no manual / scraped work)."""
+    return app_id is not None and db.connect().execute(
+        "SELECT 1 FROM apps WHERE id = ?", (app_id,)).fetchone() is not None
+
+
+class _CommitTextEdit(QTextEdit):
+    """QTextEdit that emits ``editingFinished`` when it loses focus (a QTextEdit has
+    no such signal), so a multi-line field can commit like the QLineEdits do."""
+    editingFinished = Signal()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self.editingFinished.emit()
 
 
 class DetailPanel(QWidget):
@@ -122,6 +141,7 @@ class DetailPanel(QWidget):
         # also fires editingFinished and would otherwise cause spurious
         # DB writes every time the user tabs through a field).
         self._baseline: dict = {}
+        self.search_tokens: list = []          # main-window search words (highlight matching variants)
         self._loading_variants = False
         self._build_ui()
         self.clear()
@@ -235,11 +255,16 @@ class DetailPanel(QWidget):
         form.addRow("Status", status_row)
 
         # Row 5: Description
-        self.description_edit = QTextEdit()
-        self.description_edit.setPlaceholderText("(not scraped yet)")
+        self.description_edit = _CommitTextEdit()
+        self.description_edit.setPlaceholderText("(no description yet — type one, or scrape)")
+        self.description_edit.setToolTip(
+            "Editable. Your text is kept — scraping won't overwrite it. "
+            "Clear the field to let scraping fill it in again.")
+        self.description_edit.setAcceptRichText(False)
+        self.description_edit.setTabChangesFocus(True)
         self.description_edit.setMaximumHeight(100)
-        self.description_edit.setReadOnly(True)
         self.description_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.description_edit.editingFinished.connect(self._commit_description)
         form.addRow("Description", self.description_edit)
 
         layout.addWidget(fields_box)
@@ -331,18 +356,38 @@ class DetailPanel(QWidget):
         self.variants_table.itemChanged.connect(self._on_variant_item_changed)
         self.variants_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.variants_table.customContextMenuRequested.connect(self._show_variant_context_menu)
+        # Quality-of-life: double-click File Name = run / open, double-click Path =
+        # open its location; Delete removes the selected variant(s) from the
+        # catalog (with a confirmation); Ctrl+C copies the path(s).
+        self.variants_table.itemDoubleClicked.connect(self._on_variant_double_clicked)
+        QShortcut(QKeySequence(Qt.Key_Delete), self.variants_table, context=Qt.WidgetShortcut,
+                  activated=self._delete_selected_variants)
+        QShortcut(QKeySequence.Copy, self.variants_table, context=Qt.WidgetShortcut,
+                  activated=self._copy_selected_variant_paths)
         vbox.addWidget(self.variants_table)
 
         variant_actions = QHBoxLayout()
+        self.add_variant_btn = QPushButton("Add variant…")
+        self.add_variant_btn.setToolTip("Add another installer to this app (same dialog as Add app).")
+        self.add_variant_btn.clicked.connect(self._add_variant)
+        variant_actions.addWidget(self.add_variant_btn)
         self.ignore_btn = QPushButton("Ignore selected")
         self.ignore_btn.clicked.connect(self._ignore_selected_variant)
         self.move_btn = QPushButton("Move to different app…")
         self.move_btn.clicked.connect(self._move_selected_variant)
         self.split_btn = QPushButton("Split into new app…")
         self.split_btn.clicked.connect(self._split_selected_variant)
+        self.ignore_btn.setToolTip("Ignore every selected variant (or un-ignore them if all are already ignored).")
+        self.move_btn.setToolTip("Move every selected variant to another app.")
+        self.split_btn.setToolTip("Split the selected variant(s) into a new app — "
+                                  "several at once go into one new app or one app each.")
+        self.sidecars_btn = QPushButton("Sidecars…")
+        self.sidecars_btn.setToolTip("See what is considered a sidecar of the selected variant, and add / remove items.")
+        self.sidecars_btn.clicked.connect(lambda: self._open_sidecars())
         variant_actions.addWidget(self.ignore_btn)
         variant_actions.addWidget(self.move_btn)
         variant_actions.addWidget(self.split_btn)
+        variant_actions.addWidget(self.sidecars_btn)
         variant_actions.addStretch()
         vbox.addLayout(variant_actions)
 
@@ -361,7 +406,7 @@ class DetailPanel(QWidget):
 
         self.name_edit.setEnabled(True)
         self.description_edit.setVisible(True)
-        self.description_edit.setPlaceholderText("(not scraped yet)")
+        self.description_edit.setPlaceholderText("(no description yet — type one, or scrape)")
         self.variants_box.setVisible(True)
         self.btn_original_name.setVisible(True)
         self.verify_btn.setText("Mark verified")
@@ -419,7 +464,7 @@ class DetailPanel(QWidget):
         self._multi_app_ids = []
         self.name_edit.setEnabled(True)
         self.description_edit.setVisible(True)
-        self.description_edit.setPlaceholderText("(not scraped yet)")
+        self.description_edit.setPlaceholderText("(no description yet — type one, or scrape)")
         self.variants_box.setVisible(True)
         self.verify_btn.setText("Mark verified")
         self.reresolve_btn.setText("Re-resolve this app")
@@ -522,6 +567,10 @@ class DetailPanel(QWidget):
                WHERE v.app_id = ? ORDER BY v.version""",
             (app_id,),
         ).fetchall()
+        try:
+            sidecar_info = app_sidecars.summaries(self.db, [dict(v) for v in variants])
+        except Exception:
+            sidecar_info = {}                         # never let sidecar detection break the panel
         self._loading_variants = True
         try:
             self.variants_table.setSortingEnabled(False)
@@ -532,7 +581,10 @@ class DetailPanel(QWidget):
                 file_display = v["file_name"] or ""
                 if forced:
                     file_display = f"🔒 {file_display}"
-                values = [v["version"], file_display, v["edition"], v["file_type"],
+                sc = sidecar_info.get(v["id"], {"count": 0, "excluded": 0, "names": [], "more": 0})
+                sc_text = (str(sc["count"]) if sc["count"] else "") + (
+                    f" (+{sc['excluded']} excluded)" if sc["excluded"] else "")
+                values = [v["version"], file_display, v["edition"], v["file_type"], sc_text.strip(),
                           v["name_source"], scanned, v["source_path"]]
                 for j, val in enumerate(values):
                     item = QTableWidgetItem(val or "")
@@ -544,17 +596,49 @@ class DetailPanel(QWidget):
                         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                     if col_key == "scanned_at" and v["scanned_at"]:
                         item.setToolTip(v["scanned_at"])
+                    if col_key == "sidecars":
+                        lines = [f"Sidecars ({sc['count']}):"] + [f"  • {n}" for n in sc["names"]]
+                        if sc["more"]:
+                            lines.append(f"  … and {sc['more']} more")
+                        if not sc["count"]:
+                            lines = ["No sidecars detected."]
+                        if sc["excluded"]:
+                            lines.append(f"{sc['excluded']} automatically detected item(s) excluded by you.")
+                        lines.append("\nDouble-click to view or change.")
+                        item.setToolTip("\n".join(lines))
                     if col_key == "file_name" and forced:
                         item.setToolTip(
                             f"Installer file manually locked (survives re-scans)\n"
                             f"Locked file: {v['file_name'] or '(none)'}\n"
                             f"Right-click → Clear installer file override to go back to auto."
                         )
+                    if col_key in ("file_name", "path"):
+                        full = (os.path.join(v["source_path"], v["file_name"])
+                                if v["file_name"] else v["source_path"])
+                        gone = self._path_missing(full)
+                        hint = ("Double-click to run / open this file" if col_key == "file_name"
+                                else "Double-click to open this location")
+                        lock_note = ("\n🔒 Installer file manually locked (survives re-scans). "
+                                     "Right-click → Clear installer file override to go back to auto."
+                                     if (col_key == "file_name" and forced) else "")
+                        item.setToolTip(f"{full}\n{hint}{lock_note}" + ("\n\n⚠ Not found on disk" if gone else ""))
+                        if gone:
+                            item.setForeground(QColor("#c0392b"))
                     if v["is_ignored"]:
                         item.setForeground(Qt.gray)
+                    if (col_key == "file_name" and self.search_tokens and v["file_name"]
+                            and any(t in v["file_name"].lower() for t in self.search_tokens)):
+                        item.setBackground(QColor(255, 214, 0, 90))       # matches the search
                     self.variants_table.setItem(i, j, item)
             self.variants_table.setSortingEnabled(True)
             self.variants_table.resizeColumnsToContents()
+            if self.search_tokens:                  # bring the first matching variant into view
+                fcol = [k for k, _ in VARIANT_COLUMNS].index("file_name")
+                for r in range(self.variants_table.rowCount()):
+                    it = self.variants_table.item(r, fcol)
+                    if it is not None and it.background().style() != Qt.NoBrush:
+                        self.variants_table.scrollToItem(it)
+                        break
         finally:
             self._loading_variants = False
 
@@ -564,6 +648,7 @@ class DetailPanel(QWidget):
             "publisher":    self.publisher_edit.text(),
             "homepage_url": self.homepage_edit.text(),
             "tags":         self.scraped_tags_edit.text(),
+            "description":  self.description_edit.toPlainText().strip(),
         }
 
     # ------------------------------------------------------------------
@@ -705,6 +790,7 @@ class DetailPanel(QWidget):
             "publisher":    self.publisher_edit.text(),
             "homepage_url": self.homepage_edit.text(),
             "tags":         self.scraped_tags_edit.text(),
+            "description":  "",
         }
 
     # ------------------------------------------------------------------
@@ -775,6 +861,23 @@ class DetailPanel(QWidget):
         self._baseline[field] = new_value
         self.app_changed.emit()
 
+    def _commit_description(self) -> None:
+        """Save a hand-edited description (single-app only; the field is hidden in
+        multi-select). Non-empty text is locked against scraping; clearing the field
+        unlocks it so a scrape can fill it again."""
+        if self._multi_mode or self.current_app_id is None:
+            return
+        new_value = self.description_edit.toPlainText().strip()
+        if new_value == self._baseline.get("description", ""):
+            return
+        conn = self.db.connect()
+        conn.execute(
+            "UPDATE apps SET description = ?, description_locked = ?, updated_at = datetime('now') WHERE id = ?",
+            (new_value or None, 1 if new_value else 0, self.current_app_id))
+        conn.commit()
+        self._baseline["description"] = new_value
+        self.app_changed.emit()
+
     def _commit_tags(self) -> None:
         text = self.scraped_tags_edit.text().strip()
         if text == self._baseline.get("tags", ""):
@@ -828,12 +931,36 @@ class DetailPanel(QWidget):
         row = conn.execute("SELECT * FROM variants WHERE id = ?", (vid,)).fetchone()
         return dict(row) if row else None
 
+    def _selected_variant_ids(self) -> list:
+        """Ids of ALL selected variant rows, in table order (every action below works
+        on the whole selection)."""
+        out, seen = [], set()
+        for idx in sorted(self.variants_table.selectionModel().selectedRows(), key=lambda i: i.row()):
+            item = self.variants_table.item(idx.row(), 0)
+            vid = item.data(Qt.UserRole) if item is not None else None
+            if vid is not None and vid not in seen:
+                seen.add(vid)
+                out.append(vid)
+        if not out:                                  # selection by cells rather than whole rows
+            for item in self.variants_table.selectedItems():
+                vid = item.data(Qt.UserRole)
+                if vid is not None and vid not in seen:
+                    seen.add(vid)
+                    out.append(vid)
+        return out
+
     def _ignore_selected_variant(self):
-        vid = self._selected_variant_id()
-        if vid is None:
-            QMessageBox.information(self, "No selection", "Select a variant row first.")
+        """Ignore every selected variant; if they are ALL already ignored, un-ignore them."""
+        vids = self._selected_variant_ids()
+        if not vids:
+            QMessageBox.information(self, "No selection", "Select one or more variant rows first.")
             return
-        set_variant_ignored(self.db, vid, ignored=True)
+        conn = self.db.connect()
+        q = ",".join("?" * len(vids))
+        ignored = conn.execute(f"SELECT COUNT(*) FROM variants WHERE id IN ({q}) AND is_ignored = 1", vids).fetchone()[0]
+        make_ignored = ignored < len(vids)
+        for vid in vids:
+            set_variant_ignored(self.db, vid, ignored=make_ignored)
         self.load_app(self.current_app_id)
         self.app_changed.emit()
 
@@ -868,6 +995,84 @@ class DetailPanel(QWidget):
         # Defer the refresh so we don't tear down the table mid-edit.
         QTimer.singleShot(0, self.app_changed.emit)
 
+    @staticmethod
+    def _path_missing(path: str) -> bool:
+        """True if a recorded path no longer exists. Network (UNC) paths are not
+        probed: an offline share can block the UI for many seconds."""
+        if not path or path.startswith(("\\\\", "//")):
+            return False
+        try:
+            return not os.path.exists(path)
+        except OSError:
+            return False
+
+    def _variant_row_by_id(self, vid):
+        row = self.db.connect().execute("SELECT * FROM variants WHERE id = ?", (vid,)).fetchone()
+        return dict(row) if row else None
+
+    def _on_variant_double_clicked(self, item):
+        """File Name -> run / open the file; Path -> open its location.
+        (Version / Edition keep their normal double-click-to-edit behaviour.)"""
+        if getattr(self, "_loading_variants", False):
+            return
+        col_key = VARIANT_COLUMNS[item.column()][0]
+        if col_key == "sidecars":
+            self._open_sidecars(item.data(Qt.UserRole))
+            return
+        if col_key not in ("file_name", "path"):
+            return
+        v = self._variant_row_by_id(item.data(Qt.UserRole))
+        if v is None:
+            return
+        if col_key == "file_name":
+            self._run_file(self._variant_full_path(v))
+        else:
+            self._open_file_location(self._variant_full_path(v))
+
+    def _open_sidecars(self, variant_id=None):
+        """Show / edit what counts as a sidecar of the selected variant."""
+        if variant_id is None:
+            ids = self._selected_variant_ids()
+            if len(ids) != 1:
+                QMessageBox.information(self, "Sidecars", "Select a single variant to view its sidecars.")
+                return
+            variant_id = ids[0]
+        if self._variant_row_by_id(variant_id) is None:
+            return
+        dlg = SidecarsDialog(self.db, variant_id, parent=self)
+        dlg.exec()
+        self.load_app(self.current_app_id)           # refresh the Sidecars column
+        if dlg.changed:
+            self.app_changed.emit()
+
+    def _add_variant(self):
+        """Add another installer to the current app, using the same dialog as
+        'Add app' (app name / category fixed)."""
+        if self._multi_mode or self.current_app_id is None:
+            return
+        conn = self.db.connect()
+        app = conn.execute("SELECT * FROM apps WHERE id = ?", (self.current_app_id,)).fetchone()
+        if app is None:
+            return
+        first = conn.execute("SELECT source_path FROM variants WHERE app_id = ? ORDER BY id LIMIT 1",
+                             (self.current_app_id,)).fetchone()
+        start = os.path.dirname(first["source_path"].rstrip("\\/")) if first and first["source_path"] else ""
+        dlg = AddAppDialog(self.db, parent=self, add_to_app=dict(app), start_dir=start)
+        if dlg.exec() != QDialog.Accepted or not dlg.result_info:
+            return
+        self.load_app(self.current_app_id)
+        self.app_changed.emit()
+
+    def _copy_selected_variant_paths(self):
+        paths = []
+        for vid in sorted({i.data(Qt.UserRole) for i in self.variants_table.selectedItems()
+                           if i.data(Qt.UserRole) is not None}):
+            v = self._variant_row_by_id(vid)
+            if v:
+                paths.append(self._variant_full_path(v))
+        if paths:
+            QApplication.clipboard().setText("\n".join(paths))
+
     def _delete_selected_variants(self):
         vids = {item.data(Qt.UserRole)
                 for item in self.variants_table.selectedItems()}
@@ -884,6 +1089,7 @@ class DetailPanel(QWidget):
         )
         if confirm != QMessageBox.Yes:
             return
+        app_curation.create_backup(self.db.path, "before-delete", keep=5, min_interval_s=300)
         for vid in vids:
             delete_variant(self.db, vid)
         if self.current_app_id is not None:
@@ -891,29 +1097,45 @@ class DetailPanel(QWidget):
         self.app_changed.emit()
 
     def _move_selected_variant(self):
-        vid = self._selected_variant_id()
-        if vid is None:
-            QMessageBox.information(self, "No selection", "Select a variant row first.")
+        vids = self._selected_variant_ids()
+        if not vids:
+            QMessageBox.information(self, "No selection", "Select one or more variant rows first.")
             return
         # Shared, searchable app picker (gui_backend.AppPickerDialog).
         # Excludes the current parent so a variant can't be "moved" to
-        # the app it's already under.
+        # the app it's already under. One target for the whole selection.
         dialog = AppPickerDialog(self.db, exclude_app_id=self.current_app_id, parent=self)
         if dialog.exec():
             target_id = dialog.selected_app_id()
             if target_id:
-                move_variant_to_app(self.db, vid, target_id)
-                self.load_app(self.current_app_id)
+                for vid in vids:
+                    move_variant_to_app(self.db, vid, target_id)
+                if conn_has_app(self.db, self.current_app_id):
+                    self.load_app(self.current_app_id)
                 self.app_changed.emit()
 
     def _split_selected_variant(self):
-        vid = self._selected_variant_id()
-        if vid is None:
-            QMessageBox.information(self, "No selection", "Select a variant row first.")
+        vids = self._selected_variant_ids()
+        if not vids:
+            QMessageBox.information(self, "No selection", "Select one or more variant rows first.")
             return
+        conn = self.db.connect()
+        if len(vids) > 1:
+            # several variants: one new app for all, or one new app each
+            rows = [dict(conn.execute("SELECT * FROM variants WHERE id = ?", (v,)).fetchone()) for v in vids]
+            a = conn.execute("SELECT * FROM apps WHERE id = ?", (rows[0]["app_id"],)).fetchone()
+            dlg = AddAppDialog(self.db, parent=self, split_variants=rows, split_app=dict(a))
+            if dlg.exec() != QDialog.Accepted or not dlg.result_info:
+                return
+            if conn_has_app(self.db, self.current_app_id):
+                self.load_app(self.current_app_id)
+            self.app_changed.emit()
+            if dlg.scrape_after:
+                self.scrape_requested.emit(dlg.result_info["app_ids"])
+            return
+        vid = vids[0]
         # The same dialog as "Add app", prefilled from the variant (installer file,
         # app folder, version, edition, ... all editable).
-        conn = self.db.connect()
         v = conn.execute("SELECT * FROM variants WHERE id = ?", (vid,)).fetchone()
         a = conn.execute("SELECT * FROM apps WHERE id = ?", (v["app_id"],)).fetchone()
         dlg = AddAppDialog(self.db, parent=self, split_variant=dict(v), split_app=dict(a))
@@ -926,7 +1148,7 @@ class DetailPanel(QWidget):
             self.scrape_requested.emit([dlg.result_info["app_id"]])
 
     def _selected_variant_rows(self) -> list[dict]:
-        vids = {item.data(Qt.UserRole) for item in self.variants_table.selectedItems()}
+        vids = self._selected_variant_ids()
         if not vids:
             return []
         conn = self.db.connect()
@@ -1067,26 +1289,47 @@ class DetailPanel(QWidget):
     def _show_variant_context_menu(self, pos):
         rows = self._selected_variant_rows()
         if not rows:
+            # right-click on empty space: the only thing that makes sense is adding one
+            if self.current_app_id is None or self._multi_mode:
+                return
+            empty_menu = QMenu(self)
+            add_only = empty_menu.addAction("Add variant…")
+            if empty_menu.exec(self.variants_table.viewport().mapToGlobal(pos)) is add_only:
+                self._add_variant()
             return
         menu = QMenu(self)
+        add_variant_action = menu.addAction("Add variant…")
+        menu.addSeparator()
         open_location_action = menu.addAction("Open file location")
         run_action = menu.addAction("Run / open file")
+        copy_path_action = menu.addAction("Copy path")
+        sidecars_action = menu.addAction("Sidecars…")
         menu.addSeparator()
         change_file_action = menu.addAction("Change installer file…")
         clear_file_action = menu.addAction("Clear installer file override")
         menu.addSeparator()
-        manifest_action = menu.addAction("Create/update manifest")
+        manifest_action = menu.addAction("Save metadata file")
         menu.addSeparator()
         reeval_action = menu.addAction("Re-evaluate selected")
         scrape_action = menu.addAction("Scrape app metadata (Winget)")
         choco_action = menu.addAction("Search & match…")
         menu.addSeparator()
-        ignore_action = menu.addAction("Ignore selected")
-        delete_variants_action = menu.addAction("Delete selected variant(s)")
+        n_sel = len(rows)
+        all_ignored = all(r.get("is_ignored") for r in rows)
+        ignore_action = menu.addAction(
+            (f"Un-ignore selected ({n_sel})" if all_ignored else f"Ignore selected ({n_sel})") if n_sel > 1
+            else ("Un-ignore" if all_ignored else "Ignore"))
+        move_action = menu.addAction(f"Move selected to different app… ({n_sel})" if n_sel > 1
+                                     else "Move to different app…")
+        split_action = menu.addAction(f"Split selected into new app… ({n_sel})" if n_sel > 1
+                                      else "Split into new app…")
+        delete_variants_action = menu.addAction(f"Delete selected variants ({n_sel})" if n_sel > 1
+                                                else "Delete variant")
 
         single = rows[0] if len(rows) == 1 else None
         open_location_action.setEnabled(single is not None)
         run_action.setEnabled(single is not None)
+        sidecars_action.setEnabled(single is not None)
         change_file_action.setEnabled(single is not None)
         has_override = bool(single and single.get("file_locked"))
         clear_file_action.setEnabled(has_override)
@@ -1111,7 +1354,7 @@ class DetailPanel(QWidget):
             self._clear_variant_installer_file(single)
         elif chosen == manifest_action:
             res = app_manifest.write_manifests(self.db, [r["id"] for r in rows])
-            QMessageBox.information(self, "Manifest", f"{res.summary()}.")
+            QMessageBox.information(self, "Metadata file", f"{res.summary()}.")
         elif chosen == reeval_action:
             self._reresolve()
         elif chosen == scrape_action:
@@ -1120,10 +1363,20 @@ class DetailPanel(QWidget):
         elif chosen == choco_action:
             if self.current_app_id is not None:
                 self._open_search_match()
+        elif chosen == sidecars_action and single:
+            self._open_sidecars(single["id"])
         elif chosen == ignore_action:
             self._ignore_selected_variant()
+        elif chosen == move_action:
+            self._move_selected_variant()
+        elif chosen == split_action:
+            self._split_selected_variant()
         elif chosen == delete_variants_action:
             self._delete_selected_variants()
+        elif chosen == copy_path_action:
+            self._copy_selected_variant_paths()
+        elif chosen == add_variant_action:
+            self._add_variant()
             
     def _open_search_match(self):
         settings = self.db.get_all_settings()
@@ -1182,14 +1435,23 @@ class DetailPanel(QWidget):
         if not os.path.exists(full_path):
             QMessageBox.warning(self, "File not found", f"{full_path}\n\ndoes not exist on disk.")
             return
-        confirm = QMessageBox.question(
-            self, "Run file?",
-            f"This will run:\n\n{full_path}\n\n"
-            "This may launch an installer or make changes to your system. Continue?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if confirm != QMessageBox.Yes:
-            return
+        if self.db.get_setting("confirm_run_file", True):
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Run file?")
+            box.setText(f"Run / open this file?\n\n{full_path}")
+            box.setInformativeText("This may launch an installer or make changes to your system.")
+            dont_ask = QCheckBox("Don't ask again (can be turned back on in Settings → Interface)")
+            box.setCheckBox(dont_ask)
+            run_btn = box.addButton("Run", QMessageBox.AcceptRole)
+            cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(cancel_btn)
+            box.setEscapeButton(cancel_btn)
+            box.exec()
+            if box.clickedButton() is not run_btn:
+                return
+            if dont_ask.isChecked():
+                self.db.set_setting("confirm_run_file", False, bump_version=False)
         try:
             system = platform.system()
             if system == "Windows":
@@ -2299,6 +2561,15 @@ class SettingsDialog(QDialog):
         self._build_interface(settings)
         self._build_watch_folders(settings)
 
+        # reopen on the tab that was used last
+        try:
+            self.tabs.setCurrentIndex(min(int(self.db.get_setting("settings_last_tab", 0) or 0),
+                                          self.tabs.count() - 1))
+        except Exception:
+            pass
+        self.tabs.currentChanged.connect(
+            lambda i: self.db.set_setting("settings_last_tab", i, bump_version=False))
+
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel_btn = QPushButton("Cancel")
@@ -2329,7 +2600,7 @@ class SettingsDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(inner)
-        self.tabs.addTab(scroll, title)
+        self.tabs.addTab(scroll, title.replace("&", "&&"))     # '&' would otherwise be a mnemonic marker
         return layout
 
     def _group(self, title: str) -> QGroupBox:
@@ -2575,6 +2846,47 @@ class SettingsDialog(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
+        # -- File types block --
+        from scanner import DEFAULT_INSTALLER_EXTS, DEFAULT_ARCHIVE_EXTS, normalize_ext_list
+        box_types = self._group("File types the scanner recognises")
+        vt = box_types._inner_layout
+        self.installer_exts = QPlainTextEdit(
+            "\n".join(normalize_ext_list(settings.get("installer_extensions")) or DEFAULT_INSTALLER_EXTS))
+        self.installer_exts.setMaximumHeight(110)
+        self.archive_exts = QPlainTextEdit(
+            "\n".join(normalize_ext_list(settings.get("archive_extensions")) or DEFAULT_ARCHIVE_EXTS))
+        self.archive_exts.setMaximumHeight(110)
+        reset_inst = QPushButton("Reset to defaults")
+        reset_inst.clicked.connect(lambda: self.installer_exts.setPlainText("\n".join(DEFAULT_INSTALLER_EXTS)))
+        reset_arch = QPushButton("Reset to defaults")
+        reset_arch.clicked.connect(lambda: self.archive_exts.setPlainText("\n".join(DEFAULT_ARCHIVE_EXTS)))
+        inst_col = QWidget()
+        ic = QVBoxLayout(inst_col)
+        ic.setContentsMargins(0, 0, 0, 0)
+        ic.addWidget(self._labeled(
+            "Installer files", self.installer_exts,
+            "One extension per line. A file ending in one of these is an install unit; a real installer "
+            "is preferred over a bare archive in the same folder."))
+        ic.addWidget(reset_inst, 0, Qt.AlignLeft)
+        ic.addStretch(1)
+        arch_col = QWidget()
+        ac = QVBoxLayout(arch_col)
+        ac.setContentsMargins(0, 0, 0, 0)
+        ac.addWidget(self._labeled(
+            "Archive files", self.archive_exts,
+            "One extension per line (the dot is optional; multi-part endings such as .tar.gz work). Archives "
+            "are install units too, and their contents are inspected when enabled under Archive Handling. "
+            "Inspectable: .zip .7z .rar (needs unrar/7z) .iso and tar types (.tgz .tar.gz .tar .tar.bz2 "
+            ".tar.xz). Any other extension is still detected, just not opened."))
+        ac.addWidget(reset_arch, 0, Qt.AlignLeft)
+        ac.addStretch(1)
+        self._two_col(vt, [inst_col], [arch_col])
+        vt.addWidget(self._desc(
+            "A new extension is picked up on the next scan (each scan root is re-checked completely once after "
+            "a change). Removing an extension only stops future detection -- items already in the catalog "
+            "stay until you delete them."))
+        layout.addWidget(box_types)
+
         # -- Skip block --
         box_skip = self._group("Folders to skip")
         v = box_skip._inner_layout
@@ -2724,7 +3036,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(box_behav)
 
         # -- Variant manifests --
-        box_mf = self._group("Variant manifests (<app> <version>.appcatalog.json)")
+        box_mf = self._group("Metadata files (<app> <version>.appcatalog.json)")
         vm = box_mf._inner_layout
         vm.addWidget(self._desc(
             "A small file written next to each variant: app name, the setup file and its "
@@ -2732,7 +3044,7 @@ class SettingsDialog(QDialog):
             "a re-organized library — or a brand-new database — recognises your manual work "
             "from these. Category / subcategory are deliberately NOT stored."))
         self.manifest_auto = QCheckBox(
-            "Keep manifests up to date automatically (when a variant is edited, scraped, "
+            "Keep metadata files up to date automatically (when a variant is edited, scraped, "
             "re-organized or monitored)")
         self.manifest_auto.setChecked(settings.get("manifest_auto_enabled", True))
         self.manifest_only_valuable = QCheckBox(
@@ -2744,9 +3056,9 @@ class SettingsDialog(QDialog):
         try:
             st = app_manifest.manifest_stats(self.db)
             vm.addWidget(self._desc(
-                f"{st['with_manifest']} of {st['variants']} variants have a manifest · "
+                f"{st['with_manifest']} of {st['variants']} variants have a metadata file · "
                 f"{st['pending']} pending · {st['errors']} with a write error. "
-                "Use the toolbar's “Write manifests…” (or right-click apps) to create them "
+                "Use the toolbar's “Sync meta” (or right-click apps) to create them "
                 "manually, e.g. for your existing catalog."))
         except Exception:
             pass
@@ -2968,6 +3280,26 @@ class SettingsDialog(QDialog):
             "regex. Runs at resolve time, after the catalog/subcatalog string "
             "has already been decided. Example: 'burners=CD/DVD Burner'."))
 
+        self.catalog_case_combo = QComboBox()
+        self.subcatalog_case_combo = QComboBox()
+        for _combo, _key in ((self.catalog_case_combo, "catalog_case_mode"),
+                             (self.subcatalog_case_combo, "subcatalog_case_mode")):
+            _combo.addItem("As in the folder name (no change)", "as_is")
+            _combo.addItem("Smart Title Case", "title")
+            _combo.addItem("UPPERCASE", "upper")
+            _combo.setCurrentIndex(max(_combo.findData(settings.get(_key, "as_is")), 0))
+        self._two_col(
+            v2,
+            [self._labeled(
+                "Catalog letter case (from folder names)", self.catalog_case_combo,
+                "How a catalog name taken from a folder is written. 'As in the folder name' keeps "
+                "e.g. IPTV exactly; 'Smart Title Case' turns it into 'Iptv'. Aliases above always "
+                "win. Takes effect on the next scan / re-resolve (manually locked apps keep their value).")],
+            [self._labeled(
+                "Subcatalog letter case (from folder names)", self.subcatalog_case_combo,
+                "Same as the catalog option, but for subcatalogs.")],
+        )
+
         self.fallback_catalog_name = QLineEdit(
             settings.get("fallback_catalog_name", "MISC"))
         self.fallback_subcatalog_name = QLineEdit(
@@ -3127,7 +3459,27 @@ class SettingsDialog(QDialog):
             "Scales all fonts and widget sizes. Takes effect after restarting "
             "the app (Qt reads this before the window is created)."))
 
+        self.filter_tree_case_combo = QComboBox()
+        self.filter_tree_case_combo.addItem("As in the app (exactly as stored)", "as_is")
+        self.filter_tree_case_combo.addItem("Smart Title Case", "title")
+        self.filter_tree_case_combo.setCurrentIndex(
+            max(self.filter_tree_case_combo.findData(settings.get("filter_tree_case", "as_is")), 0))
+        v.addWidget(self._labeled(
+            "Filter list (left panel) shows catalogs as",
+            self.filter_tree_case_combo,
+            "Visual only. 'As in the app' shows each catalog / subcatalog exactly as stored (uppercase, "
+            "lowercase, whatever the folder was). 'Smart Title Case' only changes how it is DISPLAYED in "
+            "the list -- the stored text and the folders on disk are never changed. Applies when you "
+            "press Save."))
+
         layout.addWidget(box)
+
+        box_beh = self._group("Behaviour")
+        vb = box_beh._inner_layout
+        self.confirm_run_file = QCheckBox("Ask before running / opening a file (double-click File Name, or Run / open)")
+        self.confirm_run_file.setChecked(settings.get("confirm_run_file", True))
+        vb.addWidget(self.confirm_run_file)
+        layout.addWidget(box_beh)
 
         # Read-only info
         info = self._group("Catalog info")
@@ -3353,6 +3705,11 @@ class SettingsDialog(QDialog):
         self.db.set_setting("archive_scratch_dir", scratch, bump_version=False)
 
         # -- Scanning & Noise --
+        from scanner import normalize_ext_list as _norm_ext
+        self.db.set_setting("installer_extensions",
+                            _norm_ext(self.installer_exts.toPlainText()), bump_version=False)
+        self.db.set_setting("archive_extensions",
+                            _norm_ext(self.archive_exts.toPlainText()), bump_version=False)
         self.db.set_setting("noise_folder_keywords",
                             [l.strip() for l in
                              self.noise_keywords.toPlainText().splitlines()
@@ -3484,6 +3841,12 @@ class SettingsDialog(QDialog):
                     alias_dict[k.strip().lower()] = v.strip()
         self.db.set_setting("folder_name_aliases", alias_dict, bump_version=False)
 
+        self.db.set_setting("filter_tree_case", self.filter_tree_case_combo.currentData(),
+                            bump_version=False)
+        self.db.set_setting("catalog_case_mode", self.catalog_case_combo.currentData(),
+                            bump_version=False)
+        self.db.set_setting("subcatalog_case_mode", self.subcatalog_case_combo.currentData(),
+                            bump_version=False)
         self.db.set_setting("fallback_catalog_name",
                             self.fallback_catalog_name.text().strip(),
                             bump_version=False)
@@ -3521,6 +3884,8 @@ class SettingsDialog(QDialog):
         # -- Interface --
         self.db.set_setting("ui_scale_multiplier", self.ui_scale.value(),
                             bump_version=False)
+        self.db.set_setting("confirm_run_file", self.confirm_run_file.isChecked(),
+                            bump_version=False)
 
         # -- Watch Folders --
         self.db.set_setting("monitor_folders",
@@ -3554,42 +3919,102 @@ class SettingsDialog(QDialog):
         self.accept()
 
 class CsvExportDialog(QDialog):
-    def __init__(self, parent=None):
+    """Export: a SHORT file for chatbots (fill-in columns only) and/or the FULL detailed report."""
+
+    def __init__(self, db: Database = None, parent=None, scopes=None, default_scope: str = "list"):
+        """scopes: [(kind, label, app_count)] -- which apps to export (current list, selection, ...)."""
         super().__init__(parent)
         self.setWindowTitle("Export to CSV")
-        self.resize(380, 160)
         self._output_dir = None
+        self._db = db
         layout = QVBoxLayout(self)
-        intro = QLabel(
-            "Exports one row per app (name, catalog, subcatalog, versions,\n"
-            "confidence, alt-name candidate) for review or bulk correction."
-        )
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-        form = QFormLayout()
-        self.batch_toggle = QCheckBox("Split into small batches (for easy chat upload)")
+        self.scope_combo = QComboBox()
+        for kind, label, n in (scopes or []):
+            self.scope_combo.addItem(f"{label}  ({n} apps)", kind)
+            if n == 0:
+                self.scope_combo.model().item(self.scope_combo.count() - 1).setEnabled(False)
+        i = self.scope_combo.findData(default_scope)
+        if i >= 0 and self.scope_combo.model().item(i).isEnabled():
+            self.scope_combo.setCurrentIndex(i)
+        if self.scope_combo.count():
+            row0 = QHBoxLayout()
+            row0.addWidget(QLabel("Apps to export:"))
+            row0.addWidget(self.scope_combo, 1)
+            layout.addLayout(row0)
+
+        # ---- short ----
+        self.short_check = QCheckBox("Short file for chatbots — fill in missing scrape data")
+        self.short_check.setChecked(True)
+        layout.addWidget(self.short_check)
+        self.short_box = QGroupBox()
+        sg = QVBoxLayout(self.short_box)
+        cols = QLabel("Columns: <b>app_id, name, catalog, subcatalog, sample_file_name</b> (identify the row — "
+                      "the chatbot must not change them) + <b>description, publisher, homepage_url, winget_id, "
+                      "choco_id, latest_version, tags</b> (to be filled in).")
+        cols.setWordWrap(True)
+        cols.setTextFormat(Qt.RichText)
+        sg.addWidget(cols)
+        self.only_missing_check = QCheckBox("Only apps that still miss one of those fields")
+        self.only_missing_check.setChecked(True)
+        sg.addWidget(self.only_missing_check)
+        self.missing_label = QLabel("")
+        self.missing_label.setStyleSheet("color: #909090; margin-left: 22px;")
+        sg.addWidget(self.missing_label)
+        self.versions_check = QCheckBox("Also include my local version(s) (a hint for the latest-version lookup)")
+        sg.addWidget(self.versions_check)
+        self.prompt_check = QCheckBox("Also write a ready-to-paste instruction text for the chatbot (.txt)")
+        self.prompt_check.setChecked(True)
+        sg.addWidget(self.prompt_check)
+        row = QHBoxLayout()
+        self.batch_toggle = QCheckBox("Split into batches of")
         self.batch_toggle.setChecked(True)
-        self.batch_toggle.toggled.connect(self._toggle_batch_size)
-        form.addRow(self.batch_toggle)
         self.batch_size = QSpinBox()
         self.batch_size.setRange(10, 5000)
         self.batch_size.setValue(200)
         self.batch_size.setSuffix(" apps per file")
-        form.addRow("Batch size", self.batch_size)
-        layout.addLayout(form)
+        self.batch_toggle.toggled.connect(self.batch_size.setEnabled)
+        row.addWidget(self.batch_toggle)
+        row.addWidget(self.batch_size)
+        row.addStretch()
+        sg.addLayout(row)
+        layout.addWidget(self.short_box)
+        self.short_check.toggled.connect(self.short_box.setEnabled)
+
+        # ---- full ----
+        self.full_check = QCheckBox("Full detailed report — every column and every row")
+        self.full_check.setChecked(False)
+        layout.addWidget(self.full_check)
+        full_info = QLabel("Two files: <b>catalog_full_apps</b> (all columns of every app, ignored ones included, "
+                           "plus tags / versions / sizes) and <b>catalog_full_variants</b> (every column of every "
+                           "variant). Opens in Excel; the apps file can be edited and imported back.")
+        full_info.setWordWrap(True)
+        full_info.setTextFormat(Qt.RichText)
+        full_info.setStyleSheet("margin-left: 22px; color: #909090;")
+        layout.addWidget(full_info)
+
+        if self._db is not None:
+            try:
+                from gui_backend import count_apps_missing_data
+                missing, total = count_apps_missing_data(self._db)
+                self.missing_label.setText(f"{missing} of {total} apps would be included.")
+            except Exception:
+                pass
 
         btn_row = QHBoxLayout()
-        choose_btn = QPushButton("Choose folder && export…")
-        choose_btn.clicked.connect(self._choose_and_accept)
+        self.export_btn = QPushButton("Choose folder && export…")
+        self.export_btn.clicked.connect(self._choose_and_accept)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         btn_row.addStretch()
         btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(choose_btn)
+        btn_row.addWidget(self.export_btn)
         layout.addLayout(btn_row)
+        self.short_check.toggled.connect(self._sync_button)
+        self.full_check.toggled.connect(self._sync_button)
+        self.setMinimumWidth(560)
 
-    def _toggle_batch_size(self, checked: bool):
-        self.batch_size.setEnabled(checked)
+    def _sync_button(self, *_):
+        self.export_btn.setEnabled(self.short_check.isChecked() or self.full_check.isChecked())
 
     def _choose_and_accept(self):
         folder = QFileDialog.getExistingDirectory(self, "Choose export folder")
@@ -3600,8 +4025,85 @@ class CsvExportDialog(QDialog):
     def output_dir(self) -> str | None:
         return self._output_dir
 
-    def batch_size_value(self) -> int:
-        return self.batch_size.value() if self.batch_toggle.isChecked() else 0
+    def scope_kind(self) -> str:
+        return self.scope_combo.currentData() or "all"
+
+    def mode(self) -> str:
+        s, f = self.short_check.isChecked(), self.full_check.isChecked()
+        return "both" if s and f else ("full" if f else "short")
+
+    def export_options(self) -> dict:
+        return dict(
+            mode=self.mode(),
+            batch_size=self.batch_size.value() if self.batch_toggle.isChecked() else 0,
+            only_missing=self.only_missing_check.isChecked(),
+            include_versions=self.versions_check.isChecked(),
+            write_prompt=self.prompt_check.isChecked(),
+        )
+
+
+class CsvImportDialog(QDialog):
+    """Import options with a live dry-run preview (nothing is written until 'Import')."""
+
+    def __init__(self, db: Database, csv_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import CSV")
+        self._db = db
+        self._path = csv_path
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"File: <b>{os.path.basename(csv_path)}</b>"))
+        self.overwrite_check = QCheckBox("Overwrite values that already exist in the catalog")
+        self.overwrite_check.setToolTip("Off (default): only blank fields are filled; existing data is never replaced.")
+        self.names_check = QCheckBox("Apply name / catalog / subcatalog changes from the file")
+        self.names_check.setChecked(True)
+        self.names_check.setToolTip("These lock the field like a manual edit. Turn off to import only the "
+                                    "scrape fields and tags.")
+        self.complete_check = QCheckBox("Mark apps with ALL details filled as scraped + verified")
+        self.complete_check.setChecked(True)
+        self.complete_check.setToolTip("An app counts as complete when description, publisher, homepage, "
+                                       "Winget id, Chocolatey id and latest version are all filled after the "
+                                       "import. Partly filled apps keep their status.")
+        layout.addWidget(self.overwrite_check)
+        layout.addWidget(self.names_check)
+        layout.addWidget(self.complete_check)
+        tag_row = QHBoxLayout()
+        tag_row.addWidget(QLabel("Tags:"))
+        self.tags_combo = QComboBox()
+        self.tags_combo.addItem("Add to the existing tags", "add")
+        self.tags_combo.addItem("Replace the existing tags", "replace")
+        tag_row.addWidget(self.tags_combo)
+        tag_row.addStretch()
+        layout.addLayout(tag_row)
+        layout.addWidget(QLabel("Preview (nothing has been changed yet):"))
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setMinimumHeight(220)
+        layout.addWidget(self.preview, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.import_btn = bb.addButton("Import", QDialogButtonBox.AcceptRole)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+        for w in (self.overwrite_check, self.names_check, self.complete_check):
+            w.toggled.connect(self._refresh)
+        self.tags_combo.currentIndexChanged.connect(self._refresh)
+        self.resize(640, 460)
+        self._refresh()
+
+    def options(self) -> dict:
+        return dict(overwrite=self.overwrite_check.isChecked(), apply_names=self.names_check.isChecked(),
+                    tags_mode=self.tags_combo.currentData(), mark_complete=self.complete_check.isChecked())
+
+    def _refresh(self, *_):
+        from gui_backend import import_apps_csv, format_import_report
+        try:
+            stats = import_apps_csv(self._db, self._path, dry_run=True, **self.options())
+            self.preview.setPlainText(format_import_report(stats))
+            self.import_btn.setEnabled(stats["updated"] > 0)
+        except Exception as e:
+            self.preview.setPlainText(f"Cannot import this file:\n\n{e}")
+            self.import_btn.setEnabled(False)
+
 
 class RefineNamesDialog(QDialog):
     """
@@ -4008,6 +4510,7 @@ class MainWindow(QMainWindow):
         self._build_central_widget()
         self._build_status_bar()
         self.refresh_all()
+        self._install_quality_of_life()
 
         # Variant manifests (appcatalog.json): auto mode flushes changed
         # variants in the background every few seconds (setting
@@ -4044,6 +4547,8 @@ class MainWindow(QMainWindow):
             "Add, re-scan, repath, or delete scan roots (picks up new/changed files "
             "on re-scan, skips anything unchanged)"
         )
+        scan_roots_action.setToolTip(scan_roots_action.toolTip() + "  (Ctrl+Shift+S)")
+        scan_roots_action.setShortcut("Ctrl+Shift+S")
         scan_roots_action.triggered.connect(self._show_scan_roots)
         toolbar.addAction(scan_roots_action)
 
@@ -4051,6 +4556,7 @@ class MainWindow(QMainWindow):
         add_app_action.setToolTip(
             "Add an app (or another variant of an existing app) straight from its installer "
             "file -- no scan root needed.")
+        add_app_action.setShortcut("Ctrl+N")
         add_app_action.triggered.connect(self._add_app_dialog)
         toolbar.addAction(add_app_action)
 
@@ -4077,15 +4583,21 @@ class MainWindow(QMainWindow):
         organize_action.triggered.connect(self._open_organize_dialog)
         toolbar.addAction(organize_action)
 
-        manifests_action = QAction("Write manifests…", self)
+        manifests_action = QAction("Sync meta", self)
         manifests_action.setToolTip(
-            "Create / refresh a manifest (<app> <version>.appcatalog.json) next to every variant: app name, "
+            "Create or refresh a metadata file (<app> <version>.appcatalog.json) next to every variant: app name, "
             "setup file + dependent files, scraped details. A fresh database (or a "
             "re-organized library) recognises your manual work again from these. "
             "Select apps first and use the right-click menu to do just those."
         )
-        manifests_action.triggered.connect(lambda: self._write_manifests_for(None))
-        toolbar.addAction(manifests_action)
+        sync_btn = QToolButton()
+        sync_btn.setText("Sync meta")
+        sync_btn.setToolTip(manifests_action.toolTip())
+        sync_btn.setPopupMode(QToolButton.InstantPopup)
+        sync_menu = QMenu(sync_btn)
+        sync_menu.aboutToShow.connect(lambda: self._fill_scope_menu(sync_menu, self._write_manifests_for))
+        sync_btn.setMenu(sync_menu)
+        toolbar.addWidget(sync_btn)
 
 
         toolbar.addSeparator()
@@ -4103,10 +4615,14 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         export_action = QAction("Export CSV…", self)
+        export_action.setToolTip("Export a short file for chatbots (missing scrape data) and/or a full report  (Ctrl+E)")
+        export_action.setShortcut("Ctrl+E")
         export_action.triggered.connect(self._export_csv)
         toolbar.addAction(export_action)
 
         import_action = QAction("Import CSV…", self)
+        import_action.setToolTip("Import a completed short file (or an edited full report) back into the catalog  (Ctrl+I)")
+        import_action.setShortcut("Ctrl+I")
         import_action.triggered.connect(self._import_csv)
         toolbar.addAction(import_action)
 
@@ -4118,6 +4634,8 @@ class MainWindow(QMainWindow):
         toolbar.addAction(columns_action)
 
         settings_action = QAction("Settings", self)
+        settings_action.setToolTip("All options: scanning, file types, scraper, interface…  (Ctrl+,)")
+        settings_action.setShortcut("Ctrl+,")
         settings_action.triggered.connect(self._open_settings)
         toolbar.addAction(settings_action)
 
@@ -4128,9 +4646,27 @@ class MainWindow(QMainWindow):
 
         filter_bar = QHBoxLayout()
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search app name / catalog / subcatalog…")
+        self.search_box.setPlaceholderText("Search app name and file name…  (several words = all must match; use \"Tags / category\" to filter by tag)")
+        self.search_box.setClearButtonEnabled(True)
         self.search_box.textChanged.connect(self._apply_filters)
         filter_bar.addWidget(self.search_box, stretch=2)
+
+        self.search_scope_combo = QComboBox()
+        self.search_scope_combo.addItem("Everything", "all")
+        self.search_scope_combo.addItem("App name", "name")
+        self.search_scope_combo.addItem("File name", "file")
+        self.search_scope_combo.addItem("Tags / category", "tags")
+        self.search_scope_combo.addItem("Folder path", "path")
+        self.search_scope_combo.setToolTip(
+            "What the search text is matched against:\n"
+            "Everything — app name AND the variants' file names\n"
+            "App name — the app name only\n"
+            "Tags / category — tags, catalog and subcatalog\n"
+            "File name — the installer file names of the variants\n"
+            "Folder path — the folders the variants live in")
+        self.search_scope_combo.currentIndexChanged.connect(self._apply_filters)
+        filter_bar.addWidget(QLabel("in"))
+        filter_bar.addWidget(self.search_scope_combo)
 
         self.status_combo = QComboBox()
         self.status_combo.addItems(STATUS_OPTIONS)
@@ -4143,6 +4679,17 @@ class MainWindow(QMainWindow):
         self.scrape_status_combo.currentTextChanged.connect(self._apply_filters)
         filter_bar.addWidget(QLabel("Scraped:"))
         filter_bar.addWidget(self.scrape_status_combo)
+        self.id_filter_btn = QPushButton("")
+        self.id_filter_btn.setToolTip("Only a chosen set of apps is listed (e.g. from the Location check). "
+                                      "Click to show every app again.")
+        self.id_filter_btn.setStyleSheet("QPushButton { border: 1px solid #c9a227; padding: 2px 8px; }")
+        self.id_filter_btn.clicked.connect(lambda: self._apply_app_id_filter(None))
+        self.id_filter_btn.hide()
+        filter_bar.addWidget(self.id_filter_btn)
+        reset_btn = QPushButton("Reset")
+        reset_btn.setToolTip("Clear search, status filters and the catalog selection  (Ctrl+Shift+F)")
+        reset_btn.clicked.connect(self._reset_filters)
+        filter_bar.addWidget(reset_btn)
         outer.addLayout(filter_bar)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -4154,8 +4701,28 @@ class MainWindow(QMainWindow):
         self.catalog_tree.addTopLevelItem(self._make_catalog_node("(all catalogs)"))
         self.catalog_tree.setCurrentItem(self.catalog_tree.topLevelItem(0))
         self.catalog_tree.itemSelectionChanged.connect(lambda *_: self._apply_filters())
-        self.catalog_tree.setMaximumWidth(240)
-        splitter.addWidget(self.catalog_tree)
+        self.catalog_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.catalog_tree.customContextMenuRequested.connect(self._catalog_tree_context_menu)
+        self._catalog_known: set = set()          # catalogs seen so far (new ones start expanded)
+        self._catalog_orphans: set = set()        # lower-cased (cat, sub) pairs no folder produces
+
+        tree_box = QWidget()
+        tree_box.setMaximumWidth(260)
+        tree_v = QVBoxLayout(tree_box)
+        tree_v.setContentsMargins(0, 0, 0, 0)
+        tree_v.setSpacing(2)
+        tree_btns = QHBoxLayout()
+        tree_btns.setSpacing(4)
+        self.expand_all_btn = QPushButton("Expand all")
+        self.collapse_all_btn = QPushButton("Collapse all")
+        for _b in (self.expand_all_btn, self.collapse_all_btn):
+            _b.setToolTip("Expand / collapse every catalog in the filter list")
+            tree_btns.addWidget(_b)
+        self.expand_all_btn.clicked.connect(self.catalog_tree.expandAll)
+        self.collapse_all_btn.clicked.connect(self.catalog_tree.collapseAll)
+        tree_v.addLayout(tree_btns)
+        tree_v.addWidget(self.catalog_tree, 1)
+        splitter.addWidget(tree_box)
 
         self.model = AppsTableModel(self.db)
         self.table = QTableView()
@@ -4183,6 +4750,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.detail_panel)
 
         splitter.setSizes([180, 650, 400])
+        self._main_splitter = splitter
 
     def _build_status_bar(self):
         self.status_bar = QStatusBar()
@@ -4193,6 +4761,9 @@ class MainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.progress_bar)
         self.status_label = QLabel("Ready.")
         self.status_bar.addWidget(self.status_label)
+        self.count_label = QLabel("")
+        self.count_label.setToolTip("Apps shown (after filters) of all apps, and how many are selected")
+        self.status_bar.addPermanentWidget(self.count_label)
 
     def _capture_state(self) -> dict:
         """Capture current sort column/order and selected app id(s)."""
@@ -4294,9 +4865,87 @@ class MainWindow(QMainWindow):
 
     def _make_catalog_node(self, label: str, catalog: Optional[str] = None,
                             subcatalog: Optional[str] = None) -> QTreeWidgetItem:
-        item = QTreeWidgetItem([label])
+        # Display only: the stored catalog/subcatalog text (kept in the item data and
+        # used for filtering) and the folders on disk are never changed by this.
+        shown = label
+        if catalog is not None and getattr(self, "_filter_tree_case", "as_is") == "title":
+            from resolver import apply_case_mode
+            shown = apply_case_mode(label, "title")
+        item = QTreeWidgetItem([shown])
         item.setData(0, Qt.UserRole, {"catalog": catalog, "subcatalog": subcatalog})
         return item
+
+    def _mark_if_orphan(self, item: QTreeWidgetItem, cat: str, sub: Optional[str]):
+        """Italic + tooltip for a category that no scanned folder produces
+        (typo from a manual edit that is locked, or a folder that was renamed)."""
+        derived = self._catalog_orphans
+        if not derived:
+            return
+        if sub is None:
+            orphan = not any(c == cat.lower() for c, _s in derived)
+        else:
+            orphan = (cat.lower(), sub.lower()) not in derived
+        if orphan:
+            f = item.font(0)
+            f.setItalic(True)
+            item.setFont(0, f)
+            item.setToolTip(0, "No folder in the scan roots produces this category.\n"
+                               "It comes from a manual (locked) edit or a folder that no longer exists.\n"
+                               "Right-click → 'Re-sync from folders…' to move its apps back.")
+
+    def _catalog_tree_context_menu(self, pos):
+        menu = QMenu(self)
+        expand_act = menu.addAction("Expand all")
+        collapse_act = menu.addAction("Collapse all")
+        resync_act = None
+        pairs = [(d["catalog"], d.get("subcatalog")) for d in
+                 (i.data(0, Qt.UserRole) or {} for i in self.catalog_tree.selectedItems())
+                 if d.get("catalog")]
+        if pairs and self._catalog_orphans:
+            menu.addSeparator()
+            resync_act = menu.addAction(f"Re-sync from folders… ({len(pairs)} selected)")
+            resync_act.setToolTip("Reset these apps' catalog/subcatalog to what their folders say "
+                                  "and unlock them")
+        reorg_cat = rescan_cat = sync_cat = export_cat = None
+        if pairs:
+            menu.addSeparator()
+            reorg_cat = menu.addAction("Reorganize files of this category…")
+            rescan_cat = menu.addAction("Re-scan the folders of this category")
+            sync_cat = menu.addAction("Sync meta for this category")
+            export_cat = menu.addAction("Export CSV for this category…")
+        chosen = menu.exec(self.catalog_tree.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if reorg_cat is not None and chosen is reorg_cat:
+            self._open_organize_dialog(scope="categories")
+            return
+        if rescan_cat is not None and chosen is rescan_cat:
+            self._rescan_apps(self._scope_app_ids("categories") or [])
+            return
+        if sync_cat is not None and chosen is sync_cat:
+            self._write_manifests_for(self._scope_app_ids("categories"))
+            return
+        if export_cat is not None and chosen is export_cat:
+            self._export_csv(default_scope="categories")
+            return
+        if chosen is expand_act:
+            self.catalog_tree.expandAll()
+        elif chosen is collapse_act:
+            self.catalog_tree.collapseAll()
+        elif resync_act is not None and chosen is resync_act:
+            from resolver import resync_categories_from_folders
+            if QMessageBox.question(
+                    self, "Re-sync from folders",
+                    "Reset the catalog/subcatalog of every app in the selected categories to what its "
+                    "scanned folders say, and unlock those two fields?\n\n"
+                    "Apps with no scanned folder are left untouched.") != QMessageBox.Yes:
+                return
+            res = resync_categories_from_folders(self.db, pairs)
+            self.refresh_all()
+            QMessageBox.information(
+                self, "Re-sync from folders",
+                f"{res['updated']} app(s) updated; {res['skipped_no_folder_info']} left as they are "
+                f"(no folder information).")
 
     def _current_catalog_selections(self) -> list[tuple[Optional[str], Optional[str]]]:
         """Every selected (catalog, subcatalog) pair. (None, None) means
@@ -4328,7 +4977,27 @@ class MainWindow(QMainWindow):
         # Update catalog/subcatalog tree, preserving every selected
         # (catalog, subcatalog) pair rather than raw text -- a subcatalog
         # name could otherwise collide with an unrelated catalog's name.
+        # Selection, expand/collapse state and scroll position all survive the
+        # rebuild; matching is case-insensitive so a case-only rename keeps them.
+        try:
+            self._filter_tree_case = self.db.get_setting("filter_tree_case", "as_is")
+        except Exception:
+            self._filter_tree_case = "as_is"
         prev_selections = set(self._current_catalog_selections())
+        prev_sel_ci = {((c or "").lower() if c else None, (s or "").lower() if s else None)
+                       for c, s in prev_selections}
+        prev_expanded = set()
+        for i in range(self.catalog_tree.topLevelItemCount()):
+            it = self.catalog_tree.topLevelItem(i)
+            d = it.data(0, Qt.UserRole) or {}
+            if d.get("catalog") and it.isExpanded():
+                prev_expanded.add(d["catalog"].lower())
+        prev_scroll = self.catalog_tree.verticalScrollBar().value()
+        try:
+            from resolver import folder_derived_category_pairs
+            self._catalog_orphans = folder_derived_category_pairs(self.db)
+        except Exception:
+            self._catalog_orphans = None
         self.catalog_tree.blockSignals(True)
         self.catalog_tree.clear()
         all_item = self._make_catalog_node("(all catalogs)")
@@ -4338,20 +5007,29 @@ class MainWindow(QMainWindow):
         for cat, subs in self.model.catalog_subcatalog_tree().items():
             cat_item = self._make_catalog_node(cat, catalog=cat)
             self.catalog_tree.addTopLevelItem(cat_item)
-            if (cat, None) in prev_selections:
+            if (cat.lower(), None) in prev_sel_ci:
                 cat_item.setSelected(True)
+            self._mark_if_orphan(cat_item, cat, None)
             for sub in sorted(set(subs)):
                 sub_item = self._make_catalog_node(sub, catalog=cat, subcatalog=sub)
                 cat_item.addChild(sub_item)
-                if (cat, sub) in prev_selections:
+                if (cat.lower(), sub.lower()) in prev_sel_ci:
                     sub_item.setSelected(True)
-            cat_item.setExpanded(True)
+                self._mark_if_orphan(sub_item, cat, sub)
+            # known catalogs keep the collapse state the user left them in;
+            # brand-new ones start expanded
+            if cat.lower() in self._catalog_known:
+                cat_item.setExpanded(cat.lower() in prev_expanded)
+            else:
+                cat_item.setExpanded(True)
+            self._catalog_known.add(cat.lower())
         # If nothing ended up selected (e.g. the old selection disappeared),
         # fall back to "(all catalogs)".
         if not self.catalog_tree.selectedItems():
             all_item.setSelected(True)
             self.catalog_tree.setCurrentItem(all_item)
         self.catalog_tree.blockSignals(False)
+        self.catalog_tree.verticalScrollBar().setValue(prev_scroll)
 
         # Apply filters – this will refresh the model
         self._apply_filters()
@@ -4360,8 +5038,88 @@ class MainWindow(QMainWindow):
         if state:
             self._restore_state(state)
 
+    def _update_count_label(self):
+        """Status bar: 'Showing X of Y apps · N selected'."""
+        if not hasattr(self, "count_label") or not hasattr(self, "table"):
+            return
+        try:
+            total = self.db.connect().execute("SELECT COUNT(*) FROM apps").fetchone()[0]
+            shown = self.model.rowCount()
+            sm = self.table.selectionModel()
+            sel = len(sm.selectedRows()) if sm is not None else 0
+            text = f"Showing {shown} of {total} apps" if shown != total else f"{total} apps"
+            if sel:
+                text += f"  ·  {sel} selected"
+            self.count_label.setText(text)
+        except Exception:
+            pass
+
+    def _apply_app_id_filter(self, ids, label: str = ""):
+        """List only these apps in the main list (None clears it). Used by the Location check."""
+        if ids:
+            self.model.app_id_filter = set(ids)
+            self.id_filter_btn.setText(f"✕  {label or 'Chosen apps'}  ({len(ids)} apps)")
+            self.id_filter_btn.show()
+            # the category selection would hide apps outside it: show the whole catalog
+            self.catalog_tree.blockSignals(True)
+            try:
+                self.catalog_tree.clearSelection()
+                all_item = self.catalog_tree.topLevelItem(0)
+                if all_item is not None:
+                    all_item.setSelected(True)
+                    self.catalog_tree.setCurrentItem(all_item)
+            finally:
+                self.catalog_tree.blockSignals(False)
+        else:
+            self.model.app_id_filter = None
+            self.id_filter_btn.hide()
+        self._apply_filters()
+
+    def _reset_filters(self):
+        """Clear search text, search scope, status filters and the catalog selection in one go."""
+        self.model.app_id_filter = None
+        self.id_filter_btn.hide()
+        widgets = [self.search_box, self.search_scope_combo, self.status_combo,
+                   self.scrape_status_combo, self.catalog_tree]
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self.search_box.clear()
+            self.search_scope_combo.setCurrentIndex(0)
+            self.status_combo.setCurrentIndex(0)
+            self.scrape_status_combo.setCurrentIndex(0)
+            self.catalog_tree.clearSelection()
+            all_item = self.catalog_tree.topLevelItem(0)
+            if all_item is not None:
+                all_item.setSelected(True)
+                self.catalog_tree.setCurrentItem(all_item)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        self._apply_filters()
+
+    def _copy_selected_rows(self):
+        """Ctrl+C on the apps table: selected rows (visible columns) as tab-separated text."""
+        sm = self.table.selectionModel()
+        rows = sorted({i.row() for i in sm.selectedRows()}) if sm else []
+        if not rows:
+            return
+        cols = [c for c in range(self.model.columnCount()) if not self.table.isColumnHidden(c)]
+        header = [str(self.model.headerData(c, Qt.Horizontal, Qt.DisplayRole) or "") for c in cols]
+        lines = ["\t".join(header)]
+        for r in rows:
+            lines.append("\t".join(str(self.model.data(self.model.index(r, c), Qt.DisplayRole) or "")
+                                    .replace("\t", " ").replace("\n", " ") for c in cols))
+        QApplication.clipboard().setText("\n".join(lines))
+        self.status_label.setText(f"Copied {len(rows)} row(s) to the clipboard.")
+
     def _apply_filters(self):
         self.model.search_text = self.search_box.text().strip()
+        self.model.search_scope = self.search_scope_combo.currentData() or "all"
+        # matching variants are highlighted in the details panel
+        self.detail_panel.search_tokens = (
+            [w.lower() for w in self.model.search_text.split()]
+            if self.model.search_scope in ("all", "file") else [])
         selections = self._current_catalog_selections()
         # "(all catalogs)" anywhere in the selection wins — clear the filter.
         if (None, None) in selections:
@@ -4375,8 +5133,16 @@ class MainWindow(QMainWindow):
         scrape_status = self.scrape_status_combo.currentText()
         self.model.scrape_status_filter = None if scrape_status == "(all)" else scrape_status
         self.model.refresh()
+        if getattr(self.model, "fuzzy_used", False):
+            self.search_box.setToolTip("No exact match - showing similar app names (typo tolerance).")
+            self.search_box.setStyleSheet("QLineEdit { border: 1px solid #c9a227; }")
+        else:
+            self.search_box.setToolTip("")
+            self.search_box.setStyleSheet("")
+        self._update_count_label()
 
     def _on_selection_changed(self, *args):
+        self._update_count_label()
         """
         Dispatch to the detail panel based on how many rows are selected:
           - 0 selected -> clear()
@@ -4401,6 +5167,60 @@ class MainWindow(QMainWindow):
         ids = [self.model.app_id_at(r) for r in rows]
         return [i for i in ids if i is not None]
 
+    def _merge_selected_apps(self, app_ids: list):
+        """Merge two or more apps into one: pick the app to keep (and optionally
+        its new name); the others' variants move under it and the others are removed."""
+        if len(app_ids) < 2:
+            return
+        from resolver import merge_apps, edit_app_field
+        conn = self.db.connect()
+        marks = ",".join("?" * len(app_ids))
+        rows = conn.execute(
+            f"SELECT a.id, a.name, a.catalog, a.subcatalog, "
+            f"(SELECT COUNT(*) FROM variants v WHERE v.app_id = a.id AND v.is_ignored = 0) AS nv "
+            f"FROM apps a WHERE a.id IN ({marks})", app_ids).fetchall()
+        if len(rows) < 2:
+            return
+        rows = sorted(rows, key=lambda r: (-r["nv"], r["name"].lower()))
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Merge {len(rows)} apps")
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("All variants of the selected apps go under the app you keep;\n"
+                             "the others are removed (their names keep pointing at the kept app,\n"
+                             "so a rescan will not bring them back)."))
+        lay.addWidget(QLabel("Keep this app:"))
+        keep_combo = QComboBox()
+        for r in rows:
+            keep_combo.addItem(f"{r['name']}   —   {r['catalog'] or '—'} / {r['subcatalog'] or '—'}   "
+                               f"({r['nv']} variant{'s' if r['nv'] != 1 else ''})", r["id"])
+        lay.addWidget(keep_combo)
+        lay.addWidget(QLabel("Name of the merged app:"))
+        name_edit = QLineEdit(rows[0]["name"])
+        lay.addWidget(name_edit)
+        keep_combo.currentIndexChanged.connect(
+            lambda i: name_edit.setText(rows[i]["name"]))
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("Merge")
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        dlg.setMinimumWidth(520)
+        if not dlg.exec():
+            return
+        target = keep_combo.currentData()
+        new_name = name_edit.text().strip()
+        try:
+            for r in rows:
+                if r["id"] != target:
+                    merge_apps(self.db, r["id"], target)
+            current = next(r["name"] for r in rows if r["id"] == target)
+            if new_name and new_name != current:
+                edit_app_field(self.db, target, "name", new_name)
+        except Exception as e:
+            QMessageBox.critical(self, "Merge failed", str(e))
+        self.refresh_all()
+        self.status_label.setText(f"Merged {len(rows)} apps into one.")
+
     def _show_apps_context_menu(self, pos):
         app_ids = self._selected_app_ids()
         if not app_ids:
@@ -4418,14 +5238,26 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
 
         manifest_action = menu.addAction(
-            f"Create/update manifests ({len(app_ids)} apps)"
-            if len(app_ids) > 1 else "Create/update manifest")
+            f"Save metadata files ({len(app_ids)} apps)"
+            if len(app_ids) > 1 else "Save metadata file")
         manifest_action.setToolTip(
-            "Write the .appcatalog.json manifest next to each variant of the selected app(s)")
+            "Save the .appcatalog.json metadata file next to each variant of the selected app(s)")
+        reorg_action = menu.addAction(
+            f"Reorganize files of these {len(app_ids)} apps…" if len(app_ids) > 1 else "Reorganize this app's files…")
+        reorg_action.setToolTip("Open Organize → Reorganize Files limited to the selected apps")
+        rescan_action = menu.addAction(
+            f"Re-scan the folders of these {len(app_ids)} apps" if len(app_ids) > 1 else "Re-scan this app's folder")
+        rescan_action.setToolTip("Pick up changes inside the app's folder without scanning the whole library")
         repair_action = menu.addAction("Repair empty apps… (whole library)")
         repair_action.setToolTip(
             "Find apps with no variants (left behind by an old rescan bug that duplicated "
             "renamed/scraped apps) and merge the duplicates back / remove the leftovers.")
+
+        menu.addSeparator()
+
+        merge_action = menu.addAction(f"Merge {len(app_ids)} selected apps into one…")
+        merge_action.setEnabled(len(app_ids) >= 2)
+        merge_action.setToolTip("Combine the selected apps: all their variants end up under the app you keep  (Ctrl+M)")
 
         menu.addSeparator()
 
@@ -4460,10 +5292,16 @@ class MainWindow(QMainWindow):
                 self.refresh_all()
                 if self.detail_panel.current_app_id == app_ids[0]:
                     self.detail_panel.load_app(app_ids[0])
+        elif chosen == merge_action:
+            self._merge_selected_apps(app_ids)
         elif chosen == refine_action:
             self._open_refine_names_dialog(app_ids)
         elif chosen == manifest_action:
             self._write_manifests_for(app_ids)
+        elif chosen == reorg_action:
+            self._open_organize_dialog(scope="selected")
+        elif chosen == rescan_action:
+            self._rescan_apps(app_ids)
         elif chosen == repair_action:
             self._repair_empty_apps()
 
@@ -4485,12 +5323,31 @@ class MainWindow(QMainWindow):
         app_ids = self._selected_app_ids()
         if not app_ids:
             return
-        if QMessageBox.question(self, "Confirm Delete",
-                                f"Delete {len(app_ids)} app(s) and their versions?",
-                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            for app_id in app_ids:
-                self.db.delete_app(app_id)
-            self.refresh_all()
+        conn = self.db.connect()
+        q = ",".join("?" * len(app_ids))
+        names = [r[0] for r in conn.execute(
+            f"SELECT name FROM apps WHERE id IN ({q}) ORDER BY name COLLATE NOCASE", app_ids)]
+        n_var = conn.execute(f"SELECT COUNT(*) FROM variants WHERE app_id IN ({q})", app_ids).fetchone()[0]
+        listing = "\n".join(f"  • {n}" for n in names[:6]) + (f"\n  … and {len(names) - 6} more" if len(names) > 6 else "")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Delete app(s)?")
+        box.setText(f"Delete {len(app_ids)} app(s) and their {n_var} variant(s) from the catalog?")
+        box.setInformativeText(
+            f"{listing}\n\nOnly the catalog records are removed — no files on disk are touched. "
+            "A later re-scan can re-add anything that is still on disk. "
+            "A backup of the catalog is saved first.")
+        delete_btn = box.addButton("Delete", QMessageBox.DestructiveRole)
+        cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+        if box.clickedButton() is not delete_btn:
+            return
+        app_curation.create_backup(self.db.path, "before-delete", keep=5, min_interval_s=300)
+        for app_id in app_ids:
+            self.db.delete_app(app_id)
+        self.refresh_all()
 
     def open_selected_location(self):
         app_ids = self._selected_app_ids()
@@ -4545,10 +5402,98 @@ class MainWindow(QMainWindow):
         for i, (key, _label) in enumerate(COLUMNS):
             self.table.setColumnHidden(i, key not in visible and key != "name")
 
-    def _open_organize_dialog(self):
-        dialog = OrganizeDialog(self.db, parent=self)
+    def _open_organize_dialog(self, *_, scope: str = None):
+        """scope: open straight on the Reorganize tab limited to 'list' | 'selected' | 'categories'."""
+        dialog = OrganizeDialog(self.db, parent=self, scope_provider=self._scope_app_ids,
+                                filter_callback=self._apply_app_id_filter)
+        if scope:
+            dialog.show_reorganize(scope)
         dialog.exec()
         self.refresh_all()
+
+    # ---- scope: which apps does an action apply to? -------------------------------------
+    SCOPE_LABELS = (("all", "Whole catalog"), ("list", "Current list as shown"),
+                    ("selected", "Selected apps"), ("categories", "Categories selected in the filter list"))
+
+    def _scope_app_ids(self, kind: str):
+        """App ids for a scope kind; None means every app."""
+        if kind == "all":
+            return None
+        if kind == "list":
+            ids = [self.model.app_id_at(r) for r in range(self.model.rowCount())]
+            return [i for i in ids if i is not None]
+        if kind == "selected":
+            return self._selected_app_ids()
+        if kind == "categories":
+            sel = self._current_catalog_selections()
+            if not sel or (None, None) in sel:
+                return None
+            conn = self.db.connect()
+            ids = set()
+            for cat, sub in sel:
+                if sub is None:
+                    cur = conn.execute("SELECT id FROM apps WHERE catalog IS ?", (cat,))
+                else:
+                    cur = conn.execute("SELECT id FROM apps WHERE catalog IS ? AND subcatalog IS ?", (cat, sub))
+                ids.update(r["id"] for r in cur)
+            return sorted(ids)
+        return []
+
+    def _scope_count(self, kind: str) -> int:
+        ids = self._scope_app_ids(kind)
+        return self.db.connect().execute("SELECT COUNT(*) FROM apps").fetchone()[0] if ids is None else len(ids)
+
+    def _fill_scope_menu(self, menu: QMenu, callback):
+        """Fills `menu` with one entry per scope (with the number of apps); callback(ids|None)."""
+        menu.clear()
+        for kind, label in self.SCOPE_LABELS:
+            n = self._scope_count(kind)
+            act = menu.addAction(f"{label}  ({n} apps)")
+            act.setEnabled(n > 0)
+            act.triggered.connect(lambda _=False, k=kind: callback(self._scope_app_ids(k)))
+
+    def _rescan_apps(self, app_ids: list):
+        """Re-scan only the folders of these apps (a change inside one app's folder, a new version
+        added, a file replaced ...), re-resolve just those items, then offer to remove variants whose
+        files are gone. Manually merged / locked / verified apps keep their manual work."""
+        if not app_ids:
+            return
+        if self._active_worker is not None:
+            QMessageBox.information(self, "Busy", "Another job is already running.")
+            return
+        from app_manager import plan_rescan, rescan_apps, format_rescan_report, execute_clean_library
+        plan = plan_rescan(self.db, app_ids)
+        if plan.folder_count == 0:
+            QMessageBox.information(self, "Re-scan", "Nothing to re-scan.\n\n" + "\n".join(plan.skipped[:20]))
+            return
+        if QMessageBox.question(
+                self, "Re-scan folders",
+                f"Re-scan {plan.folder_count} folder(s) of {len(app_ids)} app(s)?\n\n"
+                "Only these folders are walked (not the whole library). New or changed files are picked up; "
+                "nothing is deleted without asking.") != QMessageBox.Yes:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            def _progress(msg):
+                self.status_label.setText(msg)
+                QApplication.processEvents()
+            res = rescan_apps(self.db, app_ids, on_progress=_progress)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.refresh_all()
+        report = format_rescan_report(res)
+        if res.missing:
+            listing = "\n".join(f"  - {m.app_name} {m.version}: {m.source_path}" for m in res.missing[:25])
+            more = f"\n  … and {len(res.missing) - 25} more" if len(res.missing) > 25 else ""
+            if QMessageBox.question(
+                    self, "Re-scan finished",
+                    report + "\n\nRemove these variants (their files are gone) from the catalog?\n" + listing + more
+            ) == QMessageBox.Yes:
+                execute_clean_library(self.db, res.missing)
+                self.refresh_all()
+        else:
+            QMessageBox.information(self, "Re-scan finished", report)
+        self.status_label.setText("Re-scan finished.")
 
     def _maybe_show_folder_layout_dialog(self, root_path: str) -> bool:
         """
@@ -4778,10 +5723,10 @@ class MainWindow(QMainWindow):
             w.wait()
         if result is not None and (result.created or result.updated):
             self.status_label.setText(
-                f"Manifests: {result.created} created, {result.updated} updated.")
+                f"Metadata files: {result.created} created, {result.updated} updated.")
         if result is not None and result.failed:
             self.status_label.setText(
-                f"Manifests: {result.failed} could not be written (see app.log).")
+                f"Metadata files: {result.failed} could not be written (see app.log).")
 
     def _write_manifests_for(self, app_ids: Optional[list]):
         """Manual: create/refresh manifests for the given apps (None = every app)."""
@@ -4806,52 +5751,144 @@ class MainWindow(QMainWindow):
                     % ",".join("?" * len(chunk)), chunk).fetchone()[0]
             scope = f"the {len(app_ids)} selected app(s)"
         if total == 0:
-            QMessageBox.information(self, "Manifests", "Nothing to write — no variants found.")
+            QMessageBox.information(self, "Metadata files", "Nothing to write — no variants found.")
             return
-        answer = QMessageBox.question(
-            self, "Create / update manifests",
-            f"Write a .appcatalog.json manifest next to {scope}?\n\n"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Sync meta")
+        box.setText(f"Save a .appcatalog.json metadata file next to {scope}?")
+        box.setInformativeText(
             f"{total} variant(s), {have} already have one (those are refreshed only if "
             "something changed).\n\n"
-            "Each file records the app name, the setup file and its dependent files, "
+            "Each file records the app name, the setup file, its dependent files and sidecars, "
             "and any scraped details — so a new database or a re-organized library can "
-            "recognise this work again. No installer is modified or moved.",
-            QMessageBox.Yes | QMessageBox.No)
-        if answer != QMessageBox.Yes:
+            "recognise this work again. No installer is modified or moved.")
+        force_check = QCheckBox("Force rebuild — delete the existing metadata files first, then create new ones")
+        force_check.setToolTip(
+            "Clears out stale or wrong files. Anything recorded only in the old files (hand-edited member "
+            "roles) is discarded; sidecar choices and everything else in the catalog are kept.\n"
+            "The catalog is treated as correct: if it is out of date or damaged, the rebuilt files will "
+            "carry that state too.")
+        box.setCheckBox(force_check)
+        sync_btn = box.addButton("Sync", QMessageBox.AcceptRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(sync_btn)
+        box.exec()
+        if box.clickedButton() is not sync_btn:
             return
-        worker = ManifestWorker(self.db_path, variant_ids=variant_ids)
+        rebuild = force_check.isChecked()
+        worker = ManifestWorker(self.db_path, variant_ids=variant_ids, rebuild=rebuild)
         worker.progress.connect(self._on_manifest_progress)
         worker.finished_ok.connect(self._on_manifest_finished)
         worker.failed.connect(self._on_job_failed)
         self._active_worker = worker
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, max(total, 1))
-        self.status_label.setText(f"Writing manifests for {total} variant(s)…")
+        self.status_label.setText(
+            f"{'Rebuilding' if rebuild else 'Saving'} metadata files for {total} variant(s)…")
         worker.start()
 
     def _on_manifest_progress(self, done: int, total: int):
         self.progress_bar.setRange(0, max(total, 1))
         self.progress_bar.setValue(done)
-        self.status_label.setText(f"Writing manifests… {done}/{total}")
+        self.status_label.setText(f"Saving metadata files… {done}/{total}")
 
     def _on_manifest_finished(self, result):
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 100)
         self._release_worker()
-        self.status_label.setText(f"Manifests: {result.summary()}.")
+        self.status_label.setText(f"Metadata files: {result.summary()}.")
         problems = [r for r in result.items if r.status == "failed"]
         if problems:
             lines = "\n".join(f"• {r.message}" for r in problems[:8])
             more = f"\n…and {len(problems) - 8} more (see app.log)" if len(problems) > 8 else ""
             QMessageBox.warning(
-                self, "Manifests",
+                self, "Metadata files",
                 f"{result.summary()}.\n\nSome could not be written (read-only drive, "
                 f"missing folder…):\n{lines}{more}")
         else:
-            QMessageBox.information(self, "Manifests", f"Done — {result.summary()}.")
+            QMessageBox.information(self, "Metadata files", f"Done — {result.summary()}.")
+
+    # ---------------------------------------------------------------
+    # Quality of life: shortcuts, drag & drop, remembered window layout
+    # ---------------------------------------------------------------
+    def _install_quality_of_life(self):
+        # Delete on the apps table removes the selected app(s) (with a confirmation).
+        QShortcut(QKeySequence(Qt.Key_Delete), self.table, context=Qt.WidgetShortcut,
+                  activated=self.delete_selected_apps)
+        # Ctrl+F -> search, F5 -> refresh
+        QShortcut(QKeySequence.Find, self, activated=self._focus_search)
+        # long message boxes (import / merge / reports) scroll instead of overflowing the screen
+        from ui_helpers import install_scrollable_messageboxes
+        install_scrollable_messageboxes()
+        # Esc in the search box clears it; Ctrl+Shift+F resets every filter; Ctrl+M merges the
+        # selected apps; Ctrl+C copies the selected rows
+        QShortcut(QKeySequence(Qt.Key_Escape), self.search_box, context=Qt.WidgetShortcut,
+                  activated=lambda: (self.search_box.clear(), self.table.setFocus()))
+        QShortcut(QKeySequence("Ctrl+Shift+F"), self, activated=self._reset_filters)
+        QShortcut(QKeySequence("Ctrl+M"), self.table, context=Qt.WidgetShortcut,
+                  activated=lambda: self._merge_selected_apps(self._selected_app_ids()))
+        QShortcut(QKeySequence.Copy, self.table, context=Qt.WidgetShortcut,
+                  activated=self._copy_selected_rows)
+        QShortcut(QKeySequence(Qt.Key_F5), self, activated=lambda: self.refresh_all())
+        # drop installer files onto the window to add them
+        self.setAcceptDrops(True)
+        # remembered window size / position / pane widths
+        try:
+            from PySide6.QtCore import QByteArray
+            geo = self.db.get_setting("window_geometry", None)
+            if geo:
+                self.restoreGeometry(QByteArray.fromBase64(geo.encode("ascii")))
+            sizes = self.db.get_setting("main_splitter_sizes", None)
+            if (isinstance(sizes, list) and len(sizes) == 3
+                    and all(isinstance(x, int) for x in sizes) and hasattr(self, "_main_splitter")):
+                self._main_splitter.setSizes(sizes)
+        except Exception:
+            pass
+
+    def _focus_search(self):
+        self.search_box.setFocus()
+        self.search_box.selectAll()
+
+    def _save_window_layout(self):
+        try:
+            self.db.set_setting("window_geometry", bytes(self.saveGeometry().toBase64()).decode("ascii"),
+                                bump_version=False)
+            if hasattr(self, "_main_splitter"):
+                self.db.set_setting("main_splitter_sizes", [int(x) for x in self._main_splitter.sizes()],
+                                    bump_version=False)
+        except Exception:
+            pass
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls() and any(u.isLocalFile() for u in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        event.acceptProposedAction()
+        # one "Add app" dialog per dropped item; Cancel stops the sequence
+        QTimer.singleShot(0, lambda: self._add_dropped(paths[:10]))
+
+    def _add_dropped(self, paths: list):
+        added = None
+        for p in paths:
+            if os.path.isdir(p):
+                dlg = AddAppDialog(self.db, parent=self, initial_folder=p)
+            else:
+                dlg = AddAppDialog(self.db, parent=self, initial_installer=p)
+            if dlg.exec() != QDialog.Accepted or not dlg.result_info:
+                break
+            added = dlg.result_info
+            if dlg.scrape_after:
+                self._run_scrape([added["app_id"]])
+        if added:
+            self.refresh_all()
+            self.select_app_by_id(added["app_id"])
 
     def closeEvent(self, event):
         """Last chance to persist pending manifests before the app exits."""
+        self._save_window_layout()
         try:
             self._manifest_timer.stop()
             if self._manifest_flush_worker is not None:
@@ -5011,16 +6048,19 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self.db, parent=self)
         if dialog.exec():
             self.status_label.setText("Settings saved. Use 'Re-resolve all' to apply to existing data.")
+            self.refresh_all()          # e.g. the filter-list display case changed
 
-    def _export_csv(self):
-        dialog = CsvExportDialog(parent=self)
+    def _export_csv(self, *_, default_scope: str = "list"):
+        scopes = [(k, label, self._scope_count(k)) for k, label in self.SCOPE_LABELS]
+        dialog = CsvExportDialog(self.db, parent=self, scopes=scopes, default_scope=default_scope)
         if not dialog.exec():
             return
         output_dir = dialog.output_dir()
         if not output_dir:
             return
         try:
-            paths = export_apps_csv(self.db, output_dir, batch_size=dialog.batch_size_value())
+            paths = export_apps_csv(self.db, output_dir, app_ids=self._scope_app_ids(dialog.scope_kind()),
+                                    **dialog.export_options())
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e))
             return
@@ -5035,8 +6075,11 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Choose CSV to import", "", "CSV files (*.csv)")
         if not path:
             return
+        dlg = CsvImportDialog(self.db, path, parent=self)
+        if not dlg.exec():
+            return
         try:
-            counts = import_apps_csv(self.db, path)
+            counts = import_apps_csv(self.db, path, **dlg.options())
         except Exception as e:
             QMessageBox.critical(self, "Import failed", str(e))
             return
@@ -5045,3 +6088,4 @@ class MainWindow(QMainWindow):
             f"{counts['not_found']} not found."
         )
         self.refresh_all()
+        QMessageBox.information(self, "Import complete", format_import_report(counts))

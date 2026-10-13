@@ -207,9 +207,66 @@ class AppsTableModel(QAbstractTableModel):
         self.catalog_filter_spec: list[tuple[Optional[str], Optional[str]]] = []
         self.status_filter: str | None = None
         self.scrape_status_filter: str | None = None
+        # what the search text is matched against:
+        #   "all"   app name AND the variants' file names
+        #   "name"  app name only
+        #   "tags"  catalog / subcatalog / tags
+        #   "file"  variants' file names only
+        #   "path"  variants' folder paths only
+        self.search_scope: str = "all"
+        self.app_id_filter = None     # optional set of app ids: only these apps are listed (e.g. from the Location check)
+
+    def _search_clause(self) -> tuple:
+        """SQL + params for the search box. Words are ANDed: every word must match
+        somewhere in the chosen scope ("windows iso" = a name/file containing windows
+        AND one containing iso). % and _ typed by the user are matched literally."""
+        words = (self.search_text or "").split()
+        if not words:
+            return "", []
+        scope = self.search_scope if self.search_scope in ("all", "name", "tags", "file", "path") else "all"
+        esc = "ESCAPE '\\'"
+        parts, params = [], []
+        for w in words:
+            like = "%" + w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            ors = []
+            if scope in ("all", "name"):
+                ors.append(f"a.name LIKE ? {esc}")
+                params.append(like)
+            if scope == "tags":
+                # category + subcategory + tags (the filtering vocabulary)
+                ors += [f"a.catalog LIKE ? {esc}", f"a.subcatalog LIKE ? {esc}",
+                        "EXISTS (SELECT 1 FROM app_tags xat JOIN tags xt ON xt.id = xat.tag_id "
+                        f"WHERE xat.app_id = a.id AND xt.name LIKE ? {esc})"]
+                params += [like, like, like]
+            if scope in ("all", "file"):
+                ors.append(f"EXISTS (SELECT 1 FROM variants vs WHERE vs.app_id = a.id AND vs.file_name LIKE ? {esc})")
+                params.append(like)
+            if scope == "path":
+                ors.append(f"EXISTS (SELECT 1 FROM variants vs WHERE vs.app_id = a.id AND vs.source_path LIKE ? {esc})")
+                params.append(like)
+            parts.append("(" + " OR ".join(ors) + ")")
+        return " AND " + " AND ".join(parts), params
 
     def refresh(self):
         self.beginResetModel()
+        rows = self._query_rows(use_search=True)
+        self.fuzzy_used = False
+        words = (self.search_text or "").split()
+        if not rows and words and self.search_scope in ("all", "name"):
+            # Nothing matched literally -> tolerate typos ("utilti" -> Utilities)
+            # by fuzzy-matching every word against the app names, still honouring
+            # the category / status filters.
+            from rapidfuzz import fuzz
+
+            def _ok(name: str) -> bool:
+                n = (name or "").lower()
+                return all(fuzz.partial_ratio(w.lower(), n) >= 80 for w in words)
+            rows = [r for r in self._query_rows(use_search=False) if _ok(r["name"])]
+            self.fuzzy_used = bool(rows)
+        self._rows = [dict(r) for r in rows]
+        self.endResetModel()
+
+    def _query_rows(self, use_search: bool = True):
         conn = self.db.connect()
 
         query = """
@@ -231,10 +288,10 @@ class AppsTableModel(QAbstractTableModel):
             WHERE 1=1
         """
         params: list = []
-        if self.search_text:
-            query += " AND (a.name LIKE ? OR a.catalog LIKE ? OR a.subcatalog LIKE ?)"
-            like = f"%{self.search_text}%"
-            params += [like, like, like]
+        clause, clause_params = self._search_clause() if use_search else ("", [])
+        if clause:
+            query += clause
+            params += clause_params
         if self.catalog_filter_spec:
             clauses = []
             for cat, sub in self.catalog_filter_spec:
@@ -255,10 +312,21 @@ class AppsTableModel(QAbstractTableModel):
             else:
                 query += " AND a.scrape_status = ?"
                 params.append(self.scrape_status_filter)
-        query += " GROUP BY a.id ORDER BY a.catalog, a.subcatalog, a.name"
+        # While searching, apps whose NAME matches every word come first; the rest
+        # (matched only through category / file name) follow, each group in the
+        # usual catalog order.
+        words = (self.search_text or "").split() if use_search else []
+        rank = ""
+        if words and self.search_scope in ("all", "name"):
+            esc = "ESCAPE '\\'"
+            rank = "CASE WHEN " + " AND ".join(f"a.name LIKE ? {esc}" for _ in words) + " THEN 0 ELSE 1 END, "
+            params += ["%" + w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                       for w in words]
+        query += f" GROUP BY a.id ORDER BY {rank}a.catalog, a.subcatalog, a.name"
         rows = conn.execute(query, params).fetchall()
-        self._rows = [dict(r) for r in rows]
-        self.endResetModel()
+        if self.app_id_filter is not None:
+            rows = [r for r in rows if r["id"] in self.app_id_filter]
+        return rows
 
     def distinct_catalogs(self) -> list[str]:
         conn = self.db.connect()
@@ -716,10 +784,12 @@ class ManifestWorker(QThread):
     finished_ok = Signal(object)          # app_manifest.BatchResult
     failed = Signal(str)
 
-    def __init__(self, db_path: str, variant_ids: Optional[list] = None, parent=None):
+    def __init__(self, db_path: str, variant_ids: Optional[list] = None, parent=None,
+                 rebuild: bool = False):
         super().__init__(parent)
         self.db_path = db_path
         self.variant_ids = variant_ids
+        self.rebuild = rebuild               # forced: delete existing metadata files first
         self._cancelled = False
 
     def cancel(self):
@@ -736,7 +806,8 @@ class ManifestWorker(QThread):
                     self.progress.emit(i, total)
 
             result = app_manifest.write_manifests(
-                db, self.variant_ids, progress=_p, cancel=lambda: self._cancelled)
+                db, self.variant_ids, progress=_p, cancel=lambda: self._cancelled,
+                rebuild=self.rebuild)
             self.finished_ok.emit(result)
         except Exception as e:
             log.error("Manifest job failed:\n%s", traceback.format_exc())
@@ -791,88 +862,10 @@ def _copy_scan_progress(p: ScanProgress) -> ScanProgress:
 
 
 # =============================================================
-# CSV export/import
+# CSV export/import now lives in catalog_csv.py (Qt-free); re-exported here so
+# existing `from gui_backend import export_apps_csv, import_apps_csv` keeps working.
 # =============================================================
-
-EXPORT_FIELDS = [
-    "app_id", "name", "catalog", "subcatalog", "tags", "status", "confidence",
-    "alt_name_candidate", "alt_name_source", "variant_count", "versions",
-    "sample_file_name", "sample_path",
-]
-
-
-def export_apps_csv(db: Database, output_dir: str, batch_size: int = 0,
-                    base_name: str = "catalog_export") -> list[str]:
-    conn = db.connect()
-    rows = conn.execute(
-        """
-        SELECT a.id AS app_id, a.name, a.catalog, a.subcatalog, a.status, a.confidence,
-               a.alt_name_candidate, a.alt_name_source,
-               (SELECT GROUP_CONCAT(t.name, ', ') FROM app_tags at
-                  JOIN tags t ON t.id = at.tag_id WHERE at.app_id = a.id) AS tags,
-               COUNT(v.id) AS variant_count,
-               GROUP_CONCAT(DISTINCT v.version) AS versions,
-               (SELECT v2.file_name FROM variants v2 WHERE v2.app_id = a.id AND v2.file_name IS NOT NULL LIMIT 1) AS sample_file_name,
-               (SELECT v2.source_path FROM variants v2 WHERE v2.app_id = a.id LIMIT 1) AS sample_path
-        FROM apps a
-        LEFT JOIN variants v ON v.app_id = a.id AND v.is_ignored = 0
-        GROUP BY a.id
-        ORDER BY a.catalog, a.subcatalog, a.name
-        """
-    ).fetchall()
-    os.makedirs(output_dir, exist_ok=True)
-    written = []
-    if batch_size <= 0:
-        path = os.path.join(output_dir, f"{base_name}.csv")
-        _write_csv(path, rows)
-        written.append(path)
-    else:
-        total_batches = math.ceil(len(rows) / batch_size) if rows else 0
-        for i in range(total_batches):
-            batch = rows[i * batch_size:(i + 1) * batch_size]
-            path = os.path.join(output_dir, f"{base_name}_part{i+1:02d}.csv")
-            _write_csv(path, batch)
-            written.append(path)
-    return written
-
-
-def _write_csv(path: str, rows: list):
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=EXPORT_FIELDS)
-        writer.writeheader()
-        for r in rows:
-            writer.writerow({k: r[k] if r[k] is not None else "" for k in EXPORT_FIELDS})
-
-
-def import_apps_csv(db: Database, csv_path: str) -> dict:
-    conn = db.connect()
-    counts = {"updated": 0, "skipped": 0, "not_found": 0}
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            app_id_raw = (row.get("app_id") or "").strip()
-            if not app_id_raw:
-                counts["skipped"] += 1
-                continue
-            try:
-                app_id = int(app_id_raw)
-            except ValueError:
-                counts["skipped"] += 1
-                continue
-            existing = conn.execute("SELECT * FROM apps WHERE id = ?", (app_id,)).fetchone()
-            if existing is None:
-                counts["not_found"] += 1
-                continue
-            changed = False
-            for field in ("name", "catalog", "subcatalog"):
-                new_value = (row.get(field) or "").strip()
-                if new_value and new_value != (existing[field] or ""):
-                    edit_app_field(db, app_id, field, new_value)
-                    changed = True
-            if changed:
-                counts["updated"] += 1
-            else:
-                counts["skipped"] += 1
-    return counts
-    
-    
+from catalog_csv import (  # noqa: E402,F401
+    export_apps_csv, import_apps_csv, format_import_report, count_apps_missing_data,
+    SHORT_FIELDS, FILL_FIELDS,
+)

@@ -319,6 +319,9 @@ class Database:
         from app_curation import ensure_curation_schema
         ensure_curation_schema(conn)
         ensure_manifest_schema(conn)
+        # Per-variant sidecar overrides (needs variants.manifest_dirty from the line above).
+        from app_sidecars import ensure_sidecar_schema
+        ensure_sidecar_schema(conn)
         self._fix_bad_skip_roots()   # <-- add this
         self._ensure_defaults()
 

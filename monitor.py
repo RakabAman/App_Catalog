@@ -491,10 +491,14 @@ def _resolve_destination(db: Database, app_id: int, item: MonitorPlanItem,
     ).fetchone()
     if row is None:
         raise RuntimeError(f"app_id {app_id} no longer exists")
-    catalog = _safe_path_component(row["catalog"] or "Uncategorized")
-    subcatalog = _safe_path_component(row["subcatalog"] or "Misc")
+    from resolver import apply_case_mode
+    catalog = _safe_path_component(apply_case_mode(
+        row["catalog"] or "Uncategorized", settings.get("reorganize_catalog_case", "as_is")))
+    subcatalog = _safe_path_component(apply_case_mode(
+        row["subcatalog"] or "Misc", settings.get("reorganize_subcatalog_case", "as_is")))
     app_name = _safe_path_component(row["name"])
-    version = _safe_path_component(item.extracted_version or "unknown-version")
+    version = _safe_path_component(
+        item.extracted_version or (settings.get("reorganize_unknown_version_name") or "").strip() or "unknown-version")
     dest_folder = os.path.join(dest_root, catalog, subcatalog, app_name, version)
 
     already = (item.extension in
